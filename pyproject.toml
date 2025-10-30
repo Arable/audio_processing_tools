@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=72", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audio-processing-tools"
+version = "0.1.0"                 # bump major if you’re breaking imports
+description = "Audio processing utilities for Mark-3 raw audio (fetch/parse/transform/edge DSP)."
+readme = "README.md"
+requires-python = ">=3.12"        # try 3.13; relax to 3.12 if any wheel lags
+authors = [{ name = "Vikrant" }]
+license = { text = "BSD-3-Clause" }
+
+# Runtime deps — pick modern pins that work in your env
+dependencies = [
+  "numpy>=2.1",
+  "pandas>=2.2",
+  "scipy>=1.14",
+  "matplotlib>=3.9",
+  "tqdm>=4.66",
+  "requests>=2.32",
+  "soundfile>=0.12",
+  "kaitaistruct>=0.10",
+  "plotly>=5.22",
+  "librosa>=0.10",
+  # DB stack: prefer your new package (recommended)
+  "data_access_connectors>=0.1.0",
+  # SQLAlchemy + psycopg3:
+  "SQLAlchemy>=2.0",
+  "psycopg[binary]>=3.2",
+]
+
+[tool.uv.sources]
+data_access_connectors = { git = "ssh://git@github.com/Arable/data_access_connectors", tag = "ver_0.1.2" }
+
+[project.optional-dependencies]
+# extras that downstream users can opt into
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.6",
+  "ipykernel>=6.29",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["audio_processing_tools*"]
+
+# Include your shared libs (.dylib/.so/.dll) inside the wheel
+[tool.setuptools.package-data]
+"audio_processing_tools.edge.parameter_tuning" = ["*.dylib", "*.so", "*.dll"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=audio_processing_tools --cov-branch -q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E","W","F","I","UP","B","SIM","NPY","PD","D"]
+ignore = ["D105","D400"]
