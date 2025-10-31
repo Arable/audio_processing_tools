@@ -23,15 +23,10 @@ dependencies = [
   "kaitaistruct>=0.10",
   "plotly>=5.22",
   "librosa>=0.10",
-  # DB stack: prefer your new package (recommended)
-  "data_access_connectors>=0.1.0",
-  # SQLAlchemy + psycopg3:
   "SQLAlchemy>=2.0",
   "psycopg[binary]>=3.2",
 ]
 
-[tool.uv.sources]
-data_access_connectors = { git = "ssh://git@github.com/Arable/data_access_connectors", tag = "ver_0.1.2" }
 
 [project.optional-dependencies]
 # extras that downstream users can opt into
