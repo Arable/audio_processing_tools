@@ -111,7 +111,7 @@ def parse_mark_audio_file(file_contents: bytes, force_file_type=None):
             # Write original data to temp file
             input_path = os.path.join(temp_dir, "input.bin")
             with open(input_path, "wb") as f:
-                f.write(file_contents)
+                f.write(audio_data)
             
             # Create paths for intermediate CAF file and final WAV
             caf_path = os.path.join(temp_dir, "audio.caf")
@@ -223,6 +223,10 @@ def tabularize_audio_data(binary_raw_audio: dict, device_metadata=True, force_fi
             metadata = {**metadata, **additional_metadata}
 
         tabular_data.loc[key, "signal"] = AudioSignal(sig)
+        
+        # add the source file (S3 key) as a column
+        tabular_data.loc[key, "source_file"] = key
+
         for k, v in metadata.items():
             tabular_data.loc[key, k] = v
     return tabular_data
