@@ -1,4 +1,6 @@
 from typing import Optional
+from typing import Optional, Dict
+from sqlalchemy.dialects.postgresql import JSONB
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -46,6 +48,7 @@ def upsert_df(
     *,
     schema: str = "public",
     chunksize: int = 1000,
+    dtype: Optional[Dict[str, object]] = None,
 ) -> bool:
     """
     UPSERT (insert or update) a pandas DataFrame into a PostgreSQL table using SQLAlchemy.
@@ -95,7 +98,8 @@ def upsert_df(
             # Create table if missing
             df.to_sql(
                 table_name, conn, schema=schema, index=True,
-                if_exists="fail", chunksize=chunksize
+                if_exists="fail", chunksize=chunksize,
+                dtype=dtype,
             )
             conn.execute(
                 text(f'ALTER TABLE "{schema}"."{table_name}" '
@@ -106,7 +110,8 @@ def upsert_df(
         # 2) Create temp table
         df.to_sql(
             temp_table, conn, schema=schema, index=True,
-            if_exists="replace", chunksize=chunksize
+            if_exists="replace", chunksize=chunksize,
+            dtype=dtype,
         )
 
         # 3) Ensure unique constraint exists on target table
