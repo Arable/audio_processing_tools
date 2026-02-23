@@ -1,3 +1,7 @@
+import os
+import sys
+import argparse
+
 from audio_processing_tools.parse import create_dict_by_kaitai
 
 def test_audio_parser(file_path: str):
@@ -31,13 +35,32 @@ def test_audio_parser(file_path: str):
         print(f"Error parsing file: {e}")
 
 if __name__ == "__main__":
-    # Replace with your audio file path
-    # print("new file type:")
-    # file_path = "/Volumes/Work Drive/raw_audio_cache/raw_audio/D006615/2025/01/20/20250120_14_48_00_000000_rain_032.bin"
-    # test_audio_parser(file_path) 
-    print("new file type:")
-    file_path = "/Volumes/Work Drive/raw_audio_cache/raw_audio/D006534/2025/02/16/20250216_23_07_00_000000_rain_b26.bin"
-    test_audio_parser(file_path)
-    print("old file type:")
-    file_path = "/Volumes/Work Drive/raw_audio_cache/raw_audio/D006615/2024/05/29/20240529_05_15_50_000000_rain_000.bin"
-    test_audio_parser(file_path) 
+    parser = argparse.ArgumentParser(description="Parse one or more audio files.")
+    parser.add_argument("path", help="Path to a file or folder containing audio files")
+    args = parser.parse_args()
+
+    input_path = args.path
+
+    if not os.path.exists(input_path):
+        print(f"Error: {input_path} does not exist.")
+        sys.exit(1)
+
+    # If it's a folder, parse all files in it
+    if os.path.isdir(input_path):
+        print(f"Parsing all files in folder: {input_path}")
+        for root, _, files in os.walk(input_path):
+            for file in files:
+                if file.lower().endswith(".bin"):
+                    file_path = os.path.join(root, file)
+                    test_audio_parser(file_path)
+    else:
+        # If it's a single file, just parse it
+        test_audio_parser(input_path)
+
+# if __name__ == "__main__":
+#    if len(sys.argv) < 2:
+#        print("Usage: python script.py <file_path>")
+#        sys.exit(1)
+# 
+#    file_path = sys.argv[1]
+#    test_audio_parser(file_path)
