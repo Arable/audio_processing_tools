@@ -7,7 +7,12 @@ try:
 except ModuleNotFoundError:
     import pkg_resources
 import sqlalchemy
-import cachesql
+
+try:
+    import cachesql  # type: ignore[import-not-found]
+except ModuleNotFoundError:
+    cachesql = None  # Optional fallback; only required if you use cachesql-specific functions
+
 from scipy import signal, fft
 import numpy as np
 import pandas as pd
@@ -18,7 +23,7 @@ from audio_processing_tools.db_tools import get_db_data, upsert_df
 from audio_processing_tools.fetch import get_raw_audio_data, get_device_raw_audio_data
 from audio_processing_tools.parse import parse_mark_audio_file, parse_s3_audio_key, pcm_to_float
 from audio_processing_tools.edge.device_dsd_processing_emulator import DsdProcessingEmualtor
-from audio_processing_tools.edge.dsp_rain_detection import analyse_raw_audio_wrapper
+# from audio_processing_tools.edge.dsp_rain_detection import analyse_raw_audio_wrapper
 
 
 def butter_bandpass(lowcut, highcut, fs, order=5):
@@ -63,22 +68,30 @@ def emulator_output_to_df(
     df["device"] = device_id
     return df
 
-
 def validate_db_engine(db_engine):
-    if not (
-        isinstance(db_engine, sqlalchemy.engine.base.Engine)
-        or isinstance(db_engine, cachesql.sql.Database)
-    ):
-        raise Exception(f"Did not recognize db engine type:{type(db_engine)}")
+    """
+    Validate that db_engine is an ADSE-connected engine.
 
-    if (
-        isinstance(db_engine, sqlalchemy.engine.base.Engine)
-        and "adse" not in db_engine.url
-    ) or (
-        isinstance(db_engine, cachesql.sql.Database) and "adse" not in db_engine.name
-    ):
+    Supports:
+      - SQLAlchemy Engine (preferred)
+      - cachesql.sql.Database (optional, only if cachesql is installed)
+    """
+    is_sqlalchemy = isinstance(db_engine, sqlalchemy.engine.base.Engine)
+    is_cachesql = cachesql is not None and isinstance(db_engine, cachesql.sql.Database)
+
+    if not (is_sqlalchemy or is_cachesql):
+        raise Exception(f"Did not recognize db engine type: {type(db_engine)}")
+
+    if is_sqlalchemy:
+        engine_name = str(db_engine.url)
+    elif is_cachesql:
+        engine_name = db_engine.name
+    else:
+        # Should not be reachable, but keep for safety
+        raise Exception(f"Unsupported db engine type: {type(db_engine)}")
+
+    if "adse" not in engine_name:
         raise Exception("Must provide db_engine that connects to ADSE database")
-
 
 def fetch_audio_data(s3_file_key):
     try:
@@ -132,107 +145,107 @@ def add_weighted_dsd_data(
         return weighted_dsd_data
 
 
-def dsp_classification_from_audio_keys(
-    s3_file_keys: list,
-    db_engine,
-    reprocess=False,
-    force=True,
-    verbose=False,
-    local_raw_audio_cache=None,
-):
-    """input s3 keys for raw audio files, get back dsp algorithm output (i.e. 'drop count' data)
-    s3_file_keys - list of Mark 3 raw audio s3 file keys intended for processing
-    db_engine - pandas compatible db engine/connection object to use to connect to db
-    reprocess - if True will reprocess audio data through dsp classifier and rewrite to db, if False db cache will be checked
-    force -  if False will cache db queries locally for expedited future runs
-    verbose - if True will have more verbose print statements
-
-    """
-
-    # guard against upserts to other dbs
-    validate_db_engine(db_engine)
-
-    # First check db to see if processed data for this audio key already exists in db
-    if verbose:
-        print("Fetching dsp classification data from db")
-    query = f"""SELECT * FROM dsp_classification_from_raw_audio WHERE key in {tuple(s3_file_keys)} """
-    dsp_classification_output_df = get_db_data(
-        query, db_engine, force=force, cache=False
-    )
-    if verbose:
-        print("Checking if audio files require processing")
-    for key in tqdm(s3_file_keys):
-        if key in dsp_classification_output_df["key"].to_list() and reprocess is True:
-            dsp_classification_output_df = dsp_classification_output_df[
-                dsp_classification_output_df["key"] != key
-            ]
-        if (
-            key not in dsp_classification_output_df["key"].to_list()
-            or reprocess is True
-        ):
-            raw_audio_data = fetch_audio_data(key)
-            sig, metadata = parse_mark_audio_file(raw_audio_data)
-            metadata = {**metadata, **parse_s3_audio_key(key)}
-
-            # Only process complete 1-minute segments through dsd emulator
-            seconds_per_minute = 60
-            sample_rate = metadata["sample_rate"]
-            mins_to_process = int(
-                round(len(sig) / sample_rate, 1) // seconds_per_minute
-            )
-            if mins_to_process < 1:
-                raise Exception(
-                    "Cannot process audio file with duration less than 1 minute"
-                )
-            minute_series = []
-            for i in range(mins_to_process):
-                start_index = i * seconds_per_minute * sample_rate
-                end_index = (i + 1) * seconds_per_minute * sample_rate
-                sig_to_process = sig[start_index:end_index]
-
-                rain_drop_count, frain_mean = analyse_raw_audio_wrapper(
-                    sig_to_process, ref_file=None
-                )
-
-                # dsd data from device has right edge time label while audio files have left edge.
-                # adding one minute to timestamp for consistency
-                minute_data = pd.Series(
-                    {
-                        "key": key,
-                        "time": metadata["time"] + dt.timedelta(minutes=1 + i),
-                        "rain_drop_count": rain_drop_count,
-                        "frain_mean": frain_mean,
-                        "sample_rate": sample_rate,
-                    }
-                )
-                minute_series.append(minute_data)
-            output_df = pd.DataFrame(minute_series)
-
-            output_df["dsp_classifier_version"] = get_package_version()
-            output_df["device"] = metadata["device_id"]
-            current_time = dt.datetime.utcnow()
-            output_df["update_time"] = current_time
-            if reprocess is False:
-                output_df["create_time"] = current_time
-
-            # save results to db
-            if verbose:
-                print("Saving processed audio file to db")
-            upsert_df(
-                output_df.set_index(["key", "time"]),
-                "dsp_classification_from_raw_audio",
-                db_engine if isinstance(db_engine, sqlalchemy.engine.base.Engine)
-                # sqlalchemy engine class access required for cachesql engine
-                else (
-                    db_engine.engine
-                    if isinstance(db_engine, cachesql.sql.Database)
-                    else None
-                ),
-            )
-            dsp_classification_output_df = pd.concat(
-                [dsp_classification_output_df, output_df]
-            )
-    return dsp_classification_output_df
+# def dsp_classification_from_audio_keys(
+#     s3_file_keys: list,
+#     db_engine,
+#     reprocess=False,
+#     force=True,
+#     verbose=False,
+#     local_raw_audio_cache=None,
+# ):
+#     """input s3 keys for raw audio files, get back dsp algorithm output (i.e. 'drop count' data)
+#     s3_file_keys - list of Mark 3 raw audio s3 file keys intended for processing
+#     db_engine - pandas compatible db engine/connection object to use to connect to db
+#     reprocess - if True will reprocess audio data through dsp classifier and rewrite to db, if False db cache will be checked
+#     force -  if False will cache db queries locally for expedited future runs
+#     verbose - if True will have more verbose print statements
+# 
+#     """
+# 
+#     # guard against upserts to other dbs
+#     validate_db_engine(db_engine)
+# 
+#     # First check db to see if processed data for this audio key already exists in db
+#     if verbose:
+#         print("Fetching dsp classification data from db")
+#     query = f"""SELECT * FROM dsp_classification_from_raw_audio WHERE key in {tuple(s3_file_keys)} """
+#     dsp_classification_output_df = get_db_data(
+#         query, db_engine, force=force, cache=False
+#     )
+#     if verbose:
+#         print("Checking if audio files require processing")
+#     for key in tqdm(s3_file_keys):
+#         if key in dsp_classification_output_df["key"].to_list() and reprocess is True:
+#             dsp_classification_output_df = dsp_classification_output_df[
+#                 dsp_classification_output_df["key"] != key
+#             ]
+#         if (
+#             key not in dsp_classification_output_df["key"].to_list()
+#             or reprocess is True
+#         ):
+#             raw_audio_data = fetch_audio_data(key)
+#             sig, metadata = parse_mark_audio_file(raw_audio_data)
+#             metadata = {**metadata, **parse_s3_audio_key(key)}
+# 
+#             # Only process complete 1-minute segments through dsd emulator
+#             seconds_per_minute = 60
+#             sample_rate = metadata["sample_rate"]
+#             mins_to_process = int(
+#                 round(len(sig) / sample_rate, 1) // seconds_per_minute
+#             )
+#             if mins_to_process < 1:
+#                 raise Exception(
+#                     "Cannot process audio file with duration less than 1 minute"
+#                 )
+#             minute_series = []
+#             for i in range(mins_to_process):
+#                 start_index = i * seconds_per_minute * sample_rate
+#                 end_index = (i + 1) * seconds_per_minute * sample_rate
+#                 sig_to_process = sig[start_index:end_index]
+# 
+#                 rain_drop_count, frain_mean = analyse_raw_audio_wrapper(
+#                     sig_to_process, ref_file=None
+#                 )
+# 
+#                 # dsd data from device has right edge time label while audio files have left edge.
+#                 # adding one minute to timestamp for consistency
+#                 minute_data = pd.Series(
+#                     {
+#                         "key": key,
+#                         "time": metadata["time"] + dt.timedelta(minutes=1 + i),
+#                         "rain_drop_count": rain_drop_count,
+#                         "frain_mean": frain_mean,
+#                         "sample_rate": sample_rate,
+#                     }
+#                 )
+#                 minute_series.append(minute_data)
+#             output_df = pd.DataFrame(minute_series)
+# 
+#             output_df["dsp_classifier_version"] = get_package_version()
+#             output_df["device"] = metadata["device_id"]
+#             current_time = dt.datetime.utcnow()
+#             output_df["update_time"] = current_time
+#             if reprocess is False:
+#                 output_df["create_time"] = current_time
+# 
+#             # save results to db
+#             if verbose:
+#                 print("Saving processed audio file to db")
+#             upsert_df(
+#                 output_df.set_index(["key", "time"]),
+#                 "dsp_classification_from_raw_audio",
+#                 db_engine if isinstance(db_engine, sqlalchemy.engine.base.Engine)
+#                 # sqlalchemy engine class access required for cachesql engine
+#                 else (
+#                     db_engine.engine
+#                     if isinstance(db_engine, cachesql.sql.Database)
+#                     else None
+#                 ),
+#             )
+#             dsp_classification_output_df = pd.concat(
+#                 [dsp_classification_output_df, output_df]
+#             )
+#     return dsp_classification_output_df
 
 
 def process_audio_file_dsd(key, local_cache_location, verbose, reprocess):
@@ -306,18 +319,34 @@ def dsd_from_audio_keys(
     reprocess=False,
     verbose=False,
     local_cache_location="raw_audio_cache",
-    max_workers=None
+    max_workers=None,
 ):
+    """
+    Fetch or compute DSD data for a list of S3 file keys.
+
+    Supports:
+      - SQLAlchemy Engine (preferred)
+      - cachesql.sql.Database (optional, only if cachesql is installed)
+    """
+    validate_db_engine(db_engine)
+
     if verbose:
         print("Fetching existing DSD data from db")
+
     query = f"""SELECT * FROM dsd_from_raw_audio WHERE key IN {tuple(s3_file_keys)}"""
     existing_dsd_df = get_db_data(query, db_engine, force=True)
 
-    existing_keys = set(existing_dsd_df['key'].tolist()) if not existing_dsd_df.empty else set()
+    existing_keys = (
+        set(existing_dsd_df["key"].tolist()) if not existing_dsd_df.empty else set()
+    )
 
     # Determine which keys need processing
-    keys_to_process = s3_file_keys if reprocess else [key for key in s3_file_keys if key not in existing_keys]
+    if reprocess:
+        keys_to_process = s3_file_keys
+    else:
+        keys_to_process = [key for key in s3_file_keys if key not in existing_keys]
 
+    results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
@@ -326,38 +355,48 @@ def dsd_from_audio_keys(
                 local_cache_location,
                 verbose,
                 reprocess,
-            ): key for key in keys_to_process
+            ): key
+            for key in keys_to_process
         }
 
-        results = []
-        # Process futures as they complete
         for future in tqdm(
-            as_completed(futures), total=len(futures), desc="Processing audio files"
+            as_completed(futures),
+            total=len(futures),
+            desc="Processing audio files",
         ):
             result_df = future.result()
             results.append(result_df)
             if verbose:
                 print(f"Processed and fetched results for key: {futures[future]}")
 
-    # Concatenate all result dataframes from processed keys
-    if results:
-        processed_df = pd.concat(results, ignore_index=True)
-        # Upsert results into the database
+    processed_df = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
+    # Decide which underlying engine to pass to upsert_df
+    is_sqlalchemy = isinstance(db_engine, sqlalchemy.engine.base.Engine)
+    is_cachesql = cachesql is not None and isinstance(db_engine, cachesql.sql.Database)
+
+    if is_sqlalchemy:
+        upsert_engine = db_engine
+    elif is_cachesql:
+        upsert_engine = db_engine.engine  # cachesql Database wraps a SQLAlchemy engine
+    else:
+        raise Exception(
+            f"Unsupported db_engine type for upsert_df: {type(db_engine)}"
+        )
+
+    if not processed_df.empty:
         upsert_df(
             processed_df.set_index(["key", "time"]),
             "dsd_from_raw_audio",
-            db_engine if isinstance(db_engine, sqlalchemy.engine.base.Engine)
-            # sqlalchemy engine class access required for cachesql engine
-            else (
-                db_engine.engine
-                if isinstance(db_engine, cachesql.sql.Database)
-                else None
-            ),
+            upsert_engine,
         )
 
-    # Combine existing data with newly processed data if not reprocessing all
+    # Combine existing data with newly processed data
     if not reprocess:
-        final_df = pd.concat([existing_dsd_df, processed_df], ignore_index=True) if results else existing_dsd_df
+        if not processed_df.empty:
+            final_df = pd.concat([existing_dsd_df, processed_df], ignore_index=True)
+        else:
+            final_df = existing_dsd_df
     else:
         final_df = processed_df
 

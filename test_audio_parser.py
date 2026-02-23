@@ -138,12 +138,15 @@ def visualize_and_play_audio(file_path, force_file_type=None):
 
 def main():
     # Test files - replace with your actual file paths
-    pcm_file = "/Volumes/Work Drive/raw_audio_cache/raw_audio/D006615/2024/05/29/20240529_05_15_50_000000_rain_000.bin"
-    alac_file = "/Volumes/Work Drive/raw_audio_cache/raw_audio/D006615/2025/01/20/20250120_14_48_00_000000_rain_032.bin"
+    # 20250704_00_21_00_000000_rain_660.bin	20250704_02_00_00_000000_rain_6c1.bin
+    alac_file = "/Users/vikrantoak/my_jupyter_project/raw_audio_cache/raw_audio/D009933/2025/07/04/20250704_00_21_00_000000_rain_660.bin"	
+    #20250704_02_00_00_000000_rain_6c1.bin
+    #pcm_file = "rw_audio_cache/raw_audio/D006615/2024/05/29/20240529_05_15_50_000000_rain_000.bin"
+    # pcm_file = "/Volumes/Work Drive/raw_audio_cache/raw_audio/D006615/2025/01/20/20250120_14_48_00_000000_rain_032.bin"
     
     # Test PCM file
-    print("\n=== Testing PCM File ===")
-    visualize_and_play_audio(pcm_file, force_file_type='pcm')
+    # print("\n=== Testing PCM File ===")
+    # visualize_and_play_audio(pcm_file, force_file_type='pcm')
     
     # Test ALAC file
     print("\n=== Testing ALAC File ===")

@@ -1,13 +1,25 @@
+from __future__ import annotations
+
+
+
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import datetime as dt
 import os
 import wave
 import tempfile
+import logging
+import shutil
+import subprocess
+from typing import Optional,Tuple, Dict, Any
 
 import kaitaistruct
-import numpy as np
-import pandas as pd
-from kaitaistruct import KaitaiStruct
 from kaitaistruct import ValidationNotEqualError
+from kaitaistruct import KaitaiStruct
+
 
 from audio_processing_tools.db_tools import upsert_df
 from audio_processing_tools.fetch import get_device_raw_audio_data
@@ -65,24 +77,117 @@ def create_dict_by_kaitai(compressed_bin):
     return serialized
 
 
-def parse_mark_audio_file(file_contents: bytes, force_file_type=None):
+# def parse_mark_audio_file(file_contents: bytes, force_file_type=None):
+#     """
+#     Parse a MARK audio file, handling both legacy PCM and ALAC-encoded formats.
+    
+#     Parameters
+#     ----------
+#     file_contents : bytes
+#         Raw binary contents of the audio file
+#     force_file_type : str, optional
+#         Override automatic format detection. Options: 'pcm', 'alac'
+    
+#     Returns
+#     -------
+#     sig : np.ndarray
+#         Audio signal data
+#     metadata : dict
+#         Metadata about the audio file
+#     """
+#     try:
+#         parsed_binary = create_dict_by_kaitai(file_contents)
+#         sample_rate = parsed_binary["sample_rate"]
+#         channels = parsed_binary["channels"]
+#         bit_depth = parsed_binary["bit_depth"]
+#         endianness = parsed_binary["endianness"]
+#         gps = parsed_binary["gps"]
+#         audio_data = parsed_binary["audio"]
+#         device_id = parsed_binary["device"]
+#         time = parsed_binary["ts"]
+#         file_version = parsed_binary['audio_file_version']
+#     except ValidationNotEqualError:
+#         print("COULD NOT FIND HEADER ON AUDIO, USING DEFAULT IMPORT PARAMS")
+#         sample_rate = 11162
+#         channels = 1
+#         bit_depth = 16
+#         endianness = 0
+#         file_version = 0
+
+#     # Determine file type (PCM vs ALAC)
+#     is_alac = force_file_type == 'alac' if force_file_type else file_version >= 1
+
+#     if is_alac:
+#         # Create temporary files for conversion
+#         with tempfile.TemporaryDirectory() as temp_dir:
+#             # Write original data to temp file
+#             input_path = os.path.join(temp_dir, "input.bin")
+#             with open(input_path, "wb") as f:
+#                 f.write(audio_data)
+            
+#             # Create paths for intermediate CAF file and final WAV
+#             caf_path = os.path.join(temp_dir, "audio.caf")
+#             wav_path = os.path.join(temp_dir, "audio.wav")
+            
+#             # Convert to CAF and WAV
+#             rearrange(input_path, caf_path)
+#             os.system(f'ffmpeg -i "{caf_path}" "{wav_path}" -y -v error')
+            
+#             # Read the WAV file
+#             with wave.open(wav_path, 'rb') as wav_file:
+#                 audio_data = wav_file.readframes(wav_file.getnframes())
+#                 sig = np.frombuffer(audio_data, dtype=np.int16)
+#     else:
+#         # Original PCM processing
+#         sig = np.frombuffer(audio_data, dtype=np.int16)
+
+#     duration = round(len(sig) / sample_rate, 2)
+
+#     metadata = {
+#         "sample_rate": sample_rate,
+#         "channels": channels,
+#         "bit_depth": bit_depth,
+#         "endianness": endianness,
+#         "device_id": device_id,
+#         "time": time,
+#         "lat": gps[0],
+#         "long": gps[1],
+#         "duration": duration,
+#         "audio_file_version": file_version,
+#         "format": "alac" if is_alac else "pcm"
+#     }
+
+#     return sig, metadata
+
+
+
+def parse_mark_audio_file(
+    file_contents: bytes,
+    force_file_type: str | None = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Parse a MARK audio file, handling both legacy PCM and ALAC-encoded formats.
-    
+
+    Ensures audio payload length is aligned to bit depth before decoding.
+
     Parameters
     ----------
     file_contents : bytes
-        Raw binary contents of the audio file
-    force_file_type : str, optional
-        Override automatic format detection. Options: 'pcm', 'alac'
-    
+        Raw binary contents of the audio file (full file, including header)
+    force_file_type : {'pcm', 'alac'}, optional
+        Override automatic format detection.
+
     Returns
     -------
     sig : np.ndarray
-        Audio signal data
+        Audio signal data (int16 PCM)
     metadata : dict
-        Metadata about the audio file
+        Metadata about the audio file.
     """
+
+    # ------------------------------------------------------------------
+    # 1) Try to parse header with Kaitai
+    # ------------------------------------------------------------------
     try:
         parsed_binary = create_dict_by_kaitai(file_contents)
         sample_rate = parsed_binary["sample_rate"]
@@ -93,44 +198,80 @@ def parse_mark_audio_file(file_contents: bytes, force_file_type=None):
         audio_data = parsed_binary["audio"]
         device_id = parsed_binary["device"]
         time = parsed_binary["ts"]
-        file_version = parsed_binary['audio_file_version']
+        file_version = parsed_binary["audio_file_version"]
     except ValidationNotEqualError:
-        print("COULD NOT FIND HEADER ON AUDIO, USING DEFAULT IMPORT PARAMS")
+        print("WARNING: Could not parse header, assuming raw PCM defaults")
+
         sample_rate = 11162
         channels = 1
         bit_depth = 16
         endianness = 0
         file_version = 0
 
-    # Determine file type (PCM vs ALAC)
-    is_alac = force_file_type == 'alac' if force_file_type else file_version >= 1
+        gps = (None, None)
+        device_id = None
+        time = None
 
-    if is_alac:
-        # Create temporary files for conversion
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Write original data to temp file
-            input_path = os.path.join(temp_dir, "input.bin")
-            with open(input_path, "wb") as f:
-                f.write(audio_data)
-            
-            # Create paths for intermediate CAF file and final WAV
-            caf_path = os.path.join(temp_dir, "audio.caf")
-            wav_path = os.path.join(temp_dir, "audio.wav")
-            
-            # Convert to CAF and WAV
-            rearrange(input_path, caf_path)
-            os.system(f'ffmpeg -i "{caf_path}" "{wav_path}" -y -v error')
-            
-            # Read the WAV file
-            with wave.open(wav_path, 'rb') as wav_file:
-                audio_data = wav_file.readframes(wav_file.getnframes())
-                sig = np.frombuffer(audio_data, dtype=np.int16)
+        audio_data = file_contents
+
+    # ------------------------------------------------------------------
+    # 2) Normalize and validate bit depth
+    # ------------------------------------------------------------------
+    if bit_depth == 0:
+        bit_depth = 16
+
+    if bit_depth % 8 != 0:
+        raise ValueError(f"Invalid bit depth {bit_depth}: must be multiple of 8")
+
+    if bit_depth != 16:
+        print(f"WARNING: Unsupported bit depth {bit_depth}; assuming 16-bit PCM compatibility")
+
+    bytes_per_sample = bit_depth // 8
+
+    # ------------------------------------------------------------------
+    # 3) Align audio payload length BEFORE decoding
+    # ------------------------------------------------------------------
+    remainder = len(audio_data) % bytes_per_sample
+    if remainder != 0:
+        audio_data = audio_data[: len(audio_data) - remainder]
+
+    # ------------------------------------------------------------------
+    # 4) Decide file type (PCM vs ALAC)
+    # ------------------------------------------------------------------
+    if force_file_type == "alac":
+        is_alac = True
+    elif force_file_type == "pcm":
+        is_alac = False
     else:
-        # Original PCM processing
-        sig = np.frombuffer(audio_data, dtype=np.int16)
+        # Default heuristic
+        is_alac = file_version >= 1
 
-    duration = round(len(sig) / sample_rate, 2)
+    # ------------------------------------------------------------------
+    # 5) Decode audio
+    # ------------------------------------------------------------------
+    if is_alac:
+        sig = _decode_alac_to_pcm(audio_data)
+    else:
+        sig = _decode_pcm_payload(
+            audio_data,
+            bit_depth=bit_depth,
+            channels=channels,
+            endianness=endianness,
+        )
 
+    # ------------------------------------------------------------------
+    # 6) Compute duration
+    # ------------------------------------------------------------------
+    if channels > 0:
+        n_samples_per_channel = len(sig) / channels
+    else:
+        n_samples_per_channel = len(sig)
+
+    duration = round(n_samples_per_channel / sample_rate, 2)
+
+    # ------------------------------------------------------------------
+    # 7) Metadata
+    # ------------------------------------------------------------------
     metadata = {
         "sample_rate": sample_rate,
         "channels": channels,
@@ -142,10 +283,301 @@ def parse_mark_audio_file(file_contents: bytes, force_file_type=None):
         "long": gps[1],
         "duration": duration,
         "audio_file_version": file_version,
-        "format": "alac" if is_alac else "pcm"
+        "format": "alac" if is_alac else "pcm",
     }
 
     return sig, metadata
+
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_ffmpeg_path(
+    ffmpeg_path: Optional[str] = None,
+) -> str:
+    """
+    Resolve the ffmpeg executable path in a cron-safe way.
+
+    Resolution order:
+      1) explicit argument `ffmpeg_path` (absolute or resolvable)
+      2) env var FFMPEG_PATH
+      3) shutil.which("ffmpeg") on current PATH
+      4) common locations (macOS Homebrew, Linux)
+
+    Raises
+    ------
+    FileNotFoundError
+        If ffmpeg cannot be resolved.
+    """
+    candidates: list[str] = []
+
+    if ffmpeg_path:
+        candidates.append(ffmpeg_path)
+
+    env_override = os.environ.get("FFMPEG_PATH")
+    if env_override:
+        candidates.append(env_override)
+
+    # If user gave something like "ffmpeg" or "ffmpeg-7", try resolving via PATH
+    for c in list(candidates):
+        resolved = shutil.which(c)
+        if resolved:
+            return resolved
+        p = Path(c)
+        if p.exists() and os.access(str(p), os.X_OK):
+            return str(p)
+
+    resolved = shutil.which("ffmpeg")
+    if resolved:
+        return resolved
+
+    # Common fallback locations
+    fallback_paths = [
+        "/opt/homebrew/bin/ffmpeg",  # macOS Apple Silicon Homebrew
+        "/usr/local/bin/ffmpeg",     # macOS Intel Homebrew
+        "/usr/bin/ffmpeg",           # sometimes present on Linux
+        "/bin/ffmpeg",
+    ]
+    for fp in fallback_paths:
+        if os.path.exists(fp) and os.access(fp, os.X_OK):
+            return fp
+
+    raise FileNotFoundError(
+        "ffmpeg not found. Install it (e.g., brew install ffmpeg / apt-get install ffmpeg) "
+        "or set FFMPEG_PATH to the absolute path of ffmpeg (useful for cron)."
+    )
+
+
+def _subprocess_env_with_common_paths() -> dict:
+    """
+    Build a subprocess environment with extra PATH entries.
+    This helps under cron where PATH can be minimal.
+    """
+    env = os.environ.copy()
+    current = env.get("PATH", "")
+
+    extras = [
+        "/opt/homebrew/bin",  # macOS Apple Silicon
+        "/usr/local/bin",     # macOS Intel / some Linux
+        "/usr/bin",
+        "/bin",
+    ]
+
+    parts = [p for p in current.split(os.pathsep) if p] if current else []
+    # Prepend extras not already present
+    new_parts = [p for p in extras if p not in parts] + parts
+    env["PATH"] = os.pathsep.join(new_parts)
+    return env
+
+
+def _decode_alac_to_pcm(
+    audio_data: bytes,
+    *,
+    ffmpeg_path: Optional[str] = None,
+) -> np.ndarray:
+    """
+    Decode MARK ALAC payload to int16 PCM by:
+      (1) writing payload to temp
+      (2) rearranging into a CAF container
+      (3) decoding CAF -> WAV via ffmpeg
+      (4) loading WAV frames into numpy int16
+
+    Parameters
+    ----------
+    audio_data:
+        ALAC-encoded payload extracted from the MARK container.
+    ffmpeg_path:
+        Optional explicit ffmpeg path. If None, resolves via FFMPEG_PATH, PATH, and common fallbacks.
+
+    Returns
+    -------
+    sig:
+        Decoded PCM samples (int16). Interleaved if multichannel.
+
+    Raises
+    ------
+    FileNotFoundError:
+        If ffmpeg cannot be found.
+    RuntimeError:
+        If ffmpeg fails decoding.
+    ValueError:
+        If decoded WAV is not 16-bit PCM.
+    """
+    ffmpeg = _resolve_ffmpeg_path(ffmpeg_path)
+    env = _subprocess_env_with_common_paths()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = os.path.join(temp_dir, "input.bin")
+        caf_path = os.path.join(temp_dir, "audio.caf")
+        wav_path = os.path.join(temp_dir, "audio.wav")
+
+        # Write raw ALAC payload
+        with open(input_path, "wb") as f:
+            f.write(audio_data)
+
+        # Rearrange into CAF container (your existing function)
+        rearrange(input_path, caf_path)
+
+        # Decode via ffmpeg
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "error",  # only errors
+            "-y",                  # overwrite
+            "-i", caf_path,
+            wav_path,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+        if result.returncode != 0:
+            # include some context for debugging
+            raise RuntimeError(
+                "ffmpeg failed while decoding ALAC.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"Return code: {result.returncode}\n"
+                f"stderr:\n{result.stderr.strip()}"
+            )
+
+        # Demux warnings sometimes appear even on success
+        if result.stderr and "Error during demuxing" in result.stderr:
+            logger.warning(
+                "ffmpeg reported 'Error during demuxing' but decode succeeded. stderr=%s",
+                result.stderr.strip(),
+            )
+
+        # Read back WAV as int16 PCM
+        with wave.open(wav_path, "rb") as wav_file:
+            n_channels = wav_file.getnchannels()
+            sampwidth = wav_file.getsampwidth()
+            if sampwidth != 2:
+                raise ValueError(
+                    f"Expected 16-bit WAV (sampwidth=2), got sampwidth={sampwidth}. "
+                    f"n_channels={n_channels}"
+                )
+
+            raw = wav_file.readframes(wav_file.getnframes())
+            sig = np.frombuffer(raw, dtype=np.int16)
+
+        # If you want to return shape (N, C) instead of interleaved:
+        # if n_channels > 1:
+        #     sig = sig.reshape(-1, n_channels)
+
+        return sig
+# def _decode_alac_to_pcm(audio_data: bytes) -> np.ndarray:
+#     """
+#     Helper: decode ALAC payload to int16 PCM using rearrange() + ffmpeg.
+
+#     Parameters
+#     ----------
+#     audio_data : bytes
+#         ALAC-encoded payload extracted from the MARK container.
+
+#     Returns
+#     -------
+#     sig : np.ndarray[int16]
+#         Decoded PCM samples.
+#     """
+#     with tempfile.TemporaryDirectory() as temp_dir:
+#         input_path = os.path.join(temp_dir, "input.bin")
+#         caf_path = os.path.join(temp_dir, "audio.caf")
+#         wav_path = os.path.join(temp_dir, "audio.wav")
+
+#         # Write raw ALAC payload
+#         with open(input_path, "wb") as f:
+#             f.write(audio_data)
+
+#         # Rearrange into CAF container
+#         rearrange(input_path, caf_path)
+
+#         # Run ffmpeg with proper error handling
+#         result = subprocess.run(
+#             [
+#                 "ffmpeg",
+#                 "-v", "error",      # only log errors
+#                 "-y",               # overwrite
+#                 "-i", caf_path,
+#                 wav_path,
+#             ],
+#             stdout=subprocess.PIPE,
+#             stderr=subprocess.PIPE,
+#             text=True,
+#         )
+
+#         if result.returncode != 0:
+#             raise RuntimeError(
+#                 f"ffmpeg failed while decoding ALAC (code {result.returncode}):\n{result.stderr}"
+#             )
+
+#         # Optional: warn if demuxing issues occurred but decode succeeded
+#         if "Error during demuxing" in result.stderr:
+#             print("Warning: ffmpeg reported 'Error during demuxing' but decode succeeded.")
+
+#         # Read back WAV as int16 PCM
+#         with wave.open(wav_path, "rb") as wav_file:
+#             n_channels = wav_file.getnchannels()
+#             sampwidth = wav_file.getsampwidth()
+#             # You can re-check these against expected `bit_depth` if you want.
+#             if sampwidth != 2:
+#                 raise ValueError(f"Expected 16-bit WAV, got sampwidth={sampwidth}")
+
+#             raw = wav_file.readframes(wav_file.getnframes())
+#             sig = np.frombuffer(raw, dtype=np.int16)
+
+#         # sig is interleaved if n_channels > 1; you can reshape if needed:
+#         # sig = sig.reshape(-1, n_channels)
+
+#         return sig
+
+
+def _decode_pcm_payload(audio_data: bytes, bit_depth: int, channels: int, endianness: int) -> np.ndarray:
+    """
+    Helper: decode raw PCM payload from MARK file into int16 PCM.
+    Currently assumes 16-bit PCM, mono or interleaved multi-channel.
+
+    Parameters
+    ----------
+    audio_data : bytes
+        Raw PCM payload.
+    bit_depth : int
+        Bits per sample (expected 16).
+    channels : int
+        Number of channels.
+    endianness : int
+        0 = little-endian, 1 = big-endian (based on your Kaitai spec).
+
+    Returns
+    -------
+    sig : np.ndarray[int16]
+        PCM samples.
+    """
+    if bit_depth != 16:
+        # You can extend this if your format ever changes.
+        raise ValueError(f"Unsupported PCM bit depth: {bit_depth}")
+
+    # Decide dtype string based on endianness
+    # 0 => little-endian, 1 => big-endian (adapt if your spec uses different codes)
+    if endianness == 0:
+        dtype = "<i2"  # little-endian 16-bit signed
+    else:
+        dtype = ">i2"  # big-endian 16-bit signed
+
+    sig = np.frombuffer(audio_data, dtype=dtype)
+
+    # If you want native-endian int16:
+    sig = sig.astype(np.int16, copy=False)
+
+    # You can reshape to (n_frames, channels) if needed:
+    # if channels > 1:
+    #     sig = sig.reshape(-1, channels)
+
+    return sig
 
 
 def parse_s3_audio_key(key: str) -> dict:

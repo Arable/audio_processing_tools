@@ -66,12 +66,12 @@ class BaseProcessor:
                     f"audio_data too short: {audio_data.size} < required {min_len} samples"
                 )
 
-    def _with_timing(self, fn: Callable[..., Any], *args, **kwargs) -> Tuple[Any, float]:
+    def _with_timing(self, func: Callable[..., Any], *args, **kwargs) -> Tuple[Any, float]:
         """
         Execute fn(*args, **kwargs) and return (result, elapsed_time_seconds).
         """
         t0 = time.perf_counter()
-        result = fn(*args, **kwargs)
+        result = func(*args, **kwargs)
         dt = time.perf_counter() - t0
         return result, dt
 
@@ -141,68 +141,28 @@ class RainProcessor(BaseProcessor):
 
         return results, state_out
 
-
-# ----------------------------------------------------------------------
-# NoiseProcessor: generic noise estimation wrapper
-# ----------------------------------------------------------------------
-
-
-@dataclass
-class NoiseProcessor(BaseProcessor):
+def has_processor(processors, name: str) -> bool:
     """
-    Generic wrapper for a noise or SNR estimation algorithm.
+    Check whether a processor with a given name exists in a list of processors.
 
-    Expected function signature:
-        fn(audio_data: np.ndarray, **params) -> (metrics_dict, state_dict)
+    Parameters
+    ----------
+    processors : Iterable
+        A collection of processor objects. Each processor is expected
+        to expose a `.name` attribute.
 
-    Example:
+    name : str
+        The processor name to look for (e.g. "rain",
+        "noise_spectral", "spectral_features").
 
-        def my_noise_fn(audio_data: np.ndarray, **params) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-            metrics = {
-                "snr_db": 17.3,
-                "floor_db": -68.2,
-                "wind_index": 0.42,
-            }
-            state = {
-                "noise_spectrum": noise_spectrum,
-                "time_mask": time_mask,
-            }
-            return metrics, state
+    Returns
+    -------
+    bool
+        True if any processor in `processors` has `p.name == name`,
+        False otherwise.
+
     """
-
-    fn: Callable[..., Tuple[Dict[str, Any], Dict[str, Any]]]
-
-    def run(
-        self,
-        audio_data: np.ndarray,
-        params: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        # Validate input buffer
-        self._validate_audio(audio_data, params)
-
-        # Call underlying algorithm with timing
-        (metrics, state), latency = self._with_timing(
-            self.fn,
-            audio_data,
-            **params,
-        )
-
-        # Normalize metrics/state to dicts
-        if not isinstance(metrics, dict):
-            metrics = {"value": metrics}
-        if not isinstance(state, dict):
-            state = {"state": state}
-
-        metrics_out = dict(metrics)
-        metrics_out["latency_s"] = latency
-
-        state_out = dict(state)
-        state_out["processor"] = self.name
-        state_out["latency_s"] = latency
-
-        return metrics_out, state_out
-
-
+    return any(p.name == name for p in processors)
 # ----------------------------------------------------------------------
 # Minimal self-test / example usage
 # ----------------------------------------------------------------------

@@ -88,6 +88,20 @@ class AudioProcessor(Protocol):
         """
         ...
 
+def _extract_param_updates(obj: Any) -> Dict[str, Any]:
+    """
+    Extract parameter updates from processor output/state.
+
+    Convention:
+      - state["_param_updates"] : Dict[str, Any]
+      - results["_param_updates"]: Dict[str, Any]  (optional)
+
+    Returns empty dict if none / invalid.
+    """
+    if not isinstance(obj, dict):
+        return {}
+    upd = obj.get("_param_updates")
+    return upd if isinstance(upd, dict) else {}
 
 # ----------------------------------------------------------------------
 # Helper for namespaced result columns
@@ -281,19 +295,44 @@ def process_audio_batches_v2(
                 "file_key": file_key,
                 "rain_actual": rain_actual,
             }
-
-            # ----------------------------------------------------------
+                        # ----------------------------------------------------------
             # 2.1 Run all processors on this audio buffer
+            #     + allow earlier processors to update params for later processors
             # ----------------------------------------------------------
+
+            # Context params are per-file and accumulate updates as processors run
+            ctx_params: Dict[str, Any] = dict(params_global)
+
             for proc in processors:
-                proc_params = {**params_global, **params_by_processor.get(proc.name, {})}
+                # Merge in any accumulated param updates + per-processor overrides
+                proc_params = dict(ctx_params)
+                proc_params.update(params_by_processor.get(proc.name, {}))
+
+                # Optional: allow processor-local setup
+                if hasattr(proc, "setup"):
+                    proc.setup(proc_params)
+
                 proc_results, proc_state = proc.run(audio, proc_params)
 
-                proc_state = dict(proc_state)
-                proc_state["file_key"] = file_key
+                # Normalize to dicts
+                proc_results = dict(proc_results) if isinstance(proc_results, dict) else {"value": proc_results}
+                proc_state = dict(proc_state) if isinstance(proc_state, dict) else {"state": proc_state}
 
-                row.update(_flatten_with_namespace(proc.name, proc_results))
+                # Record state
+                proc_state["file_key"] = file_key
                 states_by_processor[proc.name].append(proc_state)
+
+                # Record scalar metrics into main row
+                row.update(_flatten_with_namespace(proc.name, proc_results))
+
+                # Pull param updates (prefer state; optionally also allow results)
+                updates = {}
+                updates.update(_extract_param_updates(proc_results))
+                updates.update(_extract_param_updates(proc_state))
+
+                # Apply updates for downstream processors (same file only)
+                if updates:
+                    ctx_params.update(updates)
 
             # ----------------------------------------------------------
             # 2.2 Optional rain/no-rain mismatch diagnostics
@@ -342,3 +381,24 @@ def process_audio_batches_v2(
 
 # Backwards-compatible alias
 process_audio_batches = process_audio_batches_v2
+
+
+
+# old code - To Be Deleted 
+#             # # ----------------------------------------------------------
+            # # 2.1 Run all processors on this audio buffer
+            # # ----------------------------------------------------------
+            # for proc in processors:
+            #     proc_params = {**params_global, **params_by_processor.get(proc.name, {})}
+
+            #     if hasattr(proc, "setup"):
+            #         proc.setup(proc_params)   # or setup(proc_params, params_global["sample_rate"])
+
+            #     proc_results, proc_state = proc.run(audio, proc_params)
+
+            #     proc_state = dict(proc_state)
+            #     proc_state["file_key"] = file_key
+
+            #     row.update(_flatten_with_namespace(proc.name, proc_results))
+            #     states_by_processor[proc.name].append(proc_state)
+
