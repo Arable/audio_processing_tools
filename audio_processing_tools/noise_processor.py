@@ -101,8 +101,9 @@ class NoiseProcessor(BaseProcessor):
         is_rain = out["is_rain"]
         x_hp = out["x_hp"]
 
-        # Compute simple band-limited noise statistics
-        band_mask = (freqs >= cfg.fmin) & (freqs <= cfg.fmax)
+        # Compute simple band-limited noise statistics using operating_band
+        f_lo, f_hi = cfg.operating_band
+        band_mask = (freqs >= f_lo) & (freqs <= f_hi)
         noise_band = noise_psd[band_mask]
         noise_db = 10.0 * np.log10(noise_band + cfg.eps)
 

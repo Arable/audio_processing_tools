@@ -10,7 +10,40 @@ import scipy.signal as spsig
 import scipy.ndimage as ndi
 import librosa
 
+
 from .rain_frame_classifier import RainFrameClassifierMixin
+
+# Helper to safely convert numpy scalars/arrays for debug, and optionally gate printing.
+def _as_float(x: Any, default: float = float("nan")) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _mode_isolation_mask(
+    freqs: np.ndarray,
+    mode_bands: Tuple[Tuple[float, float], ...],
+    attn_db: float,
+    smooth_bins: int,
+) -> np.ndarray:
+    """
+    Build a 1D amplitude mask g[f] that is 1.0 inside any mode band,
+    and attenuated elsewhere by attn_db (amplitude dB). Optionally smooth in bins.
+    """
+    attn = 10.0 ** (float(attn_db) / 20.0)  # amplitude scaling
+    g = np.full_like(freqs, attn, dtype=np.float64)
+
+    for (a, b) in mode_bands:
+        g[(freqs >= float(a)) & (freqs <= float(b))] = 1.0
+
+    sb = int(smooth_bins)
+    if sb and sb > 0:
+        ker = np.ones(2 * sb + 1, dtype=np.float64)
+        ker /= ker.sum()
+        g = np.convolve(g, ker, mode="same")
+        g = np.clip(g, 0.0, 1.0)
+
+    return g
 
 @dataclass
 class NoiseProcessorConfig:
@@ -38,16 +71,20 @@ class NoiseProcessorConfig:
     hp_cutoff_hz: float = 350.0
     hp_order: int = 4
 
+    # Pre-filter stage (applied before STFT)
+    #   - "highpass": current behavior using hp_cutoff_hz/hp_order
+    #   - "bandpass": use cfg.operating_band with bp_order
+    #   - "none": no pre-filter
+    pre_filter_mode: str = "highpass"  # "highpass" | "bandpass" | "none"
+    bp_order: int = 4
+
     # -----------------------------------------------------------
     # Operating band (noise estimation + gain applied here)
     # -----------------------------------------------------------
     # NOTE: `operating_band` is the canonical band used everywhere.
-    # `fmin`/`fmax` are kept ONLY for backward-compatibility with older params.
+    # If callers still pass legacy `fmin`/`fmax`, they are translated into `operating_band`
+    # inside `build_noise_config()`.
     operating_band: Tuple[float, float] = (400.0, 3500.0)
-
-    # Back-compat only (deprecated): if provided, they will be reconciled into operating_band
-    fmin: float = 400.0
-    fmax: float = 3500.0
 
     # -----------------------------------------------------------
     # Noise tracking (quantile/min-stats)
@@ -131,9 +168,21 @@ class NoiseProcessorConfig:
     rain_hold_frames: int = 1
     noise_confirm_frames: int = 2
 
+    # -----------------------------------------------------------
+    # Debug / tuning
+    # -----------------------------------------------------------
+    debug_enable: bool = False
+    debug_frame_decim: int = 1  # store every Nth FrameFeatures; 1 = all
 
+     # -----------------------------------------------------------
+    # TEMP experiment: mode-only reconstruction (for listening tests)
+    # -----------------------------------------------------------
+    mode_isolation_enable: bool = False
+    mode_isolation_attn_db: float = -60.0     # attenuation outside mode bands (dB, amplitude)
+    mode_isolation_smooth_bins: int = 2       # 0 disables; small smoothing reduces ringing
+    mode_isolation_affects_classifier: bool = False
+    mode_isolation_only: bool = True
 
- 
 # -----------------------------------------------------------
 # Config builder (dataclass defaults + params overrides)
 # -----------------------------------------------------------
@@ -148,6 +197,15 @@ def build_noise_config(sample_rate: int, params: Dict[str, Any]) -> "NoiseProces
 
     # set of dataclass field names
     cfg_fields = {f.name for f in fields(NoiseProcessorConfig)}
+
+    # Legacy support: allow callers to pass fmin/fmax, but always normalize into operating_band.
+    # operating_band wins if both are provided.
+    if "operating_band" not in params:
+        fmin = params.get("fmin", None)
+        fmax = params.get("fmax", None)
+        if fmin is not None and fmax is not None:
+            params = dict(params)  # avoid mutating caller dict
+            params["operating_band"] = (float(fmin), float(fmax))
 
     # apply overrides
     for k, v in params.items():
@@ -167,14 +225,9 @@ def build_noise_config(sample_rate: int, params: Dict[str, Any]) -> "NoiseProces
 
         setattr(cfg, k, v)
 
-    # Reconcile back-compat fmin/fmax with operating_band
-    # Priority: explicit operating_band wins; otherwise derive from fmin/fmax.
-    if getattr(cfg, "operating_band", None) is not None:
-        op_lo, op_hi = cfg.operating_band
-        cfg.fmin = float(op_lo)
-        cfg.fmax = float(op_hi)
-    else:
-        cfg.operating_band = (float(cfg.fmin), float(cfg.fmax))
+    # Final normalization
+    op_lo, op_hi = cfg.operating_band
+    cfg.operating_band = (float(op_lo), float(op_hi))
 
     return cfg
 
@@ -449,8 +502,9 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         noise_psd_fft[~band_mask, :] = 0.0
 
         # debug ratios (now consistent with smoothing)
-        ratio_mel = noise_mel / (P_mel + eps)
-        print("median N/P mel:", np.median(ratio_mel), "p90:", np.percentile(ratio_mel, 90))
+        if getattr(cfg, "debug_enable", False):
+            ratio_mel = noise_mel / (P_mel + eps)
+            print("median N/P mel:", float(np.median(ratio_mel)), "p90:", float(np.percentile(ratio_mel, 90)))
 
         return noise_psd_fft, W_mel
 
@@ -538,13 +592,35 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         if sr is None:
             sr = cfg.fs
 
-        # 0) High-pass filter
+        # 0) Pre-filter (before STFT)
         x_proc = x
-        if cfg.hp_cutoff_hz > 0:
+        mode = str(getattr(cfg, "pre_filter_mode", "highpass")).lower()
+
+        if mode not in ("highpass", "bandpass", "none"):
+            mode = "highpass"
+
+        if mode != "none":
             nyq = 0.5 * sr
-            norm_cut = np.clip(cfg.hp_cutoff_hz / nyq, 1e-4, 0.9999)
-            sos = spsig.butter(cfg.hp_order, norm_cut, btype="highpass", output="sos")
-            x_proc = spsig.sosfiltfilt(sos, x_proc)
+
+            if mode == "bandpass":
+                op_lo, op_hi = cfg.operating_band
+                lo = float(op_lo)
+                hi = float(op_hi)
+
+                # Clamp to valid digital band limits
+                lo = np.clip(lo, 1e-3, nyq * 0.999)
+                hi = np.clip(hi, lo + 1e-3, nyq * 0.999)
+
+                wn = [lo / nyq, hi / nyq]
+                sos = spsig.butter(int(getattr(cfg, "bp_order", cfg.hp_order)), wn, btype="bandpass", output="sos")
+                x_proc = spsig.sosfiltfilt(sos, x_proc)
+
+            else:
+                # highpass
+                if cfg.hp_cutoff_hz > 0:
+                    norm_cut = np.clip(cfg.hp_cutoff_hz / nyq, 1e-4, 0.9999)
+                    sos = spsig.butter(cfg.hp_order, norm_cut, btype="highpass", output="sos")
+                    x_proc = spsig.sosfiltfilt(sos, x_proc)
 
         # 1) STFT
         S = librosa.stft(
@@ -560,25 +636,66 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         times = librosa.frames_to_time(np.arange(P.shape[1]), sr=sr, hop_length=cfg.hop)
 
         F, T = P.shape
+
+                # 1b) TEMP EXPERIMENT: mode-only reconstruction for listening/inspection
+        mode_iso_enable = bool(getattr(cfg, "mode_isolation_enable", False))
+        y_mode = None
+        S_mode = None
+        mode_mask = None
+
+        if mode_iso_enable:
+            mode_mask = _mode_isolation_mask(
+                freqs=freqs,
+                mode_bands=tuple(getattr(cfg, "mode_bands", ())),
+                attn_db=float(getattr(cfg, "mode_isolation_attn_db", -60.0)),
+                smooth_bins=int(getattr(cfg, "mode_isolation_smooth_bins", 2)),
+            )
+            S_mode = (mode_mask[:, None]) * S
+            y_mode = librosa.istft(
+                S_mode,
+                hop_length=cfg.hop,
+                win_length=cfg.n_fft,
+                window="hann",
+                center=True,
+                length=len(x),
+            )
         op_lo, op_hi = cfg.operating_band
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
         # 2) Rain detection
-        is_rain, det_debug, rain_conf, noise_conf = self._detect_rain_over_time(P, freqs)
+        P_for_detection = P
+        if mode_iso_enable and cfg.mode_isolation_affects_classifier:
+            P_for_detection = np.abs(S_mode) ** 2
+
+        is_rain, det_debug, rain_conf, noise_conf = self._detect_rain_over_time(P_for_detection, freqs)
+
+        # Ensure we have a time axis in seconds for tuning/plots
+        times_s = np.asarray(times, dtype=np.float64)
+
+        # If the detector provides FrameFeatures, optionally decimate to reduce payload
+        if isinstance(det_debug, dict) and "frame_features" in det_debug:
+            ff = det_debug.get("frame_features")
+            decim = int(getattr(cfg, "debug_frame_decim", 1))
+            if decim > 1 and ff is not None:
+                try:
+                    det_debug["frame_features"] = ff[::decim]
+                except Exception:
+                    pass
 
         # Prefer explicit PSD gating from the classifier if provided
         if isinstance(det_debug, dict) and "use_for_noise_psd" in det_debug:
             use_for_noise_psd = np.asarray(det_debug["use_for_noise_psd"], dtype=bool)
-            is_rain_for_psd = ~use_for_noise_psd
         else:
-            # Conservative fallback: treat high rain_conf as rain-ish
+            # Conservative fallback: treat high rain_conf as rain-ish (so NOT used for PSD)
             th = float(getattr(cfg, "rain_like_thresh", 0.8))
-            is_rain_for_psd = (rain_conf >= th)
+            use_for_noise_psd = ~(rain_conf >= th)
+
+        is_rain_for_psd = ~use_for_noise_psd
 
         # Optional hold: exclude a couple frames after rain spikes
         hold = int(getattr(cfg, "rain_hold_frames", 0))
         if hold > 0 and is_rain_for_psd.any():
             is_rain_for_psd = ndi.binary_dilation(is_rain_for_psd, iterations=hold)
-        
+
         # 3) Noise PSD estimation (MCRA / quantile)
         if cfg.noise_psd_mode == "fft":
             noise_psd = self._estimate_noise_psd_fft(P, freqs, is_rain_for_psd)
@@ -587,21 +704,21 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             noise_psd, mel_filter = self._estimate_noise_psd_mel(P, freqs, is_rain_for_psd, sr=sr)
         else:
             raise ValueError(f"Unknown PSD mode: {cfg.noise_psd_mode}")
-        
+
         # 4) Gain computation (confidence-weighted)
         P_band_all = P[band_mask]
         N_band_all = noise_psd[band_mask]
 
-        ratio_med = np.median(N_band_all / (P_band_all + 1e-12))
-        ratio_p90 = np.percentile(N_band_all / (P_band_all  + 1e-12), 90)
-        print("median N/P:", ratio_med, "p90 N/P:", ratio_p90)
+        if getattr(cfg, "debug_enable", False):
+            ratio_med = float(np.median(N_band_all / (P_band_all + 1e-12)))
+            ratio_p90 = float(np.percentile(N_band_all / (P_band_all + 1e-12), 90))
+            print("median N/P:", ratio_med, "p90 N/P:", ratio_p90)
 
         # Gain computation (confidence-weighted)
         G_band = self._compute_gain(P_band_all, N_band_all, noise_conf=noise_conf)
 
         G = np.ones_like(P)
         G[band_mask] = G_band
-
 
         # 5) Apply gain & ISTFT
         S_hat = G * S
@@ -611,28 +728,80 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             win_length=cfg.n_fft,
             window="hann",
             center=True,
+            length=len(x),
         )
 
+        # Choose output waveform:
+        # - if mode isolation experiment enabled, output mode-only reconstruction
+        # - otherwise output the normal noise-suppressed waveform
+        y_out = y_mode if (mode_iso_enable and y_mode is not None) else y_hat
+        # if mode_iso_enable and cfg.mode_isolation_only:
+        #     y_out = y_mode
+        # else:
+        #     y_out = y_hat
+
         # 6) Debug
+        op_lo, op_hi = cfg.operating_band
+
+        # Keep detector debug under a dedicated key to avoid collisions and make plots simpler.
         debug = {
-            **det_debug,
+            "detector": det_debug,
+
+            # Common time axis and frequency axis
+            "times_s": times_s,
+            "freqs": freqs,
+
+            # Classifier outputs
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
+            "use_for_noise_psd": use_for_noise_psd,
+            "is_rain_for_psd": is_rain_for_psd,
+
+            # Suppression / PSD
             "G": G,
             "noise_psd": noise_psd,
-            "is_rain_for_psd": is_rain_for_psd,
+
+            # Band metadata
+            "operating_band": (float(op_lo), float(op_hi)),
+            "band_mask": band_mask,
+
+            # Pre-filter info for debug/tuning/plots
+            "pre_filter_mode": mode,
+            "pre_filter_band": (float(cfg.operating_band[0]), float(cfg.operating_band[1])),
+
+            # Key thresholds for plotting reference
+            "rain_hi": _as_float(getattr(cfg, "rain_hi", np.nan)),
+            "noise_hi": _as_float(getattr(cfg, "noise_hi", np.nan)),
+            "noise_update_thresh": _as_float(getattr(cfg, "noise_update_thresh", np.nan)),
+            "primary_rise_db_thresh": _as_float(getattr(cfg, "primary_rise_db_thresh", np.nan)),
+            "peaks_in_mode_min": int(getattr(cfg, "peaks_in_mode_min", 0)),
+            
+            # TEMP experiment: mode-only reconstruction
+            "mode_isolation_enable": mode_iso_enable,
+            "mode_isolation_attn_db": _as_float(getattr(cfg, "mode_isolation_attn_db", np.nan)),
+            "mode_isolation_smooth_bins": int(getattr(cfg, "mode_isolation_smooth_bins", 0)),
+            "mode_isolation_mask": mode_mask,
+            "S_mode": S_mode,
+
         }
+
+        # Optional: include mel filter if present
         if mel_filter is not None:
             debug["mel_filter"] = mel_filter
 
         return {
-            "y": y_hat,
+            "y": y_out,            # what your harness will treat as "denoised_audio"
+            "y_suppressed": y_hat, # always available for A/B
+            "y_mode": y_mode,      # mode-only listening output
             "S": S,
             "S_hat": S_hat,
             "noise_psd": noise_psd,
             "is_rain": is_rain,
             "freqs": freqs,
             "times": times,
+            # Back-compat convenience: top-level detector keys (if present)
+            "det_debug": det_debug,
             "debug": debug,
-            "x_hp": x_proc,
+            "x_hp": x_proc,   # back-compat name
+            "x_filt": x_proc, # clearer name (HPF/BPF/none)
         }
