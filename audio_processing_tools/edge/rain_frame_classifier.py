@@ -8,46 +8,38 @@ import scipy.signal as spsig
 
 @dataclass
 class FrameFeatures:
-    """Compact per-frame diagnostics for tuning/visualization."""
+    """Compact per-frame diagnostics for tuning/visualization.
+
+    Keep this small: per-frame scalars + a light peak summary + final decision.
+    Heavy arrays stay in `det_debug`.
+    """
 
     # indexing / time
     t: int
     time_s: float
 
-    # operating-band loudness (dB) + rise (dB)
+    # operating-band loudness (dB)
     Ltot: float
     dLtot: float
+
+    # key evidence (already robust-normalized where applicable)
+    primary_flux_z: float
+    mode_count_z: int
 
     # must-have gates
     gate_primary_rise_ok: bool
     gate_primary_peak_ok: bool
     gate_top_peaks_mode_ok: bool
+    gate_multi_mode_ok: bool
 
-    # hybrid / consensus gates
-    gate_multi_mode_ok: bool = False
-    mode_count: int = 0
-    mode_ok: Optional[List[bool]] = None
-    primary_rise_db: Optional[float] = None
-    margin_db: Optional[float] = None
-    margin_score: Optional[float] = None
-
-    # peak debug
+    # light peak debug
     top_peaks_hz: Optional[List[float]] = None
     top_peaks_db: Optional[List[float]] = None
     top_peaks_in_mode: Optional[List[bool]] = None
     top_peaks_in_primary: Optional[List[bool]] = None
 
-    # mode evidence
-    mode_L: Optional[List[float]] = None
-    mode_rise_db: Optional[List[float]] = None
-    mode_peak_db: Optional[List[float]] = None
-    mode_score: Optional[List[float]] = None
-
-    mode_score_joint: Optional[float] = None
-    primary_ok: Optional[bool] = None
-
     # final
-    rain_score_raw: Optional[float] = None
+    rain_score_raw: float = 0.0
     label: Optional[str] = None        # "rain" | "noise" | "uncertain"
     use_for_noise_psd: Optional[bool] = None
 
@@ -70,16 +62,11 @@ class RainFrameClassifierMixin:
 
     # Optional tunables (all have defaults inside the implementation)
     OPTIONAL_CFG_FIELDS = [
-        "mode_weights",
-        "mode_rise_db_low", "mode_rise_db_high",
-        "mode_peak_db_low", "mode_peak_db_high",
-        "mode_w_rise", "mode_w_peak",
-        "primary_min_score",
         "peak_top_p", "peak_primary_q", "peaks_in_mode_min",
-        "mode_overall_margin_db_low", "mode_overall_margin_db_high",
-        "prob_w_mode_rise", "prob_w_mode_peak", "prob_w_margin",
-        # used only for FrameFeatures time axis (safe defaults if missing)
         "fs", "hop",
+        "flux_win_frames", "flux_low_frac", "flux_use_log",
+        "primary_flux_z_thresh", "mode_flux_z_thresh", "modes_flux_min_count",
+        "peak_smooth_bins", "peak_prominence_db", "peak_min_distance_hz",
     ]
 
     def _validate_rain_cfg(self):
@@ -188,6 +175,82 @@ class RainFrameClassifierMixin:
         return float(np.sum(P_frame[mask]))
 
     @staticmethod
+    def _band_flux_pos(
+        P_t: np.ndarray,
+        P_prev: Optional[np.ndarray],
+        freqs: np.ndarray,
+        band: Tuple[float, float],
+        eps: float,
+        *,
+        use_log: bool = True,
+    ) -> float:
+        """Positive spectral flux in a band vs previous frame.
+
+        flux = sum(max(0, x_t - x_prev)) over bins in band, where x is either
+        log-power (default) or linear power.
+        """
+        if P_prev is None:
+            return 0.0
+        lo, hi = band
+        mask = (freqs >= lo) & (freqs < hi)
+        if not np.any(mask):
+            return 0.0
+        a = np.asarray(P_t[mask], dtype=float)
+        b = np.asarray(P_prev[mask], dtype=float)
+        if use_log:
+            a = np.log10(a + eps)
+            b = np.log10(b + eps)
+        d = a - b
+        d[d < 0.0] = 0.0
+        return float(np.sum(d))
+
+    @staticmethod
+    def _robust_z_at(
+        x: np.ndarray,
+        t: int,
+        win: int,
+        low_frac: float,
+        eps: float,
+    ) -> Tuple[float, float, float]:
+        """Robust z-score at index t using a *symmetric* window.
+
+        We estimate the baseline from the bottom `low_frac` fraction of values
+        inside the window to reduce contamination from rain-like outliers.
+
+        Returns (z, baseline, scale).
+        """
+        T = int(x.size)
+        if T == 0:
+            return 0.0, 0.0, 0.0
+
+        w = int(max(0, win))
+        t0 = max(0, int(t) - w)
+        t1 = min(T, int(t) + w + 1)
+        vals = np.asarray(x[t0:t1], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size < 3:
+            return 0.0, float(vals[0]) if vals.size else 0.0, 0.0
+
+        # bottom-k subset for baseline
+        lf = float(np.clip(low_frac, 0.05, 0.8))
+        k = max(3, int(np.floor(lf * vals.size)))
+        srt = np.sort(vals)
+        bot = srt[:k]
+
+        # robust center = median of low-energy subset
+        med = float(np.median(bot))
+
+        # MAD-based scale (robust std estimate)
+        mad = float(np.median(np.abs(bot - med)))
+        scale = float(1.4826 * mad + eps)
+
+        # use median consistently as baseline
+        baseline = med
+
+        z = float((x[t] - med) / scale) if np.isfinite(x[t]) else 0.0
+        return z, baseline, scale
+
+    @staticmethod
     def _top_k_peaks_in_band(
         P_frame: np.ndarray,
         freqs: np.ndarray,
@@ -289,103 +352,58 @@ class RainFrameClassifierMixin:
         self,
         P_frame: np.ndarray,
         freqs: np.ndarray,
-        prev_mode_db1: Optional[np.ndarray],
-        prev_mode_db2: Optional[np.ndarray],
-        prev_Ltot1: Optional[float] = None,
-        prev_Ltot2: Optional[float] = None,
+        P_prev1: Optional[np.ndarray],
+        P_prev2: Optional[np.ndarray],
     ) -> Dict[str, Any]:
-        """Mode-centric per-frame rain evidence with hybrid (hard-gate + soft-evidence) logic.
+        """Per-frame raw features for flux-based rain/noise classification.
 
-        Must-have (hard gates):
-          (G1) Primary-mode inter-frame rise must exceed cfg.primary_rise_db_thresh.
-          (G2) One of the top-Q peaks must lie in the primary band.
-
-        Consensus gate:
-          (G3) At least K mode-bands must show evidence (rise/peak) in the current frame.
-
-        Soft evidence (only used when the hard gates pass):
-          - mode consensus strength (fraction/weighted fraction of modes that are ok)
-          - per-mode rise/peak soft scores
-          - margin: mode-rise vs overall-loudness-rise (reject “everything got louder”)
-
-        Returns a rain_score_raw in [0,1] and rich debug fields.
+        This function intentionally returns *raw* (unnormalized) features.
+        Robust normalization (MAD z-scores) and labeling happen in
+        `_detect_rain_over_time`, where a symmetric time window is available.
         """
         cfg = self.cfg
         eps = float(getattr(cfg, "eps", 1e-9))
 
-        # ---------------- config with safe defaults ----------------
         op_lo, op_hi = cfg.operating_band
         op_band = (float(op_lo), float(op_hi))
-
-        top_p = int(getattr(cfg, "peak_top_p", 6))
-        top_q = int(getattr(cfg, "peak_primary_q", 3))
-        # default: require ~half the peaks to land in some mode band
-        peaks_in_mode_min = int(getattr(cfg, "peaks_in_mode_min", max(2, int(np.ceil(top_p / 2)))))
-
-        # multi-mode consensus requirement
-        mode_count_min = int(getattr(cfg, "mode_count_min", 2))
-
-        # peak finder knobs
-        peak_smooth_bins = int(getattr(cfg, "peak_smooth_bins", 3))
-        peak_prominence_db = float(getattr(cfg, "peak_prominence_db", 3.0))
-        peak_min_distance_hz = float(getattr(cfg, "peak_min_distance_hz", 80.0))
-
-        primary_rise_thresh = float(getattr(cfg, "primary_rise_db_thresh", 6.0))
-
-        # margin thresholds
-        margin_low = float(getattr(cfg, "mode_overall_margin_db_low", 1.5))
-        margin_high = float(getattr(cfg, "mode_overall_margin_db_high", 6.0))
-
-        # NEW: hard-ish margins to enforce "not just overall loudness" and "multi-mode rise"
-        primary_overall_margin_db_thresh = float(getattr(cfg, "primary_overall_margin_db_thresh", 2.0))
-        topk_overall_margin_db_thresh = float(getattr(cfg, "topk_overall_margin_db_thresh", 1.0))
-        topk_margin_k = int(getattr(cfg, "topk_margin_k", 2))
-
-        # soft-evidence weights
-        w_mode_consensus = float(getattr(cfg, "prob_w_mode_consensus", 0.45))
-        w_mode_rise = float(getattr(cfg, "prob_w_mode_rise", 0.35))
-        w_mode_peak = float(getattr(cfg, "prob_w_mode_peak", 0.10))
-        w_margin = float(getattr(cfg, "prob_w_margin", 0.10))
-        wsum = max(1e-12, (w_mode_consensus + w_mode_rise + w_mode_peak + w_margin))
-        w_mode_consensus /= wsum
-        w_mode_rise /= wsum
-        w_mode_peak /= wsum
-        w_margin /= wsum
 
         mode_bands: List[Tuple[float, float]] = list(getattr(cfg, "mode_bands", []))
         n_modes = len(mode_bands)
         if n_modes == 0:
-            raise AttributeError("cfg.mode_bands must be defined for mode-centric classifier")
-
-        w_mode = np.asarray(getattr(cfg, "mode_weights", [1.0] * n_modes), dtype=float)
-        if w_mode.size != n_modes:
-            w_mode = np.ones(n_modes, dtype=float)
+            raise AttributeError("cfg.mode_bands must be defined for flux-based classifier")
 
         pidx = int(getattr(cfg, "primary_mode_idx", 0))
         if not (0 <= pidx < n_modes):
             pidx = 0
         primary_band = mode_bands[pidx]
 
-        rise_low = float(getattr(cfg, "mode_rise_db_low", 2.0))
-        rise_high = float(getattr(cfg, "mode_rise_db_high", 6.0))
-        peak_low = float(getattr(cfg, "mode_peak_db_low", 2.0))
-        peak_high = float(getattr(cfg, "mode_peak_db_high", 8.0))
+        # peak-gate knobs
+        top_p = int(getattr(cfg, "peak_top_p", 6))
+        top_q = int(getattr(cfg, "peak_primary_q", 3))
+        peaks_in_mode_min = int(getattr(cfg, "peaks_in_mode_min", 2))
 
-        # optional per-mode hard thresholds (if provided)
-        rise_thresh_low = float(getattr(cfg, "mode_rise_db_thresh_low", rise_low))
-        rise_thresh_high = float(getattr(cfg, "mode_rise_db_thresh_high", rise_high))
-        peak_thresh_low = float(getattr(cfg, "mode_peak_db_thresh_low", peak_low))
-        peak_thresh_high = float(getattr(cfg, "mode_peak_db_thresh_high", peak_high))
+        peak_smooth_bins = int(getattr(cfg, "peak_smooth_bins", 3))
+        peak_prominence_db = float(getattr(cfg, "peak_prominence_db", 3.0))
+        peak_min_distance_hz = float(getattr(cfg, "peak_min_distance_hz", 80.0))
 
-        primary_min_score = float(getattr(cfg, "primary_min_score", 0.5))
+        # flux knobs
+        use_log_flux = bool(getattr(cfg, "flux_use_log", True))
 
-        # ---------------- operating-band loudness ----------------
+        # operating-band loudness (for debug only)
         Ltot = self._band_db(P_frame, freqs, op_band, eps)
-        dLtot1 = (Ltot - prev_Ltot1) if (prev_Ltot1 is not None and np.isfinite(Ltot) and np.isfinite(prev_Ltot1)) else 0.0
-        dLtot2 = (Ltot - prev_Ltot2) if (prev_Ltot2 is not None and np.isfinite(Ltot) and np.isfinite(prev_Ltot2)) else 0.0
-        dLtot = float(max(dLtot1, dLtot2))
 
-        # ---------------- peak logic (hard gates + auxiliary) ----------------
+        # raw positive flux (t vs t-1 and t vs t-2)
+        primary_flux_1 = self._band_flux_pos(P_frame, P_prev1, freqs, primary_band, eps, use_log=use_log_flux)
+        primary_flux_2 = self._band_flux_pos(P_frame, P_prev2, freqs, primary_band, eps, use_log=use_log_flux)
+        primary_flux = float(max(primary_flux_1, primary_flux_2))
+
+        mode_flux = np.zeros(n_modes, dtype=float)
+        for i, b in enumerate(mode_bands):
+            f1 = self._band_flux_pos(P_frame, P_prev1, freqs, b, eps, use_log=use_log_flux)
+            f2 = self._band_flux_pos(P_frame, P_prev2, freqs, b, eps, use_log=use_log_flux)
+            mode_flux[i] = max(f1, f2)
+
+        # --- peaks gate (in operating band) ---
         top_freq, top_db = self._top_k_peaks_in_band(
             P_frame,
             freqs,
@@ -406,133 +424,16 @@ class RainFrameClassifierMixin:
             q_eff = min(int(top_q), int(top_freq.size))
             gate_primary_peak_ok = any(in_primary[:q_eff])
 
-        # ---------------- mode energies / rises / peakiness ----------------
-        mode_db = np.zeros(n_modes, dtype=float)
-        mode_peak_db = np.zeros(n_modes, dtype=float)
-        for i, b in enumerate(mode_bands):
-            mode_db[i] = self._band_db(P_frame, freqs, b, eps)
-            mode_peak_db[i] = self._peakiness_db(P_frame, freqs, b, eps)
-
-        mode_rise = np.zeros(n_modes, dtype=float)
-        if prev_mode_db1 is not None:
-            mode_rise = np.maximum(mode_rise, mode_db - prev_mode_db1)
-        if prev_mode_db2 is not None:
-            mode_rise = np.maximum(mode_rise, mode_db - prev_mode_db2)
-
-        primary_rise = float(mode_rise[pidx]) if (0 <= pidx < n_modes) else 0.0
-        gate_primary_rise_ok = (primary_rise >= primary_rise_thresh)
-
-        # ---------------- per-mode soft scores ----------------
-        mode_sr = np.zeros(n_modes, dtype=float)
-        mode_sp = np.zeros(n_modes, dtype=float)
-        mode_score_each = np.zeros(n_modes, dtype=float)
-        for i in range(n_modes):
-            mode_sr[i] = self._soft_score(float(mode_rise[i]), rise_low, rise_high)
-            mode_sp[i] = self._soft_score(float(mode_peak_db[i]), peak_low, peak_high)
-            mode_score_each[i] = 0.8 * mode_sr[i] + 0.2 * mode_sp[i]
-
-        primary_ok = bool(mode_score_each[pidx] >= primary_min_score)
-
-        # ---------------- NEW: consensus (per-mode ok + count) ----------------
-        # must-have inter-frame bump: even "peak-only" evidence must include at least some rise
-        mode_ok = (
-            (mode_rise >= rise_thresh_high)
-            | ((mode_rise >= rise_thresh_low) & (mode_peak_db >= peak_thresh_low))
-            | ((mode_rise >= rise_thresh_low) & (mode_peak_db >= peak_thresh_high))
-        )
-        mode_count = int(np.sum(mode_ok))
-        gate_multi_mode_ok = (mode_count >= mode_count_min)
-
-        # Consensus strength in [0,1]
-        denom_w = float(np.sum(w_mode) + eps)
-        consensus_wfrac = float(np.sum(w_mode * mode_ok.astype(float)) / denom_w)
-        consensus_frac = float(mode_count / max(1, n_modes))
-        consensus_score = float(0.5 * consensus_frac + 0.5 * consensus_wfrac)
-
-        # ---------------- margin: mode rise vs overall rise ----------------
-        margin_score = 0.0
-        margin_db = 0.0
-        primary_margin_ok = False
-        topk_margin_ok = False
-
-        if prev_mode_db1 is not None:
-            # margin uses "mode-rise" vs "overall loudness" rise
-            dL_total = float(dLtot)
-
-            # primary margin
-            primary_margin_db = float(primary_rise - dL_total)
-            primary_margin_ok = bool(primary_margin_db >= primary_overall_margin_db_thresh)
-
-            # top-k modes margin (robust to one-mode domination)
-            k_eff = int(max(1, min(topk_margin_k, n_modes)))
-            topk_rises = np.sort(mode_rise)[-k_eff:]
-            topk_mean_rise = float(np.mean(topk_rises)) if topk_rises.size else 0.0
-            topk_margin_db = float(topk_mean_rise - dL_total)
-            topk_margin_ok = bool(topk_margin_db >= topk_overall_margin_db_thresh)
-
-            # soft margin score based on weighted-average mode rise
-            dL_mode = float(np.sum(w_mode * mode_rise) / (float(np.sum(w_mode)) + eps))
-            margin_db = float(dL_mode - dL_total)
-            margin_score = self._soft_score(margin_db, margin_low, margin_high)
-
-        # ---------------- hard gating ----------------
-        must_ok = bool(gate_primary_rise_ok and gate_primary_peak_ok and gate_top_peaks_mode_ok)
-
-        # ---------------- final score ----------------
-        if must_ok:
-            # Use consensus as primary driver; keep soft rise/peak as refinement.
-            rise_strength = float(np.sum(w_mode * mode_sr) / (float(np.sum(w_mode)) + eps))
-            peak_strength = float(np.sum(w_mode * mode_sp) / (float(np.sum(w_mode)) + eps))
-
-            rain_score_raw = float(
-                np.clip(
-                    (w_mode_consensus * consensus_score)
-                    + (w_mode_rise * rise_strength)
-                    + (w_mode_peak * peak_strength)
-                    + (w_margin * margin_score),
-                    0.0,
-                    1.0,
-                )
-            )
-
-            # If multi-mode consensus fails, strongly cap the score (prevents single-mode override)
-            if not gate_multi_mode_ok:
-                rain_score_raw = min(rain_score_raw, 0.35)
-
-        else:
-            rain_score_raw = 0.0
-
         return {
-            "Ltot": float(Ltot), "dLtot": float(dLtot),
-
+            "Ltot": float(Ltot),
+            "primary_flux": float(primary_flux),
+            "mode_flux": mode_flux,
             "top_peaks_hz": top_freq,
             "top_peaks_db": top_db,
             "top_peaks_in_mode": np.asarray(in_mode, dtype=bool),
             "top_peaks_in_primary": np.asarray(in_primary, dtype=bool),
-
-            "gate_primary_rise_ok": bool(gate_primary_rise_ok),
             "gate_primary_peak_ok": bool(gate_primary_peak_ok),
             "gate_top_peaks_mode_ok": bool(gate_top_peaks_mode_ok),
-            "gate_multi_mode_ok": bool(gate_multi_mode_ok),
-
-            "primary_rise_db": float(primary_rise),
-
-            "mode_db": mode_db,
-            "mode_rise": mode_rise,
-            "mode_peak_db": mode_peak_db,
-            "mode_score_each": mode_score_each,
-
-            # NEW debug
-            "mode_ok": mode_ok.astype(bool),
-            "mode_count": int(mode_count),
-            "consensus_score": float(consensus_score),
-            "margin_db": float(margin_db),
-            "margin_score": float(margin_score),
-
-            "primary_ok": bool(primary_ok),
-            "rain_score_raw": float(rain_score_raw),
-            "primary_margin_ok": bool(primary_margin_ok),
-            "topk_margin_ok": bool(topk_margin_ok),
         }
 
     # ----------------------- 3-state classification -----------------------
@@ -612,85 +513,166 @@ class RainFrameClassifierMixin:
         F, T = P.shape
         cfg = self.cfg
 
-        # mode arrays
-        n_modes = len(cfg.mode_bands)
-        mode_db_all = np.full((n_modes, T), np.nan)
-        mode_rise_all = np.full((n_modes, T), np.nan)
-        mode_peak_all = np.full((n_modes, T), np.nan)
-        mode_score_each_all = np.full((n_modes, T), np.nan)
-        mode_joint = np.full(T, np.nan)
-        primary_ok = np.zeros(T, dtype=bool)
+        # ---- raw flux features (per frame) ----
+        mode_bands: List[Tuple[float, float]] = list(getattr(cfg, "mode_bands", []))
+        n_modes = len(mode_bands)
+        if n_modes == 0:
+            raise AttributeError("cfg.mode_bands must be defined")
 
-        rain_score_raw = np.full(T, np.nan)
-
-        # New: operating-band loudness history
+        primary_flux = np.full(T, np.nan)
+        mode_flux = np.full((n_modes, T), np.nan)
         Ltot = np.full(T, np.nan)
-        dLtot = np.full(T, np.nan)
-        prev_Ltot1: Optional[float] = None
-        prev_Ltot2: Optional[float] = None
+        total_mode_flux = np.full(T, np.nan)
 
-        prev_mode1: Optional[np.ndarray] = None
-        prev_mode2: Optional[np.ndarray] = None
-        
+        # peak-gate traces
+        peaks_in_mode_count = np.full(T, 0, dtype=int)
+        peaks_in_primary_topq = np.full(T, 0, dtype=int)
+        gate_primary_peak_ok = np.zeros(T, dtype=bool)
+        gate_top_peaks_mode_ok = np.zeros(T, dtype=bool)
+
         debug_frames: List[FrameFeatures] = []
+
+        # config knobs for robust normalization + decision
+        win = int(getattr(cfg, "flux_win_frames", 20))
+        low_frac = float(getattr(cfg, "flux_low_frac", 0.30))
+
+        primary_z_thresh = float(getattr(cfg, "primary_flux_z_thresh", 6.0))
+        mode_z_thresh = float(getattr(cfg, "mode_flux_z_thresh", 3.0))
+        modes_min_count = int(getattr(cfg, "modes_flux_min_count", 2))
+
+        # for debug time axis
+        fs = float(getattr(cfg, "fs", 1.0))
+        hop = float(getattr(cfg, "hop", 0.0))
+
+        # store per-frame peak lists temporarily
+        _top_peaks_hz: List[List[float]] = []
+        _top_peaks_db: List[List[float]] = []
+        _top_peaks_in_mode: List[List[bool]] = []
+        _top_peaks_in_primary: List[List[bool]] = []
+
         for t in range(T):
+            P_prev1 = P[:, t - 1] if t - 1 >= 0 else None
+            P_prev2 = P[:, t - 2] if t - 2 >= 0 else None
+
             det = self._detect_rain_frame_v2(
                 P[:, t],
                 freqs,
-                prev_mode1,
-                prev_mode2,
-                prev_Ltot1,
-                prev_Ltot2,
+                P_prev1,
+                P_prev2,
             )
 
-            rain_score_raw[t] = det["rain_score_raw"]
+            Ltot[t] = float(det.get("Ltot", np.nan))
+            primary_flux[t] = float(det.get("primary_flux", np.nan))
+            mf = det.get("mode_flux")
+            if isinstance(mf, np.ndarray) and mf.shape[0] == n_modes:
+                mode_flux[:, t] = mf
+            if isinstance(mf, np.ndarray):
+                total_mode_flux[t] = float(np.sum(mf))
 
-            mode_db_all[:, t] = det["mode_db"]
-            mode_rise_all[:, t] = det["mode_rise"]
-            mode_peak_all[:, t] = det["mode_peak_db"]
-            mode_score_each_all[:, t] = det["mode_score_each"]
-            # mode_joint and primary_ok are for v1; hybrid logic may not return those
-            mode_joint[t] = float(det.get("mode_score_joint", np.nan))
-            primary_ok[t] = bool(det.get("primary_ok"))
+            gate_primary_peak_ok[t] = bool(det.get("gate_primary_peak_ok", False))
+            gate_top_peaks_mode_ok[t] = bool(det.get("gate_top_peaks_mode_ok", False))
 
-            # Track Ltot/dLtot
-            Ltot[t] = det.get("Ltot", np.nan)
-            dLtot[t] = det.get("dLtot", np.nan)
-            prev_Ltot2, prev_Ltot1 = prev_Ltot1, Ltot[t]
+            # peak counts for quick tuning
+            in_mode = det.get("top_peaks_in_mode")
+            in_primary = det.get("top_peaks_in_primary")
+            if isinstance(in_mode, np.ndarray):
+                peaks_in_mode_count[t] = int(np.sum(in_mode.astype(int)))
+            if isinstance(in_primary, np.ndarray):
+                top_q = int(getattr(cfg, "peak_primary_q", 3))
+                q_eff = min(int(top_q), int(in_primary.size))
+                peaks_in_primary_topq[t] = int(np.sum(in_primary[:q_eff].astype(int)))
 
-            # shift mode history
-            prev_mode2, prev_mode1 = prev_mode1, det["mode_db"].copy()
+            # stash lists for compact per-frame records
+            _top_peaks_hz.append(self._as_list(det.get("top_peaks_hz")))
+            _top_peaks_db.append(self._as_list(det.get("top_peaks_db")))
+            _top_peaks_in_mode.append(self._as_bool_list(det.get("top_peaks_in_mode")))
+            _top_peaks_in_primary.append(self._as_bool_list(det.get("top_peaks_in_primary")))
 
-            # --- compact per-frame debug record (for interactive viz / tuning) ---
-            fs = float(getattr(cfg, "fs", 1.0))
-            hop = float(getattr(cfg, "hop", 0.0))
+        # operating-band loudness rise (debug)
+        dLtot = np.full(T, np.nan)
+        for t in range(T):
+            if t - 1 >= 0 and np.isfinite(Ltot[t]) and np.isfinite(Ltot[t - 1]):
+                dLtot[t] = float(Ltot[t] - Ltot[t - 1])
+            else:
+                dLtot[t] = 0.0
+
+        # ---- robust z-scores (MAD) using symmetric window ----
+        primary_flux_z = np.full(T, np.nan)
+        primary_flux_base = np.full(T, np.nan)
+
+        mode_flux_z = np.full((n_modes, T), np.nan)
+        mode_flux_base = np.full((n_modes, T), np.nan)
+        total_mode_flux_z = np.full(T, np.nan)
+        total_mode_flux_base = np.full(T, np.nan)
+
+        for t in range(T):
+            z, base, _ = self._robust_z_at(primary_flux, t, win, low_frac, float(cfg.eps))
+            primary_flux_z[t] = z
+            primary_flux_base[t] = base
+            zt, bt, _ = self._robust_z_at(total_mode_flux, t, win, low_frac, float(cfg.eps))
+            total_mode_flux_z[t] = zt
+            total_mode_flux_base[t] = bt
+            for i in range(n_modes):
+                zi, bi, _ = self._robust_z_at(mode_flux[i, :], t, win, low_frac, float(cfg.eps))
+                mode_flux_z[i, t] = zi
+                mode_flux_base[i, t] = bi
+
+        # ---- gates + score ----
+        pidx = int(getattr(cfg, "primary_mode_idx", 0))
+        if not (0 <= pidx < n_modes):
+            pidx = 0
+
+        gate_primary_rise_ok = np.isfinite(primary_flux_z) & (primary_flux_z >= primary_z_thresh)
+
+        mode_count_z = np.sum(np.isfinite(mode_flux_z) & (mode_flux_z >= mode_z_thresh), axis=0).astype(int)
+        gate_multi_mode_ok = mode_count_z >= modes_min_count
+
+        # minimal score in [0,1]
+        # (1) primary z, (2) multi-mode count, (3) peak gates
+        # peak gates are treated as hard constraints.
+        rain_score_raw = np.zeros(T, dtype=float)
+        for t in range(T):
+            if not (bool(gate_primary_peak_ok[t]) and bool(gate_top_peaks_mode_ok[t])):
+                rain_score_raw[t] = 0.0
+                continue
+            if not bool(gate_primary_rise_ok[t]):
+                rain_score_raw[t] = 0.0
+                continue
+
+            # soft contributions
+            s_primary = float(np.clip((primary_flux_z[t] - primary_z_thresh) / max(1e-9, primary_z_thresh), 0.0, 1.0))
+            s_modes_count = float(np.clip(mode_count_z[t] / max(1, n_modes), 0.0, 1.0))
+
+            # combined mode flux (more stable than per-mode count alone)
+            total_z = float(total_mode_flux_z[t]) if np.isfinite(total_mode_flux_z[t]) else 0.0
+            s_modes_total = float(np.clip(total_z / max(1e-9, primary_z_thresh), 0.0, 1.0))
+
+            # combine both mode evidences
+            s_modes = 0.5 * s_modes_count + 0.5 * s_modes_total
+
+            rain_score_raw[t] = float(np.clip(0.65 * s_primary + 0.35 * s_modes, 0.0, 1.0))
+            if not bool(gate_multi_mode_ok[t]):
+                rain_score_raw[t] = min(rain_score_raw[t], 0.35)
+
+        # ---- build compact per-frame debug records ----
+        for t in range(T):
             time_s = float(t * hop / fs) if (hop > 0 and fs > 0) else float(t)
-
             ff = FrameFeatures(
                 t=int(t),
                 time_s=time_s,
                 Ltot=float(Ltot[t]),
                 dLtot=float(dLtot[t]),
-                gate_primary_rise_ok=bool(det.get("gate_primary_rise_ok", False)),
-                gate_primary_peak_ok=bool(det.get("gate_primary_peak_ok", False)),
-                gate_top_peaks_mode_ok=bool(det.get("gate_top_peaks_mode_ok", False)),
-                gate_multi_mode_ok=bool(det.get("gate_multi_mode_ok", False)),
-                mode_count=int(det.get("mode_count", 0)),
-                mode_ok=self._as_bool_list(det.get("mode_ok")),
-                primary_rise_db=float(det.get("primary_rise_db", np.nan)),
-                margin_db=float(det.get("margin_db", np.nan)),
-                margin_score=float(det.get("margin_score", np.nan)),
-                top_peaks_hz=self._as_list(det.get("top_peaks_hz")),
-                top_peaks_db=self._as_list(det.get("top_peaks_db")),
-                top_peaks_in_mode=self._as_bool_list(det.get("top_peaks_in_mode")),
-                top_peaks_in_primary=self._as_bool_list(det.get("top_peaks_in_primary")),
-                mode_L=self._as_list(det.get("mode_db")),
-                mode_rise_db=self._as_list(det.get("mode_rise")),
-                mode_peak_db=self._as_list(det.get("mode_peak_db")),
-                mode_score=self._as_list(det.get("mode_score_each")),
-                mode_score_joint=float(det.get("mode_score_joint", np.nan)),
-                primary_ok=bool(det.get("primary_ok", False)),
-                rain_score_raw=float(det.get("rain_score_raw", np.nan)),
+                primary_flux_z=float(primary_flux_z[t]),
+                mode_count_z=int(mode_count_z[t]),
+                gate_primary_rise_ok=bool(gate_primary_rise_ok[t]),
+                gate_primary_peak_ok=bool(gate_primary_peak_ok[t]),
+                gate_top_peaks_mode_ok=bool(gate_top_peaks_mode_ok[t]),
+                gate_multi_mode_ok=bool(gate_multi_mode_ok[t]),
+                top_peaks_hz=_top_peaks_hz[t],
+                top_peaks_db=_top_peaks_db[t],
+                top_peaks_in_mode=_top_peaks_in_mode[t],
+                top_peaks_in_primary=_top_peaks_in_primary[t],
+                rain_score_raw=float(rain_score_raw[t]),
             )
             debug_frames.append(ff)
 
@@ -708,21 +690,38 @@ class RainFrameClassifierMixin:
         noise_conf = 1.0 - rain_conf
 
         det_debug = {
-            "Ltot": Ltot,
-            "dLtot": dLtot,
+            "operating_band": tuple(getattr(cfg, "operating_band")),
+            "times_s": np.asarray([ff.time_s for ff in debug_frames], dtype=float),
 
+            # raw + robust-normalized flux
+            "primary_flux": primary_flux,
+            "primary_flux_z": primary_flux_z,
+            "primary_flux_base": primary_flux_base,
+
+            "mode_flux": mode_flux,
+            "mode_flux_z": mode_flux_z,
+            "mode_flux_base": mode_flux_base,
+            "mode_count_z": mode_count_z,
+            "total_mode_flux": total_mode_flux,
+            "total_mode_flux_z": total_mode_flux_z,
+            "total_mode_flux_base": total_mode_flux_base,
+
+            # peak gates
+            "peaks_in_mode_count": peaks_in_mode_count,
+            "peaks_in_primary_topq": peaks_in_primary_topq,
+            "gate_primary_peak_ok": gate_primary_peak_ok,
+            "gate_top_peaks_mode_ok": gate_top_peaks_mode_ok,
+
+            # decision outputs
             "rain_score_raw": rain_score_raw,
-
-            "mode_db": mode_db_all,
-            "mode_rise": mode_rise_all,
-            "mode_peak_db": mode_peak_all,
-            "mode_score_each": mode_score_each_all,
-            "mode_score_joint": mode_joint,
-            "primary_ok": primary_ok,
-
             "label": label,
             "use_for_noise_psd": use_for_noise_psd,
 
+            # loudness debug
+            "Ltot": Ltot,
+            "dLtot": dLtot,
+
+            # compact per-frame records for interactive viz
             "frames": debug_frames,
         }
 
