@@ -24,6 +24,7 @@ class TestVectorLabeller:
         self,
         audio_df: pd.DataFrame,
         db_engine,
+        db_engine_upsert=None,
         max_duration_seconds=15,
         local_audio_cache="./raw_audio_cache",
         normalize_audio: bool = True,
@@ -39,9 +40,12 @@ class TestVectorLabeller:
             raise ValueError("audio_df must contain a 'source_file' column")
         if self.audio_df["source_file"].isnull().any():
             raise ValueError("audio_df contains null values in 'source_file'")
+        if not self.audio_df["source_file"].is_unique:
+            raise ValueError("audio_df must have unique source_file values")
         if not self.audio_df.index.equals(pd.Index(self.audio_df["source_file"])):
             self.audio_df = self.audio_df.set_index("source_file", drop=False)
         self.db_engine = db_engine
+        self.db_engine_upsert = db_engine_upsert or db_engine
  
         self.max_duration_seconds = max_duration_seconds
         self.local_audio_cache = local_audio_cache
@@ -155,9 +159,15 @@ class TestVectorLabeller:
                 fig.show()
                 return
 
-            ibm_plot_data = TestVectorLabeller.fetch_ibm_data(
-                db_engine, start_time, end_time, lat, long
-            )
+            try:
+                ibm_plot_data = TestVectorLabeller.fetch_ibm_data(
+                    db_engine, start_time, end_time, lat, long
+                )
+            except Exception as e:
+                print(f"Could not fetch IBM data: {e}")
+                fig.show()
+                return
+
             if ibm_plot_data.empty:
                 print(f"IBM data for {lat}, {long} not found in db")
                 fig.show()
@@ -280,14 +290,14 @@ class TestVectorLabeller:
     def make_button_handler(
         self,
         index,
-        data: pd.DataFrame,
+        data: pd.Series,
         output_widget: Output,
         rain_status: bool,
         next_index_callback: Callable,
     ) -> Callable:
         def on_button_clicked(b):
             try:
-                self.update_rain_label(index, data, rain_status, output_widget)
+                self.update_rain_label(data, rain_status, output_widget)
                 time.sleep(0.5)
                 clear_output(wait=True)
                 next_index_callback()
@@ -297,7 +307,7 @@ class TestVectorLabeller:
         return on_button_clicked
 
     def update_rain_label(
-        self, index, audio_file_data, rain_status: bool, output_widget: Output
+        self, audio_file_data, rain_status: bool, output_widget: Output
     ) -> None:
         with output_widget:
             display(
@@ -318,9 +328,12 @@ class TestVectorLabeller:
             data_to_upload["source"] = "manually labeled"
             data_to_upload["raining"] = rain_status
             data_to_upload["corrected"] = False
-            data_to_upload["creator"] = requests.get(
-                "https://api.ipify.org"
-            ).content.decode("utf8")
+            try:
+                data_to_upload["creator"] = requests.get(
+                    "https://api.ipify.org", timeout=5
+                ).content.decode("utf8")
+            except Exception:
+                data_to_upload["creator"] = "unknown"
             data_to_upload["update_time"] = current_time
             data_to_upload["create_time"] = current_time
             data_to_upload["manually_labeled"] = True
@@ -338,7 +351,7 @@ class TestVectorLabeller:
     def background_upsert(self, data: pd.DataFrame):
         try:
             upsert_df(
-                data, "device_audio_rain_classification", self.db_engine
+                data, "device_audio_rain_classification", self.db_engine_upsert
             )
             print("Database upsert completed successfully.")
         except Exception as e:
