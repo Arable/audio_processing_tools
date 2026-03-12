@@ -66,7 +66,8 @@ class TestVectorLabeller:
         self.history_stack = deque()  # History stack to keep track of processed indices
         self.upsert_threads = []
 
-    def reset(self):
+    def reset(self) -> None:
+        """Reset navigation state and recreate widget outputs for a fresh labeling run."""
         self.index_list = self.audio_df.index
         self.index_iter = iter(self.index_list)
         self.history_stack = deque()
@@ -77,7 +78,8 @@ class TestVectorLabeller:
         self.figure_output = Output()
         self.upsert_threads = []
 
-    def label_vectors(self):
+    def label_vectors(self) -> None:
+        """Start a fresh labeling session from the first file."""
         self.reset()
         display(self.main_output)
         display(self.audio_output)
@@ -86,7 +88,7 @@ class TestVectorLabeller:
         display(self.figure_output)
         self.process_next_index()
 
-    def process_next_index(self):
+    def process_next_index(self) -> None:
         try:
             next_index = next(self.index_iter)
             self.history_stack.append(next_index)  # Save the index to history stack
@@ -96,7 +98,7 @@ class TestVectorLabeller:
                 clear_output(wait=True)
                 print("All files have been processed.")
 
-    def process_previous_index(self):
+    def process_previous_index(self) -> None:
         if len(self.history_stack) > 1:
             self.history_stack.pop()  # Remove the current index
             previous_index = self.history_stack.pop()  # Get the previous index
@@ -288,12 +290,11 @@ class TestVectorLabeller:
                     clear_output(wait=True)
                     plot_audio_spectrogram(pcm_to_float(sig_of_interest), sample_rate)
 
-            db_engine = self.db_engine 
             if self.visualize_device_context:
                 with self.figure_output:
                     clear_output(wait=True)
                     self.plot_device_context(
-                        db_engine,
+                        self.db_engine,
                         index,
                         self.audio_df,
                         self.context_window_days,
@@ -318,7 +319,7 @@ class TestVectorLabeller:
         return on_button_clicked
 
     def update_rain_label(
-        self, audio_file_data, rain_status: bool, output_widget: Output
+        self, audio_file_data: pd.Series, rain_status: bool, output_widget: Output
     ) -> None:
         with output_widget:
             display(
@@ -356,11 +357,17 @@ class TestVectorLabeller:
             data_to_upload["uid"] = self.generate_uid(uid)
             data = pd.DataFrame([data_to_upload])
             data.set_index("uid", inplace=True)
-            thread = threading.Thread(target=self.background_upsert, args=(data,))
+            # Fire-and-forget background upsert. Daemon thread allows notebook shutdown
+            # without waiting, but an in-flight write may be interrupted on kernel exit.
+            thread = threading.Thread(
+                target=self.background_upsert,
+                args=(data,),
+                daemon=True,
+            )
             thread.start()
             self.upsert_threads.append(thread)
 
-    def background_upsert(self, data: pd.DataFrame):
+    def background_upsert(self, data: pd.DataFrame) -> None:
         try:
             upsert_df(
                 data, "device_audio_rain_classification", self.db_engine_upsert
