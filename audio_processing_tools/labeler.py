@@ -19,7 +19,7 @@ from audio_processing_tools.parse import parse_mark_audio_file, pcm_to_float
 from audio_processing_tools.visualize_audio import plot_audio_signal, plot_audio_spectrogram
 
 
-class TestVectorLabeller:
+class TestVectorLabeler:
     def __init__(
         self,
         audio_df: pd.DataFrame,
@@ -175,7 +175,7 @@ class TestVectorLabeller:
                 return
 
             try:
-                ibm_plot_data = TestVectorLabeller.fetch_ibm_data(
+                ibm_plot_data = TestVectorLabeler.fetch_ibm_data(
                     db_engine, start_time, end_time, lat, long
                 )
             except Exception as e:
