@@ -64,8 +64,21 @@ class TestVectorLabeller:
         self.visualize_time_series_signal = visualize_time_series_signal
         self.visualize_signal_spectrogram = visualize_signal_spectrogram
         self.history_stack = deque()  # History stack to keep track of processed indices
+        self.upsert_threads = []
+
+    def reset(self):
+        self.index_list = self.audio_df.index
+        self.index_iter = iter(self.index_list)
+        self.history_stack = deque()
+        self.main_output = Output()
+        self.audio_output = Output()
+        self.signal_output = Output()
+        self.spectrogram_output = Output()
+        self.figure_output = Output()
+        self.upsert_threads = []
 
     def label_vectors(self):
+        self.reset()
         display(self.main_output)
         display(self.audio_output)
         display(self.signal_output)
@@ -246,12 +259,12 @@ class TestVectorLabeller:
 
             raining_button.on_click(
                 self.make_button_handler(
-                    index, audio_file_data, output_widget, True, next_index_callback
+                    audio_file_data, output_widget, True, next_index_callback
                 )
             )
             not_raining_button.on_click(
                 self.make_button_handler(
-                    index, audio_file_data, output_widget, False, next_index_callback
+                    audio_file_data, output_widget, False, next_index_callback
                 )
             )
             skip_button.on_click(lambda b: next_index_callback())
@@ -289,7 +302,6 @@ class TestVectorLabeller:
 
     def make_button_handler(
         self,
-        index,
         data: pd.Series,
         output_widget: Output,
         rain_status: bool,
@@ -299,7 +311,6 @@ class TestVectorLabeller:
             try:
                 self.update_rain_label(data, rain_status, output_widget)
                 time.sleep(0.5)
-                clear_output(wait=True)
                 next_index_callback()
             except Exception as e:
                 print(f"Error in button handler: {e}")
@@ -347,6 +358,7 @@ class TestVectorLabeller:
             data.set_index("uid", inplace=True)
             thread = threading.Thread(target=self.background_upsert, args=(data,))
             thread.start()
+            self.upsert_threads.append(thread)
 
     def background_upsert(self, data: pd.DataFrame):
         try:
