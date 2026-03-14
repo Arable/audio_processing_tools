@@ -132,6 +132,16 @@ class NoiseProcessorConfig:
     snr_gating_use_mode_bands: bool = True
 
     # -----------------------------------------------------------
+    # Detector input normalization (optional)
+    # -----------------------------------------------------------
+    # If enabled, build a coarse/bootstrapped noise PSD first, then classify frames
+    # using the lagged PSD (t-1) before the final PSD estimation pass.
+    detector_use_noise_norm: bool = False
+    # "log_sub" => 10*log10(P) - 10*log10(N_lag)
+    # "ratio_db" => 10*log10(P / N_lag)
+    detector_noise_norm_mode: str = "log_sub"
+
+    # -----------------------------------------------------------
     # Debug / tuning
     # -----------------------------------------------------------
     debug_enable: bool = False
@@ -738,8 +748,14 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         op_lo, op_hi = cfg.operating_band
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
-        # 2) Rain detection (temporarily bypassed for suppression tuning)
+
+        # 2) Frame classification (optionally using lagged/bootstrapped noise PSD)
         bypass_classifier = bool(getattr(cfg, "detector", {}).get("bypass_classifier", False))
+        detector_use_noise_norm = bool(getattr(cfg, "detector_use_noise_norm", False))
+        detector_noise_norm_mode = str(getattr(cfg, "detector_noise_norm_mode", "log_sub")).lower()
+
+        bootstrap_noise_psd = None
+        detector_noise_psd_lag = None
 
         if bypass_classifier:
             # Treat all frames as noise so we can inspect suppressor behavior.
@@ -756,8 +772,47 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         else:
             P_for_detection = P.copy()
             P_for_detection[~band_mask, :] = 0.0
-            # log compression for stable detection
-            P_for_detection = np.log1p(P_for_detection)
+
+            if detector_use_noise_norm:
+                # Bootstrap/coarse PSD pass using all frames as candidate noise frames.
+                # This gives a lagged baseline for the detector without creating a circular dependency
+                # with the final classifier-gated PSD estimate.
+                bootstrap_is_rain_for_psd = np.zeros(T, dtype=bool)
+                if cfg.noise_psd_mode == "fft":
+                    bootstrap_noise_psd = self._estimate_noise_psd_fft(
+                        P,
+                        freqs,
+                        bootstrap_is_rain_for_psd,
+                        sr=sr,
+                    )
+                elif cfg.noise_psd_mode == "mel":
+                    bootstrap_noise_psd, _ = self._estimate_noise_psd_mel(
+                        P,
+                        freqs,
+                        bootstrap_is_rain_for_psd,
+                        sr=sr,
+                    )
+                else:
+                    raise ValueError(f"Unknown PSD mode: {cfg.noise_psd_mode}")
+
+                detector_noise_psd_lag = bootstrap_noise_psd.copy()
+                if detector_noise_psd_lag.shape[1] > 1:
+                    detector_noise_psd_lag = np.roll(detector_noise_psd_lag, shift=1, axis=1)
+                    detector_noise_psd_lag[:, 0] = bootstrap_noise_psd[:, 0]
+
+                # Safety clamp for lagged detector PSD as well.
+                maxr_det = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
+                maxr_det = 1.0 if (not np.isfinite(maxr_det)) else float(np.clip(maxr_det, 0.0, 1.0))
+                detector_noise_psd_lag = np.minimum(detector_noise_psd_lag, maxr_det * P)
+
+                if detector_noise_norm_mode == "ratio_db":
+                    P_for_detection = 10.0 * np.log10(P_for_detection / (detector_noise_psd_lag + cfg.eps) + cfg.eps)
+                else:
+                    # default: log-subtracted spectrum ~= dB above noise floor
+                    P_for_detection = 10.0 * np.log10(P_for_detection + cfg.eps) - 10.0 * np.log10(detector_noise_psd_lag + cfg.eps)
+            else:
+                # legacy detector input: absolute spectrum in dB
+                P_for_detection = 10.0 * np.log10(P_for_detection + cfg.eps)
 
             frame_class, rain_conf, det_debug = self._detect_rain_over_time(
                 P_for_detection,
@@ -783,7 +838,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                     pass
 
         # PSD update gating is derived from the canonical frame class.
-        # Only confident NOISE frames are used to update the noise PSD.
+        # Only confident NOISE frames are used to update the final noise PSD.
         use_for_noise_psd = np.asarray(is_noise, dtype=bool)
         is_rain_for_psd = ~use_for_noise_psd
 
@@ -925,6 +980,10 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             # Common time axis and frequency axis
             "times_s": times_s,
             "freqs": freqs,
+            "bootstrap_noise_psd": bootstrap_noise_psd,
+            "detector_noise_psd_lag": detector_noise_psd_lag,
+            "detector_use_noise_norm": detector_use_noise_norm,
+            "detector_noise_norm_mode": detector_noise_norm_mode,
 
             # Classifier outputs
             "rain_conf": rain_conf,

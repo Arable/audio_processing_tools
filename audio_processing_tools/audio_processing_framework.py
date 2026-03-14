@@ -148,6 +148,7 @@ def process_audio_batches_v2(
     query: Optional[str] = None,
     adse_engine=None,
     batch_size: int = 1000,
+    max_files: Optional[int] = None,
     local_cache: Optional[str] = None,
     localStatus: bool = True,
     get_keys_fn: Optional[
@@ -194,6 +195,9 @@ def process_audio_batches_v2(
         SQLAlchemy engine for DB-backed sources.
     batch_size :
         Number of items to process per batch.
+    max_files :
+        Optional limit on the number of input files (keys) to process. If
+        provided, only the first `max_files` discovered keys will be processed.
     local_cache :
         Local cache root for remote audio (forwarded to get_input_data_fn).
     localStatus :
@@ -247,7 +251,16 @@ def process_audio_batches_v2(
         batch_size=batch_size,
         localStatus=localStatus,
     )
-    print(f"received {len(keys)} test vectors")
+    # Optionally limit number of files processed
+    if max_files is not None:
+        if max_files < 0:
+            raise ValueError("max_files must be >= 0 or None")
+        keys = keys[:max_files]
+
+    if max_files is None:
+        print(f"received {len(keys)} test vectors")
+    else:
+        print(f"received {len(keys)} test vectors (limited by max_files={max_files})")
 
     results_rows: List[Dict[str, Any]] = []
     states_by_processor: Dict[str, List[Dict[str, Any]]] = {p.name: [] for p in processors}
