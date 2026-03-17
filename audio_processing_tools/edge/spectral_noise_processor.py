@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, field
-from enum import IntEnum
+
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -13,13 +13,6 @@ import librosa
 
 
 from .rain_frame_classifier import RainFrameClassifierMixin, FrameClass
-
-# Helper to safely convert numpy scalars/arrays for debug, and optionally gate printing.
-def _as_float(x: Any, default: float = float("nan")) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
 
 
 @dataclass
@@ -156,6 +149,14 @@ class NoiseProcessorConfig:
 
 # -----------------------------------------------------------
 # Config builder (dataclass defaults + params overrides)
+#
+# Notes:
+#   - suppressor params may be supplied under params["suppressor"] and are also
+#     flattened into top-level dataclass fields for stage-1 use.
+#   - detector params are stored under cfg.detector and are consumed by
+#     RainFrameClassifierMixin from that nested dict.
+#   - detector-specific flat keys that are not dataclass fields are not copied
+#     onto cfg as top-level attributes.
 # -----------------------------------------------------------
 def build_noise_config(sample_rate: int, params: Dict[str, Any]) -> "NoiseProcessorConfig":
     cfg = NoiseProcessorConfig(fs=int(sample_rate))
@@ -182,6 +183,9 @@ def build_noise_config(sample_rate: int, params: Dict[str, Any]) -> "NoiseProces
     det = params.get("detector", None)
     if isinstance(det, dict):
         cfg.detector = dict(det)
+    # Detector params intentionally remain nested under cfg.detector.
+    # They are read by RainFrameClassifierMixin via cfg.detector[...] rather than
+    # being flattened into top-level NoiseProcessorConfig attributes.
 
     # Legacy support: allow callers to pass fmin/fmax, but always normalize into operating_band.
     if "operating_band" not in params:
@@ -194,9 +198,6 @@ def build_noise_config(sample_rate: int, params: Dict[str, Any]) -> "NoiseProces
     for k, v in params.items():
         if k not in cfg_fields:
             continue
-
-        if k == "mode_bands":
-            v = tuple((float(a), float(b)) for (a, b) in v)
 
         if k == "operating_band":
             if isinstance(v, (list, tuple)) and len(v) == 2:
@@ -822,7 +823,10 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         frame_class = np.asarray(frame_class, dtype=np.int8)
         is_rain = frame_class == FrameClass.RAIN
         is_noise = frame_class == FrameClass.NOISE
-        noise_conf = np.clip(1.0 - rain_conf, 0.0, 1.0)
+        noise_conf = np.asarray(
+            det_debug.get("noise_conf", np.clip(1.0 - rain_conf, 0.0, 1.0)),
+            dtype=np.float64,
+        )
 
         # Ensure we have a time axis in seconds for tuning/plots
         times_s = np.asarray(times, dtype=np.float64)
