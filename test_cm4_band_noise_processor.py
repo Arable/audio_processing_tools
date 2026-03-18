@@ -115,6 +115,11 @@ INPUT_TYPE = "LocalPath"  # "RemotePath" or "LocalPath"
 #TEST_VECTOR_PATH = "/Users/vikrantoak/Downloads/tv_sets/balanced_rain_test_vectors"
 TEST_VECTOR_PATH = "/home/santhosh/Mark3/Doc/Rain/noise_cancel/test_vector/raw_audio/D009920"
 LOCAL_AUDIO_CACHE = "/home/santhosh/Mark3/Doc/Rain/noise_cancel/audio_header_cache"
+M3CLI_PATH = "/home/santhosh/repo/mark3-firmware-trunk/Utilities/M3cli/m3cli"
+M3CLI_DIR  = str(Path(M3CLI_PATH).parent)
+
+ENABLE_COMBINED_PLOT = True   # combined scatter + confusion matrix (all files)
+ENABLE_OTHER_PLOTS   = False  # per-file band-noise state plots
 
 N = 100
 QUERY = f"""
@@ -313,15 +318,16 @@ for i in range(len(states_df)):
     print("rain_actual:", row["rain_actual"])
     print("fft_rain_frac:", row["band_noise__fft_rain_frac"])
     print("n_frames:", row["band_noise__n_frames"])
-    #plot_band_noise_states_aligned(states_df, file_key=fk)
-    plot_band_noise_state(
-        states_df,
-        file_key=fk,
-        hpf_cutoff_hz = 400.0,
-        hpf_order  = 4,
-        noise_amp_mode = "rms",   # "rms" or "std"
-        figsize=(15, 10),
-    )
+    if ENABLE_OTHER_PLOTS:
+        #plot_band_noise_states_aligned(states_df, file_key=fk)
+        plot_band_noise_state(
+            states_df,
+            file_key=fk,
+            hpf_cutoff_hz=400.0,
+            hpf_order=4,
+            noise_amp_mode="rms",
+            figsize=(15, 10),
+        )
 
 
 # In[ ]:
@@ -473,11 +479,12 @@ def plot_band_noise_states_aligned(
 # In[ ]:
 
 
-states_df = states_by_proc["band_noise"]
-for i in range(len(states_df)):
-    fk = states_df["file_key"].iloc[i]
-    print(fk)
-    plot_band_noise_states_aligned(states_df, file_key=fk)
+if ENABLE_OTHER_PLOTS:
+    states_df = states_by_proc["band_noise"]
+    for i in range(len(states_df)):
+        fk = states_df["file_key"].iloc[i]
+        print(fk)
+        plot_band_noise_states_aligned(states_df, file_key=fk)
 
 
 # In[ ]:
@@ -589,7 +596,7 @@ def dump_eband_mband(audio_path: str,
     # ------------------------------------------------------------------
     # 2. Normalise to float  (mirrors: (float)s16[i] / 32768.0f  in C)
     # ------------------------------------------------------------------
-    x = pcm_int16.astype(np.float64) / 32768.0
+    x = pcm_int16.astype(np.float32) / np.float32(32768.0)
 
     # ------------------------------------------------------------------
     # 3. Build BandNoiseEstimator with CM4-matching defaults
@@ -633,15 +640,378 @@ def dump_eband_mband(audio_path: str,
 
 
 # ---------------------------------------------------------------------------
-# CLI:  python test_cm4_band_noise_processor.py <audio.bin> [output.txt]
+# m3cli integration helpers
+# ---------------------------------------------------------------------------
+
+# m3cli binary and working directory — set via macros at the top of this file
+_M3CLI_DEFAULT = M3CLI_PATH
+_M3CLI_DIR     = M3CLI_DIR
+
+
+def run_m3cli_nos_aud(audio_path: str,
+                      m3cli_path: str = _M3CLI_DEFAULT,
+                      nb_out_path: str | None = None,
+                      timeout: int = 120) -> str:
+    """
+    Run ``./m3cli 'nos_aud <audio_path>'``, wait for completion, and return
+    the local path to the downloaded NOS_BAND.TXT.
+
+    Parameters
+    ----------
+    audio_path  : absolute path to the Mark3 .bin audio file
+    m3cli_path  : path to the m3cli binary (default: sibling repo location)
+    nb_out_path : where to copy NOS_BAND.TXT after download; if None the file is
+                  left in the m3cli working directory and its path is returned
+    timeout     : seconds to wait for m3cli to finish (default 120 s)
+
+    Returns
+    -------
+    str : path to the NOS_BAND.TXT file produced by the device
+    """
+    import subprocess
+
+    m3cli_dir  = str(Path(m3cli_path).parent)
+    nb_default = os.path.join(m3cli_dir, "NOS_BAND.TXT")
+
+    cmd = [m3cli_path, f"nos_aud {audio_path}", "quit"]
+    print(f"\nrun_m3cli_nos_aud: {' '.join(repr(c) for c in cmd)}")
+    print(f"  working dir : {m3cli_dir}")
+
+    result = subprocess.run(
+        cmd,
+        cwd=m3cli_dir,
+        timeout=timeout,
+        capture_output=False,   # let stdout/stderr stream to the terminal
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"m3cli exited with code {result.returncode}")
+
+    if not os.path.isfile(nb_default):
+        raise FileNotFoundError(
+            f"NOS_BAND.TXT not found at {nb_default!r} after m3cli run"
+        )
+
+    if nb_out_path is not None and nb_out_path != nb_default:
+        import shutil
+        shutil.copy2(nb_default, nb_out_path)
+        print(f"  NOS_BAND.TXT copied → {nb_out_path}")
+        return nb_out_path
+
+    print(f"  NOS_BAND.TXT  : {nb_default}")
+    return nb_default
+
+
+def _load_m_clean(path: str) -> np.ndarray:
+    """
+    Load the M_clean column (last, 4th column) from a 4-column output file.
+    Format per line:  <frame_idx> <E_band> <M_band> <M_clean>
+    """
+    data = np.loadtxt(path, usecols=(0, 3))   # frame_idx, M_clean
+    return data   # shape (N, 2)
+
+
+def compare_m_clean(py_out_path: str,
+                    nb_out_path: str,
+                    *,
+                    abs_tol: float = 1e-3) -> bool:
+    """
+    Compare the M_clean column between the Python output and the device
+    (m3cli / NOS_BAND.TXT) output.
+
+    A frame PASSES if |py - nb| < abs_tol (default 0.001).
+
+    Prints statistics, a per-frame diff table for failing frames, a scatter
+    plot of py vs nb M_clean, and a confusion matrix (PASS/FAIL per frame).
+
+    Parameters
+    ----------
+    py_out_path : path to Python-generated output (4-column format)
+    nb_out_path : path to device NOS_BAND.TXT (4-column format)
+    abs_tol     : absolute tolerance — diff < abs_tol is a pass (default 1e-3)
+
+    Returns
+    -------
+    bool : True if every frame is within tolerance
+    """
+    import matplotlib.pyplot as plt
+
+    py_data = _load_m_clean(py_out_path)   # (N, 2): col0=frame, col1=M_clean
+    nb_data = _load_m_clean(nb_out_path)
+
+    py_frames = py_data[:, 0].astype(int)
+    nb_frames = nb_data[:, 0].astype(int)
+
+    # --- align on frame index (intersection) ---
+    common = np.intersect1d(py_frames, nb_frames)
+    if len(common) == 0:
+        print("compare_m_clean: no common frame indices — cannot compare")
+        return False
+
+    py_mc = py_data[np.isin(py_frames, common), 1]
+    nb_mc = nb_data[np.isin(nb_frames, common), 1]
+    n = len(common)
+
+    diff     = py_mc - nb_mc          # signed error (py − nb)
+    abs_diff = np.abs(diff)
+    within   = abs_diff < abs_tol
+    n_pass   = int(np.sum(within))
+    n_fail   = n - n_pass
+
+    # --- statistics ---
+    mae      = float(np.mean(abs_diff))
+    rmse     = float(np.sqrt(np.mean(diff ** 2)))
+    max_diff = float(np.max(abs_diff))
+    avg_diff = float(np.mean(diff))                    # mean signed difference
+    std_diff = float(np.std(diff))                     # std dev of signed error
+    mean_err = avg_diff                                # bias
+    max_dev  = float(np.max(np.abs(diff - avg_diff))) # max deviation from bias
+    p90      = float(np.percentile(abs_diff, 90))
+    p95      = float(np.percentile(abs_diff, 95))
+    p99      = float(np.percentile(abs_diff, 99))
+
+    print()
+    print("=" * 72)
+    print("  M_clean comparison:  Python  vs  Device (NOS_BAND.TXT)")
+    print(f"  frames compared    : {n}")
+    print(f"  MAE                : {mae:.6e}   (mean absolute error)")
+    print(f"  RMSE               : {rmse:.6e}   (how close overall)")
+    print(f"  Mean error (bias)  : {mean_err:.6e}   (signed: +ve = py > nb)")
+    print(f"  Max |difference|   : {max_diff:.6e}   (worst case)")
+    print(f"  Avg difference     : {avg_diff:.6e}")
+    print(f"  Std deviation      : {std_diff:.6e}")
+    print(f"  Max deviation      : {max_dev:.6e}   (max spread around bias)")
+    print(f"  90th percentile    : {p90:.6e}")
+    print(f"  95th percentile    : {p95:.6e}   (worst 5 % threshold)")
+    print(f"  99th percentile    : {p99:.6e}   (worst 1 % threshold)")
+    print(f"  tolerance          : |diff| < {abs_tol:.0e}")
+    print(f"  frames PASS        : {n_pass} / {n}")
+    print(f"  frames FAIL        : {n_fail}")
+    print("=" * 72)
+
+    if n_fail > 0:
+        print(f"\n  {'frame':>6}  {'py_M_clean':>16}  {'nb_M_clean':>16}  {'abs_diff':>14}")
+        print("  " + "-" * 58)
+        for idx in np.where(~within)[0]:
+            fi = int(common[idx])
+            print(f"  {fi:>6}  {py_mc[idx]:>16.10e}  {nb_mc[idx]:>16.10e}"
+                  f"  {abs_diff[idx]:>14.6e}")
+
+    result_str = "PASS" if n_fail == 0 else "FAIL"
+    print(f"\n  Overall result: {result_str}")
+    print("=" * 72)
+
+    return n_fail == 0, py_mc, nb_mc
+
+
+def plot_combined_charts(all_py_mc: np.ndarray,
+                         all_nb_mc: np.ndarray,
+                         abs_tol: float = 1e-3,
+                         title_prefix: str = "") -> None:
+    """
+    Plot scatter chart and confusion matrix from combined M_clean arrays
+    accumulated across all processed files.
+
+    Parameters
+    ----------
+    all_py_mc    : concatenated Python M_clean values (all files)
+    all_nb_mc    : concatenated Device M_clean values (all files)
+    abs_tol      : same tolerance used in compare_m_clean
+    title_prefix : optional label prepended to figure title (e.g. file count)
+    """
+    import matplotlib.pyplot as plt
+
+    diff     = all_py_mc - all_nb_mc
+    abs_diff = np.abs(diff)
+    within   = abs_diff < abs_tol
+    n        = len(all_py_mc)
+    n_pass   = int(np.sum(within))
+    n_fail   = n - n_pass
+
+    mae      = float(np.mean(abs_diff))
+    rmse     = float(np.sqrt(np.mean(diff ** 2)))
+    max_diff = float(np.max(abs_diff))
+    avg_diff = float(np.mean(diff))
+    std_diff = float(np.std(diff))
+    mean_err = avg_diff
+    max_dev  = float(np.max(np.abs(diff - avg_diff)))
+    p90      = float(np.percentile(abs_diff, 90))
+    p95      = float(np.percentile(abs_diff, 95))
+    p99      = float(np.percentile(abs_diff, 99))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    prefix = f"{title_prefix} — " if title_prefix else ""
+    fig.suptitle(
+        f"{prefix}M_clean: Python vs Device  ({n} frames total)\n"
+        f"MAE={mae:.3e}  RMSE={rmse:.3e}  Bias={mean_err:.3e}  "
+        f"MaxDiff={max_diff:.3e}  Std={std_diff:.3e}  MaxDev={max_dev:.3e}  "
+        f"P90={p90:.3e}  P95={p95:.3e}  P99={p99:.3e}",
+        fontsize=8,
+    )
+
+    # ------------------------------------------------------------------ #
+    #  Scatter plot                                                        #
+    # ------------------------------------------------------------------ #
+    ax = axes[0]
+    ax.scatter(all_nb_mc[within], all_py_mc[within],
+               s=8, alpha=0.5, color="steelblue", label=f"PASS ({n_pass})")
+    if (~within).any():
+        ax.scatter(all_nb_mc[~within], all_py_mc[~within],
+                   s=15, alpha=0.85, color="crimson", label=f"FAIL ({n_fail})")
+    lo = min(all_nb_mc.min(), all_py_mc.min())
+    hi = max(all_nb_mc.max(), all_py_mc.max())
+    ax.plot([lo, hi], [lo, hi], "k--", linewidth=0.8, label="ideal (y=x)")
+    ax.set_xlabel("Device M_clean (nb)")
+    ax.set_ylabel("Python M_clean (py)")
+    ax.set_title("Scatter: py vs nb M_clean (all files combined)")
+    ax.legend(fontsize=8)
+    ax.grid(True, linestyle=":", alpha=0.5)
+
+    # ------------------------------------------------------------------ #
+    #  Confusion matrix (above/below combined median)                     #
+    # ------------------------------------------------------------------ #
+    threshold = np.median(np.concatenate([all_py_mc, all_nb_mc]))
+    py_hi = (all_py_mc >= threshold).astype(int)
+    nb_hi = (all_nb_mc >= threshold).astype(int)
+
+    cm = np.zeros((2, 2), dtype=int)
+    for p, d in zip(py_hi, nb_hi):
+        cm[d, p] += 1   # rows = device, cols = python
+
+    ax2 = axes[1]
+    im = ax2.imshow(cm, interpolation="nearest", cmap="Blues")
+    fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+    labels = ["Below median", "Above median"]
+    ax2.set_xticks([0, 1]); ax2.set_xticklabels(labels, fontsize=8)
+    ax2.set_yticks([0, 1]); ax2.set_yticklabels(labels, fontsize=8)
+    ax2.set_xlabel("Python M_clean")
+    ax2.set_ylabel("Device M_clean")
+    ax2.set_title(f"Confusion Matrix (threshold={threshold:.3e}, all files combined)")
+    for i in range(2):
+        for j in range(2):
+            ax2.text(j, i, str(cm[i, j]),
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > cm.max() / 2 else "black",
+                     fontsize=12, fontweight="bold")
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+# ---------------------------------------------------------------------------
+# Run test for all files under TEST_VECTOR_PATH directory
+# $ python test_cm4_band_noise_processor.py
+#
+# ---------------------------------------------------------------------------
+# Run for single file
+# $ python test_cm4_band_noise_processor.py /home/santhosh/Mark3/Doc/Rain/noise_cancel/test_vector/raw_audio/D009920/2025/04/05/20250405_07_40_00_000000_rain_09b.bin 
+#
+# ---------------------------------------------------------------------------
+# CLI:  python test_cm4_band_noise_processor.py <audio.bin> [py_out.txt]
+#       Add --skip-m3cli to only run the Python side (no device needed).
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python test_cm4_band_noise_processor.py <audio.bin> [output.txt]")
-        sys.exit(1)
-    _audio  = sys.argv[1]
-    _output = sys.argv[2] if len(sys.argv) > 2 else "nos_band_out.txt"
-    dump_eband_mband(_audio, _output)
+    import argparse as _argparse
+
+    _ap = _argparse.ArgumentParser(
+        description=(
+            "Run Python BandNoiseEstimator and compare M_clean with device output via m3cli.\n"
+            "With no positional argument: processes every .bin file under TEST_VECTOR_PATH.\n"
+            "With a positional argument: processes that single file only."
+        )
+    )
+    _ap.add_argument("audio", nargs="?", default=None,
+                     help="Mark3 audio .bin file to process (omit to run all files in TEST_VECTOR_PATH)")
+    _ap.add_argument("--nb-out", default=None,
+                     help="Path for NOS_BAND.TXT copy (default: leave in m3cli dir)")
+    _ap.add_argument("--m3cli", default=_M3CLI_DEFAULT,
+                     help=f"Path to m3cli binary (default: {_M3CLI_DEFAULT})")
+    _ap.add_argument("--skip-m3cli", action="store_true",
+                     help="Skip m3cli call; compare against existing NOS_BAND.TXT instead")
+    _ap.add_argument("--existing-nb-out", default=None,
+                     help="Path to an existing NOS_BAND.TXT to use when --skip-m3cli is set")
+    _ap.add_argument("--abs-tol", type=float, default=1e-3,
+                     help="Absolute tolerance for M_clean comparison — diff < abs_tol is a pass (default: 1e-3)")
+    _args = _ap.parse_args()
+
+    # Build list of files to process
+    if _args.audio:
+        _files = [_args.audio]
+    else:
+        _files = sorted(Path(TEST_VECTOR_PATH).rglob("*.bin"))
+        if not _files:
+            print(f"No .bin files found under TEST_VECTOR_PATH={TEST_VECTOR_PATH!r}")
+            sys.exit(1)
+        print(f"Found {len(_files)} .bin file(s) under {TEST_VECTOR_PATH}")
+
+    _results   = []   # list of (filename, passed)
+    _all_py_mc = []   # accumulated Python M_clean across all files
+    _all_nb_mc = []   # accumulated Device M_clean across all files
+
+    for _audio in _files:
+        _audio = str(_audio)
+        _stem  = Path(_audio).stem
+        _py_out = f"py_out_{_stem}.txt"
+
+        print(f"\n{'='*72}")
+        print(f"  File: {_audio}")
+        print(f"{'='*72}")
+
+        try:
+            # --- 1. Python side ---
+            dump_eband_mband(_audio, _py_out)
+
+            # --- 2. Device side (m3cli) ---
+            # Per-file cached copy of NOS_BAND.TXT — reuse on subsequent runs
+            _nb_cache = f"NOS_BAND_{_stem}.TXT"
+
+            if _args.skip_m3cli:
+                _nb = _args.existing_nb_out or os.path.join(_M3CLI_DIR, "NOS_BAND.TXT")
+                print(f"\nSkipping m3cli — using existing NOS_BAND.TXT: {_nb}")
+            elif os.path.isfile(_nb_cache):
+                _nb = _nb_cache
+                print(f"\n  [CACHE] Reusing {_nb_cache} — skipping m3cli")
+            else:
+                _nb = run_m3cli_nos_aud(_audio, _args.m3cli, _nb_cache)
+                print(f"  [CACHE] Saved → {_nb_cache}")
+
+            # --- 3. Compare M_clean (per-file stats + console table) ---
+            _passed, _py_mc, _nb_mc = compare_m_clean(_py_out, _nb,
+                                                       abs_tol=_args.abs_tol)
+            _results.append((_audio, _passed))
+            _all_py_mc.append(_py_mc)
+            _all_nb_mc.append(_nb_mc)
+
+        except FileNotFoundError as _e:
+            print(f"\n  [SKIP] FileNotFoundError: {_e}")
+            print(f"  Skipping: {_audio}")
+            _results.append((_audio, None))
+
+    # --- Combined scatter + confusion matrix across all files ---
+    if ENABLE_COMBINED_PLOT and _all_py_mc:
+        _combined_py = np.concatenate(_all_py_mc)
+        _combined_nb = np.concatenate(_all_nb_mc)
+        plot_combined_charts(
+            _combined_py, _combined_nb,
+            abs_tol=_args.abs_tol,
+            title_prefix=f"{len(_files)} file(s)",
+        )
+
+    # --- Summary across all files ---
+    if len(_results) > 1:
+        _n_pass = sum(1 for _, ok in _results if ok is True)
+        _n_fail = sum(1 for _, ok in _results if ok is False)
+        _n_skip = sum(1 for _, ok in _results if ok is None)
+        print(f"\n{'='*72}")
+        print(f"  SUMMARY: {_n_pass} PASSED  {_n_fail} FAILED  {_n_skip} SKIPPED  (of {len(_results)} files)")
+        print(f"{'='*72}")
+        for _f, _ok in _results:
+            _tag = "PASS" if _ok is True else ("SKIP" if _ok is None else "FAIL")
+            print(f"  [{_tag}]  {_f}")
+        print(f"{'='*72}")
+
+    sys.exit(0 if all(ok is True for _, ok in _results) else 1)
 
 
 # In[ ]:
