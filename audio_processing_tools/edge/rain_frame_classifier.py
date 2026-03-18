@@ -35,9 +35,10 @@ class TimeDomainSoftLabelConfig:
     env_smooth_len: int = 3
 
     # Soft-label thresholds (initial guesses)
-    energy_excess_min: float = 0.20
-    crest_factor_min: float = 3.0
-    kurtosis_min: float = 3.5
+    energy_peak_ratio_min: float = 1.5
+    env_baseline_floor: float = 1e-6
+    crest_factor_min: float = 10.0 #3.0
+    kurtosis_min: float = 10.0 #3.5
     min_positive_votes: int = 2
 
     eps: float = 1e-9
@@ -53,7 +54,7 @@ class TimeDomainSoftLabeller:
       - 256-point frames with 128-point hop
       - per-frame features:
           * envelope peak present
-          * energy excess over local envelope baseline
+          * envelope peak-to-baseline ratio
           * crest factor
           * kurtosis
       - soft label from vote count
@@ -135,6 +136,7 @@ class TimeDomainSoftLabeller:
         env, env_times = self._block_energy_envelope(x_bp)
 
         energy_excess = np.zeros(T, dtype=np.float64)
+        energy_peak_ratio = np.zeros(T, dtype=np.float64)
         crest_factor = np.zeros(T, dtype=np.float64)
         kurt_vals = np.zeros(T, dtype=np.float64)
         env_peak_present = np.zeros(T, dtype=bool)
@@ -167,18 +169,23 @@ class TimeDomainSoftLabeller:
                 m = (env_times >= t0) & (env_times < t1)
                 if np.any(m):
                     env_seg = env[m]
-                    env_peak_present[t] = bool(np.max(env_seg) >= env_peak_threshold)
-                    energy_excess[t] = max(float(np.max(env_seg) - env_baseline), 0.0)
+                    env_max = float(np.max(env_seg))
+                    baseline_ref = max(float(env_baseline), float(cfg.env_baseline_floor), cfg.eps)
+                    env_peak_present[t] = bool(env_max >= env_peak_threshold)
+                    energy_excess[t] = max(env_max - float(env_baseline), 0.0)
+                    energy_peak_ratio[t] = env_max / baseline_ref
                 else:
                     env_peak_present[t] = False
                     energy_excess[t] = 0.0
+                    energy_peak_ratio[t] = 0.0
             else:
                 env_peak_present[t] = False
                 energy_excess[t] = 0.0
+                energy_peak_ratio[t] = 0.0
 
             votes = 0
             votes += int(env_peak_present[t])
-            votes += int(energy_excess[t] >= cfg.energy_excess_min)
+            votes += int(energy_peak_ratio[t] >= cfg.energy_peak_ratio_min)
             votes += int(crest_factor[t] >= cfg.crest_factor_min)
             votes += int(kurt_vals[t] >= cfg.kurtosis_min)
             vote_count[t] = votes
@@ -193,6 +200,7 @@ class TimeDomainSoftLabeller:
             "env_baseline": env_baseline,
             "env_peak_threshold": env_peak_threshold,
             "energy_excess": energy_excess,
+            "energy_peak_ratio": energy_peak_ratio,
             "crest_factor": crest_factor,
             "kurtosis": kurt_vals,
             "env_peak_present": env_peak_present,
@@ -308,7 +316,8 @@ class RainFrameClassifierMixin:
         td_soft_env_block_len = int(self._dget("td_soft_env_block_len", 32))
         td_soft_env_hop = int(self._dget("td_soft_env_hop", 16))
         td_soft_env_smooth_len = int(self._dget("td_soft_env_smooth_len", 3))
-        td_soft_energy_excess_min = float(self._dget("td_soft_energy_excess_min", 0.20))
+        td_soft_energy_peak_ratio_min = float(self._dget("td_soft_energy_peak_ratio_min", 2.0))
+        td_soft_env_baseline_floor = float(self._dget("td_soft_env_baseline_floor", 1e-6))
         td_soft_crest_factor_min = float(self._dget("td_soft_crest_factor_min", 3.0))
         td_soft_kurtosis_min = float(self._dget("td_soft_kurtosis_min", 3.5))
         td_soft_min_positive_votes = int(self._dget("td_soft_min_positive_votes", 2))
@@ -381,7 +390,8 @@ class RainFrameClassifierMixin:
                     env_block_len=td_soft_env_block_len,
                     env_hop=td_soft_env_hop,
                     env_smooth_len=td_soft_env_smooth_len,
-                    energy_excess_min=td_soft_energy_excess_min,
+                    energy_peak_ratio_min=td_soft_energy_peak_ratio_min,
+                    env_baseline_floor=td_soft_env_baseline_floor,
                     crest_factor_min=td_soft_crest_factor_min,
                     kurtosis_min=td_soft_kurtosis_min,
                     min_positive_votes=td_soft_min_positive_votes,
