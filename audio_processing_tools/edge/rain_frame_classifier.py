@@ -6,7 +6,6 @@ from typing import Any, Dict, Tuple, Optional
 
 import librosa
 import numpy as np
-import scipy.ndimage as ndi
 import scipy.signal as spsig
 from scipy.stats import kurtosis
 
@@ -19,7 +18,6 @@ class FrameClass(IntEnum):
     RAIN = 2
 
 
-
 @dataclass
 class TimeDomainSoftLabelConfig:
     fs: int = 11162
@@ -27,18 +25,21 @@ class TimeDomainSoftLabelConfig:
     hop: int = 128
 
     operating_band: Tuple[float, float] = (400.0, 3500.0)
+    time_flux_band: Optional[Tuple[float, float]] = None
     bp_order: int = 4
 
-    # Envelope from block energy
-    env_block_len: int = 32
-    env_hop: int = 16
-    env_smooth_len: int = 3
+    # Subframe-energy dynamics (aligned to the classifier hop by default)
+    subframe_len: int = 128
+    subframe_hop: int = 128
+    baseline_win_sec: float = 0.5
+    baseline_min_hist_sec: float = 0.25
+    baseline_q: float = 20.0
 
-    # Soft-label thresholds (initial guesses)
-    energy_peak_ratio_min: float = 1.5
-    env_baseline_floor: float = 1e-6
-    crest_factor_min: float = 10.0 #3.0
-    kurtosis_min: float = 10.0 #3.5
+    # Soft-label thresholds (current working defaults)
+    time_flux_score_min: float = 1.5
+    baseline_floor: float = 1e-6
+    crest_factor_min: float = 4.0
+    kurtosis_min: float = 6.0
     min_positive_votes: int = 2
 
     eps: float = 1e-9
@@ -49,29 +50,35 @@ class TimeDomainSoftLabeller:
     Simple time-domain soft labeller for rain-like impulsive frames.
 
     Current design:
-      - bandpass filter with operating band
-      - block-energy envelope
-      - 256-point frames with 128-point hop
-      - per-frame features:
-          * envelope peak present
-          * envelope peak-to-baseline ratio
-          * crest factor
-          * kurtosis
+      - bandpass filter with operating band for waveform-shape features
+      - optional narrower time-flux band for the subframe-energy / flux path
+      - 128-point subframe energy
+      - 256-point frame energy formed by summing two adjacent subframes
+      - causal rolling low-quantile baseline over ~0.5 s on the subframe-energy stream,
+        then mapped to frame level
+      - frame-level time-domain flux using only frame-to-(t-2) positive rise
+      - 256-point frame-level crest factor and kurtosis
       - soft label from vote count
+      - warm-up handling so time-flux scoring is trusted only after sufficient
+        causal baseline history is available
+
+    Note:
+      - decay-based features are currently disabled and can be reintroduced later if needed.
     """
 
     def __init__(self, config: Optional[TimeDomainSoftLabelConfig] = None):
         self.cfg = config or TimeDomainSoftLabelConfig()
 
-    def _bandpass(self, x: np.ndarray) -> np.ndarray:
+    def _bandpass(self, x: np.ndarray, band: Optional[Tuple[float, float]] = None) -> np.ndarray:
         cfg = self.cfg
         x = np.asarray(x, dtype=np.float64).reshape(-1)
         if x.size == 0:
             return x.copy()
 
+        use_band = cfg.operating_band if band is None else band
         nyq = 0.5 * float(cfg.fs)
-        lo = float(np.clip(cfg.operating_band[0], 1e-3, nyq * 0.999))
-        hi = float(np.clip(cfg.operating_band[1], lo + 1e-3, nyq * 0.999))
+        lo = float(np.clip(use_band[0], 1e-3, nyq * 0.999))
+        hi = float(np.clip(use_band[1], lo + 1e-3, nyq * 0.999))
         sos = spsig.butter(
             int(cfg.bp_order),
             [lo / nyq, hi / nyq],
@@ -83,34 +90,6 @@ class TimeDomainSoftLabeller:
         except ValueError:
             return spsig.sosfilt(sos, x)
 
-    def _block_energy_envelope(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        cfg = self.cfg
-        x = np.asarray(x, dtype=np.float64).reshape(-1)
-        if x.size == 0:
-            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-
-        B = int(max(1, cfg.env_block_len))
-        H = int(max(1, cfg.env_hop))
-        if x.size < B:
-            energy = np.array([float(np.mean(x**2))], dtype=np.float64)
-            times = np.array([0.0], dtype=np.float64)
-        else:
-            vals = []
-            times = []
-            for start in range(0, x.size - B + 1, H):
-                seg = x[start : start + B]
-                vals.append(float(np.mean(seg**2)))
-                times.append((start + 0.5 * B) / float(cfg.fs))
-            energy = np.asarray(vals, dtype=np.float64)
-            times = np.asarray(times, dtype=np.float64)
-
-        if energy.size > 1 and int(cfg.env_smooth_len) > 1:
-            L = int(cfg.env_smooth_len)
-            kernel = np.ones(L, dtype=np.float64) / float(L)
-            energy = np.convolve(energy, kernel, mode="same")
-
-        return energy, times
-
     def _frame_view(self, x: np.ndarray) -> np.ndarray:
         cfg = self.cfg
         x = np.asarray(x, dtype=np.float64).reshape(-1)
@@ -118,6 +97,7 @@ class TimeDomainSoftLabeller:
             return np.empty((0, cfg.frame_len), dtype=np.float64)
         T = 1 + (x.size - cfg.frame_len) // cfg.hop
         stride = x.strides[0]
+        # NOTE: uses as_strided (no bounds check) — assumes valid frame geometry
         return np.lib.stride_tricks.as_strided(
             x,
             shape=(T, cfg.frame_len),
@@ -125,31 +105,115 @@ class TimeDomainSoftLabeller:
             writeable=False,
         )
 
+    def _subframe_energy(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        cfg = self.cfg
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        if x.size == 0:
+            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+        B = int(max(1, cfg.subframe_len))
+        H = int(max(1, cfg.subframe_hop))
+        if x.size < B:
+            energy = np.array([float(np.mean(x**2))], dtype=np.float64)
+            times = np.array([0.0], dtype=np.float64)
+            return energy, times
+
+        vals = []
+        times = []
+        for start in range(0, x.size - B + 1, H):
+            seg = x[start : start + B]
+            vals.append(float(np.mean(seg**2)))
+            times.append(start / float(cfg.fs))
+        return np.asarray(vals, dtype=np.float64), np.asarray(times, dtype=np.float64)
+
+    def _rolling_low_quantile_baseline(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        cfg = self.cfg
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        T = x.size
+        if T == 0:
+            return x.copy(), np.zeros(0, dtype=bool)
+
+        q = float(np.clip(cfg.baseline_q, 0.0, 100.0)) / 100.0
+        subframes_per_sec = float(cfg.fs) / max(float(cfg.subframe_hop), 1.0)
+        W = max(3, int(round(float(cfg.baseline_win_sec) * subframes_per_sec)))
+        min_hist = max(1, int(round(float(cfg.baseline_min_hist_sec) * subframes_per_sec)))
+
+        out = np.empty(T, dtype=np.float64)
+        warm_ok = np.zeros(T, dtype=bool)
+        for t in range(T):
+            i0 = max(0, t - W)
+            i1 = t  # causal: exclude current sample from baseline estimate
+            if i1 <= i0:
+                out[t] = cfg.baseline_floor
+                warm_ok[t] = False
+            else:
+                hist = x[i0:i1]
+                out[t] = np.quantile(hist, q)
+                warm_ok[t] = hist.size >= min_hist
+
+        out = np.nan_to_num(out, nan=cfg.baseline_floor, posinf=cfg.baseline_floor, neginf=cfg.baseline_floor)
+        out = np.maximum(out, cfg.baseline_floor)
+        return out, warm_ok
+
+    def _frame_baseline_from_subframes(self, sub_baseline: np.ndarray, n_frames: int) -> np.ndarray:
+        sub_baseline = np.asarray(sub_baseline, dtype=np.float64).reshape(-1)
+        out = np.zeros(n_frames, dtype=np.float64)
+        if n_frames == 0 or sub_baseline.size == 0:
+            return out
+
+        for t in range(n_frames):
+            b0 = sub_baseline[t] if t < sub_baseline.size else 0.0
+            b1 = sub_baseline[t + 1] if (t + 1) < sub_baseline.size else 0.0
+            out[t] = float(b0 + b1)
+        return out
+
+    def _frame_energy_from_subframes(self, sub_energy: np.ndarray, n_frames: int) -> np.ndarray:
+        sub_energy = np.asarray(sub_energy, dtype=np.float64).reshape(-1)
+        out = np.zeros(n_frames, dtype=np.float64)
+        if n_frames == 0 or sub_energy.size == 0:
+            return out
+
+        for t in range(n_frames):
+            e0 = sub_energy[t] if t < sub_energy.size else 0.0
+            e1 = sub_energy[t + 1] if (t + 1) < sub_energy.size else 0.0
+            out[t] = float(e0 + e1)
+        return out
+
     def process(self, x: np.ndarray) -> Dict[str, Any]:
         cfg = self.cfg
         x = np.asarray(x, dtype=np.float64).reshape(-1)
-        x_bp = self._bandpass(x)
+        x_bp = self._bandpass(x, cfg.operating_band)
+        flux_band = cfg.time_flux_band if cfg.time_flux_band is not None else cfg.operating_band
+        x_flux = self._bandpass(x, flux_band)
         frames = self._frame_view(x_bp)
         T = frames.shape[0]
 
         frame_times = (np.arange(T) * cfg.hop) / float(cfg.fs)
-        env, env_times = self._block_energy_envelope(x_bp)
+        sub_energy, sub_times = self._subframe_energy(x_flux)
+        sub_baseline, sub_warm_ok = self._rolling_low_quantile_baseline(sub_energy)
+        frame_energy = self._frame_energy_from_subframes(sub_energy, T)
+        frame_baseline = self._frame_baseline_from_subframes(sub_baseline, T)
+        frame_warm_ok = np.zeros(T, dtype=bool)
+        if sub_warm_ok.size > 0:
+            for t in range(T):
+                ok0 = bool(sub_warm_ok[t]) if t < sub_warm_ok.size else False
+                ok1 = bool(sub_warm_ok[t + 1]) if (t + 1) < sub_warm_ok.size else False
+                frame_warm_ok[t] = ok0 and ok1
+        baseline_ref = np.maximum(frame_baseline, cfg.baseline_floor)
 
-        energy_excess = np.zeros(T, dtype=np.float64)
-        energy_peak_ratio = np.zeros(T, dtype=np.float64)
+        frame_flux = np.zeros(T, dtype=np.float64)
+        time_flux_score = np.zeros(T, dtype=np.float64)
         crest_factor = np.zeros(T, dtype=np.float64)
         kurt_vals = np.zeros(T, dtype=np.float64)
-        env_peak_present = np.zeros(T, dtype=bool)
         vote_count = np.zeros(T, dtype=np.int32)
         soft_score = np.zeros(T, dtype=np.float64)
         soft_label = np.zeros(T, dtype=bool)
 
-        if env.size > 0:
-            env_baseline = np.percentile(env, 20.0)
-            env_peak_threshold = env_baseline + 0.25 * max(np.max(env) - env_baseline, cfg.eps)
-        else:
-            env_baseline = 0.0
-            env_peak_threshold = np.inf
+        if T > 2:
+            frame_flux[2:] = np.maximum(frame_energy[2:] - frame_energy[:-2], 0.0)
+
+        time_flux_score = frame_flux / baseline_ref
+        time_flux_score = np.where(frame_warm_ok, time_flux_score, 0.0)
 
         for t in range(T):
             seg = np.asarray(frames[t], dtype=np.float64)
@@ -163,47 +227,29 @@ class TimeDomainSoftLabeller:
             else:
                 kurt_vals[t] = 0.0
 
-            t0 = frame_times[t]
-            t1 = t0 + cfg.frame_len / float(cfg.fs)
-            if env.size > 0:
-                m = (env_times >= t0) & (env_times < t1)
-                if np.any(m):
-                    env_seg = env[m]
-                    env_max = float(np.max(env_seg))
-                    baseline_ref = max(float(env_baseline), float(cfg.env_baseline_floor), cfg.eps)
-                    env_peak_present[t] = bool(env_max >= env_peak_threshold)
-                    energy_excess[t] = max(env_max - float(env_baseline), 0.0)
-                    energy_peak_ratio[t] = env_max / baseline_ref
-                else:
-                    env_peak_present[t] = False
-                    energy_excess[t] = 0.0
-                    energy_peak_ratio[t] = 0.0
-            else:
-                env_peak_present[t] = False
-                energy_excess[t] = 0.0
-                energy_peak_ratio[t] = 0.0
-
             votes = 0
-            votes += int(env_peak_present[t])
-            votes += int(energy_peak_ratio[t] >= cfg.energy_peak_ratio_min)
+            votes += int(time_flux_score[t] >= cfg.time_flux_score_min)
             votes += int(crest_factor[t] >= cfg.crest_factor_min)
             votes += int(kurt_vals[t] >= cfg.kurtosis_min)
             vote_count[t] = votes
-            soft_score[t] = votes / 4.0
+            soft_score[t] = votes / 3.0
             soft_label[t] = votes >= int(cfg.min_positive_votes)
 
         return {
             "x_bp": x_bp,
+            "x_flux": x_flux,
             "frame_times": frame_times,
-            "env": env,
-            "env_times": env_times,
-            "env_baseline": env_baseline,
-            "env_peak_threshold": env_peak_threshold,
-            "energy_excess": energy_excess,
-            "energy_peak_ratio": energy_peak_ratio,
+            "sub_energy": sub_energy,
+            "sub_times": sub_times,
+            "sub_baseline": sub_baseline,
+            "sub_warm_ok": sub_warm_ok,
+            "frame_energy": frame_energy,
+            "frame_baseline": frame_baseline,
+            "frame_warm_ok": frame_warm_ok,
+            "frame_flux": frame_flux,
+            "time_flux_score": time_flux_score,
             "crest_factor": crest_factor,
             "kurtosis": kurt_vals,
-            "env_peak_present": env_peak_present,
             "vote_count": vote_count,
             "soft_score": soft_score,
             "soft_label": soft_label,
@@ -313,13 +359,21 @@ class RainFrameClassifierMixin:
         # Optional time-domain soft-labeller configuration.
         td_soft_enable = bool(self._dget("td_soft_enable", False))
         td_soft_bp_order = int(self._dget("td_soft_bp_order", 4))
-        td_soft_env_block_len = int(self._dget("td_soft_env_block_len", 32))
-        td_soft_env_hop = int(self._dget("td_soft_env_hop", 16))
-        td_soft_env_smooth_len = int(self._dget("td_soft_env_smooth_len", 3))
-        td_soft_energy_peak_ratio_min = float(self._dget("td_soft_energy_peak_ratio_min", 2.0))
-        td_soft_env_baseline_floor = float(self._dget("td_soft_env_baseline_floor", 1e-6))
-        td_soft_crest_factor_min = float(self._dget("td_soft_crest_factor_min", 3.0))
-        td_soft_kurtosis_min = float(self._dget("td_soft_kurtosis_min", 3.5))
+        td_soft_time_flux_band = self._dget("td_soft_time_flux_band", None)
+        if td_soft_time_flux_band is not None:
+            td_soft_time_flux_band = (
+                float(td_soft_time_flux_band[0]),
+                float(td_soft_time_flux_band[1]),
+            )
+        td_soft_subframe_len = int(self._dget("td_soft_subframe_len", 128))
+        td_soft_subframe_hop = int(self._dget("td_soft_subframe_hop", 128))
+        td_soft_baseline_win_sec = float(self._dget("td_soft_baseline_win_sec", 0.5))
+        td_soft_baseline_q = float(self._dget("td_soft_baseline_q", 20.0))
+        td_soft_baseline_min_hist_sec = float(self._dget("td_soft_baseline_min_hist_sec", 0.25))
+        td_soft_time_flux_score_min = float(self._dget("td_soft_time_flux_score_min", 1.5))
+        td_soft_baseline_floor = float(self._dget("td_soft_baseline_floor", 1e-6))
+        td_soft_crest_factor_min = float(self._dget("td_soft_crest_factor_min", 4.0))
+        td_soft_kurtosis_min = float(self._dget("td_soft_kurtosis_min", 6.0))
         td_soft_min_positive_votes = int(self._dget("td_soft_min_positive_votes", 2))
 
         primary_mode_idx = int(self._dget("primary_mode_idx", 0))
@@ -330,7 +384,6 @@ class RainFrameClassifierMixin:
             )
 
         # noise_hi remains part of NOISE frame assignment.
-        # The legacy rain_hi threshold is no longer used by the flux-based detector.
         noise_hi = float(self._dget("noise_hi", 0.80))
 
 
@@ -386,12 +439,15 @@ class RainFrameClassifierMixin:
                     frame_len=int(self._dget("n_fft", 256)),
                     hop=int(self._dget("hop", 128)),
                     operating_band=(op_lo, op_hi),
+                    time_flux_band=td_soft_time_flux_band,
                     bp_order=td_soft_bp_order,
-                    env_block_len=td_soft_env_block_len,
-                    env_hop=td_soft_env_hop,
-                    env_smooth_len=td_soft_env_smooth_len,
-                    energy_peak_ratio_min=td_soft_energy_peak_ratio_min,
-                    env_baseline_floor=td_soft_env_baseline_floor,
+                    subframe_len=td_soft_subframe_len,
+                    subframe_hop=td_soft_subframe_hop,
+                    baseline_win_sec=td_soft_baseline_win_sec,
+                    baseline_min_hist_sec=td_soft_baseline_min_hist_sec,
+                    baseline_q=td_soft_baseline_q,
+                    time_flux_score_min=td_soft_time_flux_score_min,
+                    baseline_floor=td_soft_baseline_floor,
                     crest_factor_min=td_soft_crest_factor_min,
                     kurtosis_min=td_soft_kurtosis_min,
                     min_positive_votes=td_soft_min_positive_votes,
@@ -440,7 +496,6 @@ class RainFrameClassifierMixin:
 
         flux_primary = np.full(T, np.nan, dtype=np.float64)
         flux_modes = np.full(T, np.nan, dtype=np.float64)
-        flux_from_t2 = np.full(T, np.nan, dtype=np.float64)
 
         peak_ratio = np.full(T, np.nan, dtype=np.float64)
         peak_in_mode_count = np.full(T, np.nan, dtype=np.float64)
@@ -466,7 +521,6 @@ class RainFrameClassifierMixin:
                 # First frame: no previous reference available.
                 flux_primary[t] = 0.0
                 flux_modes[t] = 0.0
-                flux_from_t2[t] = 0.0
                 peak_detected_count[t] = 0.0
                 peak_total_count[t] = 0.0
                 peak_in_mode_count[t] = 0.0
@@ -482,7 +536,6 @@ class RainFrameClassifierMixin:
                 # Second frame: still warming up the t-2 reference.
                 # Keep flux at zero so all later frames use a consistent delay definition.
                 flux = np.zeros_like(frame)
-                flux_from_t2[t] = 0.0
                 prev_frame_2 = prev_frame_1
                 prev_frame_1 = frame
             else:
@@ -490,7 +543,6 @@ class RainFrameClassifierMixin:
                 delta2 = frame - prev_frame_2
                 d2_pos = np.maximum(delta2, 0.0)
                 flux = d2_pos
-                flux_from_t2[t] = float(np.sum(d2_pos))
                 prev_frame_2 = prev_frame_1
                 prev_frame_1 = frame
 
@@ -662,7 +714,6 @@ class RainFrameClassifierMixin:
             "mode_flux_baseline": mode_flux_baseline,
             "mode_flux_excess": mode_flux_excess,
             "mode_flux_score": mode_flux_score,
-            "flux_from_t2": flux_from_t2,
             "mode_flux_rain_pass": mode_flux_rain_pass,
             "rain_conf": rain_conf,
             "primary_flux_sanity": primary_flux_sanity,
@@ -710,6 +761,12 @@ class RainFrameClassifierMixin:
                 "flux_modes_winsor_q": flux_modes_winsor_q,
                 "primary_mode_idx": primary_mode_idx,
                 "mode_bands": mode_bands,
+                "td_soft_enable": td_soft_enable,
+                "td_soft_time_flux_band": td_soft_time_flux_band,
+                "td_soft_time_flux_score_min": td_soft_time_flux_score_min,
+                "td_soft_crest_factor_min": td_soft_crest_factor_min,
+                "td_soft_kurtosis_min": td_soft_kurtosis_min,
+                "td_soft_min_positive_votes": td_soft_min_positive_votes,
             },
         }
 
@@ -796,7 +853,7 @@ class RainFrameClassifierProcessor(RainFrameClassifierMixin):
             "freqs": freqs,
             "times": times,
             "S": S,
-            "x_filt": x,
+            "x_filt": det_debug.get("td_soft", {}).get("x_bp", x),
             "debug": det_debug,
         }
 
