@@ -331,7 +331,7 @@ class RainFrameClassifierMixin:
         self,
         P: np.ndarray,
         freqs: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """
         Returns
         -------
@@ -341,6 +341,8 @@ class RainFrameClassifierMixin:
             Per-frame rain confidence in [0, 1].
         det_debug : Dict[str, Any]
             Detector diagnostics and intermediate signals.
+        feature_dump : Dict[str, Any]
+            Raw feature arrays needed to replay threshold logic offline.
         """
 
         self._validate_rain_cfg()
@@ -770,7 +772,90 @@ class RainFrameClassifierMixin:
             },
         }
 
-        return frame_class, rain_conf, det_debug
+        feature_dump_level = int(self._dget("feature_dump_level", 0))
+        feature_dump: Dict[str, Any] = {}
+
+        if feature_dump_level > 0:
+            feature_dump = {
+                "frame_times": (np.arange(T, dtype=np.float64) * float(self._dget("hop", 128)))
+                / float(self._dget("sample_rate", self._dget("fs", 11162))),
+                "frame_class": frame_class,
+                "rain_conf": rain_conf,
+                "noise_conf": noise_conf,
+                "is_rain_raw": is_rain_raw,
+                "onset_mask": onset_mask,
+                "onset_indices": onset_indices,
+                "flux_primary": flux_primary,
+                "flux_modes_raw": flux_modes_raw,
+                "flux_modes_proc": flux_modes_proc,
+                "flux_modes_winsor_hi": np.asarray([flux_modes_winsor_hi], dtype=np.float64),
+                "mode_flux_baseline": mode_flux_baseline,
+                "mode_flux_excess": mode_flux_excess,
+                "mode_flux_score": mode_flux_score,
+                "mode_flux_rain_pass": mode_flux_rain_pass,
+                "primary_flux_sanity": primary_flux_sanity.astype(np.int8),
+                "primary_sanity": primary_sanity.astype(np.int8),
+                "peak_ratio": peak_ratio,
+                "peak_detected_count": peak_detected_count,
+                "peak_total_count": peak_total_count,
+                "peak_in_mode_count": peak_in_mode_count,
+                "peak_in_primary_count": peak_in_primary_count,
+                "peak_gate_score": peak_gate_score,
+                "peak_gate": peak_gate.astype(np.int8),
+            }
+
+            if feature_dump_level > 1:
+                feature_dump.update({
+                    "frame_class_name": np.array(
+                        [FrameClass(v).name.lower() for v in frame_class], dtype=object
+                    ),
+                    "primary_ok": primary_ok_dbg,
+                    "mode_ok": mode_ok_dbg,
+                    "tuning_params": {
+                        "noise_hi": noise_hi,
+                        "mode_flux_rain_min": mode_flux_rain_min,
+                        "primary_flux_sanity_min": primary_flux_sanity_min,
+                        "mode_flux_noise_max": mode_flux_noise_max,
+                        "mode_flux_norm_enable": mode_flux_norm_enable,
+                        "mode_flux_norm_win_sec": mode_flux_norm_win_sec,
+                        "mode_flux_norm_q": mode_flux_norm_q,
+                        "mode_flux_norm_min": mode_flux_norm_min,
+                        "peak_top_p": peak_top_p,
+                        "primary_top_m": primary_top_m,
+                        "peak_ratio_min": peak_ratio_min,
+                        "peak_prominence_db": peak_prominence_db,
+                        "peak_min_db_above_floor": peak_min_db_above_floor,
+                        "flux_modes_winsor_enable": flux_modes_winsor_enable,
+                        "flux_modes_winsor_q": flux_modes_winsor_q,
+                        "primary_mode_idx": primary_mode_idx,
+                        "mode_bands": mode_bands,
+                        "td_soft_enable": td_soft_enable,
+                        "td_soft_time_flux_band": td_soft_time_flux_band,
+                        "td_soft_time_flux_score_min": td_soft_time_flux_score_min,
+                        "td_soft_crest_factor_min": td_soft_crest_factor_min,
+                        "td_soft_kurtosis_min": td_soft_kurtosis_min,
+                        "td_soft_min_positive_votes": td_soft_min_positive_votes,
+                    },
+                })
+
+                if td_soft_enable and td_soft_debug:
+                    for k in (
+                        "frame_energy",
+                        "frame_baseline",
+                        "frame_warm_ok",
+                        "frame_flux",
+                        "time_flux_score",
+                        "crest_factor",
+                        "kurtosis",
+                        "vote_count",
+                        "soft_score",
+                        "soft_label",
+                        "frame_times",
+                    ):
+                        if k in td_soft_debug:
+                            feature_dump[f"td_{k}"] = td_soft_debug[k]
+
+        return frame_class, rain_conf, det_debug, feature_dump
 
 
 class RainFrameClassifierProcessor(RainFrameClassifierMixin):
@@ -837,7 +922,7 @@ class RainFrameClassifierProcessor(RainFrameClassifierMixin):
             n_fft=cfg.n_fft,
         )
 
-        frame_class, rain_conf, det_debug = self._detect_rain_over_time(P, freqs)
+        frame_class, rain_conf, det_debug, feature_dump = self._detect_rain_over_time(P, freqs)
         frame_class = np.asarray(frame_class, dtype=np.int8)
         is_rain = frame_class == FrameClass.RAIN
         noise_conf = np.asarray(
@@ -845,17 +930,33 @@ class RainFrameClassifierProcessor(RainFrameClassifierMixin):
             dtype=np.float64,
         )
 
-        return {
+        feature_dump_level = int(self._dget("feature_dump_level", 0))
+
+        result = {
             "frame_class": frame_class,
             "is_rain": is_rain,
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
-            "freqs": freqs,
-            "times": times,
-            "S": S,
-            "x_filt": det_debug.get("td_soft", {}).get("x_bp", x),
-            "debug": det_debug,
         }
+
+        if feature_dump_level > 0:
+            result["feature_dump"] = feature_dump
+
+        debug_level = int(self._dget("debug_level", 2))
+        if debug_level > 0:
+            result.update({
+                "freqs": freqs,
+                "times": times,
+            })
+
+        if debug_level > 1:
+            result.update({
+                "S": S,
+                "x_filt": det_debug.get("td_soft", {}).get("x_bp", x),
+                "debug": det_debug,
+            })
+
+        return result
 
     def run(self, audio: np.ndarray, params: Dict[str, Any]):
         """
@@ -869,6 +970,7 @@ class RainFrameClassifierProcessor(RainFrameClassifierMixin):
         sr = int(params.get("sample_rate", params.get("fs", 11162)))
         results = self.process(audio, sr=sr)
 
+        feature_dump_level = int(params.get("feature_dump_level", 0))
         state = {
             "frame_class": results.get("frame_class"),
             "is_rain": results.get("is_rain"),
@@ -876,4 +978,6 @@ class RainFrameClassifierProcessor(RainFrameClassifierMixin):
             "noise_conf": results.get("noise_conf"),
             "debug": results.get("debug"),
         }
+        if feature_dump_level > 1:
+            state["feature_dump"] = results.get("feature_dump")
         return results, state
