@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Callable
 from collections import deque
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -27,6 +28,7 @@ class TestVectorLabeler:
         db_engine_upsert=None,
         max_duration_seconds=15,
         local_audio_cache="./raw_audio_cache",
+        out_folder: str | None = None,
         normalize_audio: bool = True,
         autoplay: bool = True,
         visualize_device_context=False,
@@ -49,6 +51,11 @@ class TestVectorLabeler:
  
         self.max_duration_seconds = max_duration_seconds
         self.local_audio_cache = local_audio_cache
+        self.out_folder = (
+            Path(out_folder).expanduser().resolve() if out_folder is not None else None
+        )
+        if self.out_folder is not None:
+            self.out_folder.mkdir(parents=True, exist_ok=True)
         self.normalize_audio = normalize_audio
         self.autoplay = autoplay
         self.index_list = self.audio_df.index
@@ -257,6 +264,7 @@ class TestVectorLabeler:
             raining_button = Button(description="Raining")
             not_raining_button = Button(description="Not Raining")
             skip_button = Button(description="Skip")
+            save_for_review_button = Button(description="Save for Review")
             go_back_button = Button(description="Go Back")
 
             raining_button.on_click(
@@ -270,12 +278,25 @@ class TestVectorLabeler:
                 )
             )
             skip_button.on_click(lambda b: next_index_callback())
+            save_for_review_button.on_click(
+                self.make_save_for_review_handler(
+                    audio_file_data,
+                    audio_binary,
+                    output_widget,
+                )
+            )
             go_back_button.on_click(
                 lambda b: self.process_previous_index()
             )  # Go back action
 
             button_box = HBox(
-                [raining_button, not_raining_button, skip_button, go_back_button]
+                [
+                    raining_button,
+                    not_raining_button,
+                    skip_button,
+                    save_for_review_button,
+                    go_back_button,
+                ]
             )
             display(button_box)
 
@@ -300,6 +321,22 @@ class TestVectorLabeler:
                         self.context_window_days,
                         self.add_ibm_data,
                     )
+
+
+    def make_save_for_review_handler(
+        self,
+        audio_file_data: pd.Series,
+        audio_binary: bytes,
+        output_widget: Output,
+    ) -> Callable:
+        def on_button_clicked(b):
+            with output_widget:
+                try:
+                    self.save_file_for_review(audio_file_data, audio_binary, output_widget)
+                except Exception as e:
+                    print(f"Error while saving file for review: {e}")
+
+        return on_button_clicked
 
     def make_button_handler(
         self,
@@ -375,3 +412,34 @@ class TestVectorLabeler:
             print("Database upsert completed successfully.")
         except Exception as e:
             print(f"Error during database upsert: {e}")
+
+    def save_file_for_review(
+        self, audio_file_data: pd.Series, audio_binary: bytes, output_widget: Output
+    ) -> None:
+        with output_widget:
+            if self.out_folder is None:
+                print("out_folder is not configured; cannot save file for review.")
+                return
+
+            source_file = str(audio_file_data["source_file"])
+            device_id = str(audio_file_data.get("device_id", "unknown_device"))
+            base_name = Path(source_file).stem
+            out_name = f"{device_id}_{base_name}.wav"
+            out_path = self.out_folder / out_name
+
+            print(f"Saving decoded WAV for review to: {out_path}")
+
+            # Decode full audio file
+            sig, metadata = parse_mark_audio_file(audio_binary)
+            sample_rate = int(metadata["sample_rate"])
+
+            # Save as WAV
+            from scipy.io.wavfile import write as wav_write
+
+            wav_write(out_path, sample_rate, sig)
+
+            if not out_path.exists():
+                raise RuntimeError(f"WAV file was not created: {out_path}")
+
+            file_size = out_path.stat().st_size
+            print(f"Saved decoded WAV for review: {out_path} ({file_size} bytes)")
