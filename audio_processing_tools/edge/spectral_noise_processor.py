@@ -98,11 +98,8 @@ class NoiseProcessorConfig:
     # Optional frequency-domain smoothing of gain (helps reduce musical noise)
     gain_freq_smooth_enable: bool = True
     gain_freq_kernel: Tuple[float, ...] = (0.2, 0.6, 0.2)
-    # number of mel bands
-    n_mels: int = 24  # or 32; number of mel bands
-
-    # select between fft and mel
-    noise_psd_mode: str = "fft"  # "fft" or "mel"
+    # Noise PSD estimation mode
+    noise_psd_mode: str = "fft"
 
     # New / refined PSD tracking params
     pre_smooth_frames: int = 0      # try 3–5, 0 disables
@@ -135,10 +132,25 @@ class NoiseProcessorConfig:
     detector_noise_norm_mode: str = "log_sub"
 
     # -----------------------------------------------------------
+    # Suppressor bypass for offline feature extraction / tuning
+    # -----------------------------------------------------------
+    # When True, keep the detector / soft-label path active but disable
+    # noise-PSD estimation, gain computation, and spectral suppression.
+    # This is useful when we want to extract detector features on raw clips
+    # and compare them directly against soft frame labels.
+    disable_suppression: bool = False
+
+    # -----------------------------------------------------------
     # Debug / tuning
     # -----------------------------------------------------------
     debug_enable: bool = False
     debug_frame_decim: int = 1  # store every Nth FrameFeatures; 1 = all
+
+    # Separate feature payload for offline training / plotting.
+    # When enabled, the processor exports a compact `features` dict containing
+    # both soft-label / detector outputs and frequency-domain tuning features.
+    dump_features: bool = False
+    feature_decim: int = 1  # keep every Nth frame in exported features; 1 = all
 
     # -----------------------------------------------------------
     # Nested detector configuration (framework-friendly)
@@ -218,7 +230,8 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
     Noise processor:
       - STFT via librosa
       - Raindrop frame detection (via RainFrameClassifierMixin)
-      - Noise PSD estimation (FFT or mel)
+      - Optional suppressor bypass for offline feature extraction
+      - Noise PSD estimation (FFT)
       - Adaptive, confidence-weighted suppression
       - ISTFT to get noise-suppressed waveform
 
@@ -506,104 +519,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         return np.clip(G_time, cfg.gain_floor, cfg.gain_ceil)
 
-    def _estimate_noise_psd_mel(
-        self,
-        P: np.ndarray,
-        freqs: np.ndarray,
-        is_rain: np.ndarray,
-        sr: Optional[int] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Estimate noise PSD using mel-band min-stats then expand back to FFT bins.
-
-        Returns
-        -------
-        noise_psd_fft : (F, T)
-        W_mel         : (B, F) mel filterbank used (for debug/inspection)
-        """
-        cfg = self.cfg
-        F, T = P.shape
-        eps = cfg.eps
-
-        if sr is None:
-            sr = cfg.fs
-
-        op_lo, op_hi = cfg.operating_band
-        W_mel = librosa.filters.mel(
-            sr=int(sr),
-            n_fft=cfg.n_fft,
-            n_mels=int(getattr(cfg, "n_mels", 24)),
-            fmin=float(op_lo),
-            fmax=float(op_hi),
-        ).astype(np.float64)  # (B, F)
-
-        # Mel power
-        P_mel = W_mel @ P  # (B, T)
-
-        # Optional pre-smoothing over time
-        L = int(getattr(cfg, "pre_smooth_frames", 0))
-        if L and L > 1:
-            P_mel = self._time_smooth(P_mel, L)
-
-        B = P_mel.shape[0]
-
-        frames_per_sec = float(sr) / float(cfg.hop)
-        W_frames = max(10, int(cfg.win_sec * frames_per_sec))
-
-        # Ring buffer for noise-only frames
-        buffer = np.full((W_frames, B), np.nan, dtype=np.float64)
-        buf_idx = 0
-        buf_count = 0
-
-        noise_mel = np.zeros((B, T), dtype=np.float64)
-
-        ema_up = float(getattr(cfg, "ema_up", cfg.ema_feedback))
-        ema_down = float(getattr(cfg, "ema_down", cfg.ema_feedback))
-
-        for t in range(T):
-            Pm = P_mel[:, t]
-
-            warmup_need = max(10, W_frames // 2)
-            if buf_count < warmup_need or (not is_rain[t]):
-                buffer[buf_idx] = Pm
-                buf_idx = (buf_idx + 1) % W_frames
-                buf_count = min(buf_count + 1, W_frames)
-            if buf_count == 0:
-                raw_q = Pm
-            else:
-                valid = buffer[:buf_count]
-                raw_q = np.nanquantile(valid, cfg.q, axis=0)
-
-            if t == 0:
-                Nm = raw_q
-            else:
-                prev = noise_mel[:, t - 1]
-                lam = np.where(raw_q > prev, ema_up, ema_down)
-                Nm = lam * prev + (1.0 - lam) * raw_q
-
-            # Clamp: noise estimate should not exceed instantaneous mel power
-            maxr = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
-            maxr = 1.0 if (not np.isfinite(maxr)) else float(np.clip(maxr, 0.0, 1.0))
-            Nm = np.minimum(Nm, maxr * Pm)
-            noise_mel[:, t] = np.maximum(Nm, 0.0)
-
-        # Optional median filter over time
-        m = int(getattr(cfg, "median_frames", 0))
-        if m and m > 1:
-            if m % 2 == 0:
-                m += 1
-            noise_mel = ndi.median_filter(noise_mel, size=(1, m))
-
-        # Expand mel -> FFT. Distribute mel energy back to FFT bins and normalize by filter sum.
-        den = (W_mel.sum(axis=0, keepdims=True) + eps)  # (1, F)
-        
-        W_norm = W_mel / (W_mel.sum(axis=1, keepdims=True) + eps)
-        noise_psd_fft = W_norm.T @ noise_mel
-
-        # Zero outside operating band
-        band_mask = (freqs >= float(op_lo)) & (freqs <= float(op_hi))
-        noise_psd_fft[~band_mask, :] = 0.0
-
-        return noise_psd_fft, W_mel
 
   
     def _estimate_noise_psd_fft(
@@ -685,7 +600,103 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             noise_psd = ndi.median_filter(noise_psd, size=(1, m))
 
         return noise_psd
- 
+
+    def _decimate_feature_value(self, value: Any, step: int) -> Any:
+        """Decimate feature arrays/lists by frame step when possible."""
+        if step <= 1:
+            return value
+        if value is None:
+            return None
+        try:
+            if isinstance(value, np.ndarray):
+                if value.ndim == 0:
+                    return value
+                return value[..., ::step]
+            if isinstance(value, list):
+                return value[::step]
+            if isinstance(value, tuple):
+                return value[::step]
+        except Exception:
+            return value
+        return value
+
+    def _build_features_payload(
+        self,
+        *,
+        times_s: np.ndarray,
+        frame_class: np.ndarray,
+        is_rain: np.ndarray,
+        rain_conf: np.ndarray,
+        noise_conf: np.ndarray,
+        det_debug: Dict[str, Any],
+        step: int,
+    ) -> Dict[str, Any]:
+        """
+        Build a compact exported feature payload for offline threshold tuning.
+
+        The payload is intentionally separate from `debug` so training / plotting
+        code can consume a stable structure without carrying all suppressor state.
+        """
+        features: Dict[str, Any] = {
+            "frame_times": self._decimate_feature_value(np.asarray(times_s, dtype=np.float64), step),
+            "frame_class": self._decimate_feature_value(np.asarray(frame_class), step),
+            "is_rain": self._decimate_feature_value(np.asarray(is_rain), step),
+            "rain_conf": self._decimate_feature_value(np.asarray(rain_conf, dtype=np.float64), step),
+            "noise_conf": self._decimate_feature_value(np.asarray(noise_conf, dtype=np.float64), step),
+        }
+
+        if not isinstance(det_debug, dict):
+            return features
+
+        # Prefer the detector-side feature dump if available.
+        feature_dump = det_debug.get("feature_dump", None)
+        if isinstance(feature_dump, dict):
+            for k, v in feature_dump.items():
+                features[k] = self._decimate_feature_value(v, step)
+            return features
+
+        # Otherwise export a compact curated subset of detector outputs.
+        keep_keys = [
+            # Current soft-labeller / detector decision streams
+            "frame_class_name",
+            "rain_score_raw",
+            "is_rain_raw",
+            "onset_mask",
+            "onset_indices",
+            "primary_flux_sanity",
+            "primary_sanity",
+            "peak_gate",
+            "peak_gate_score",
+            "mode_flux_rain_pass",
+            "mode_flux_score",
+            "flux_primary",
+            "flux_modes",
+            # Frequency-domain tuning features
+            "mode_flux_by_mode",
+            "normalized_mode_flux_by_mode",
+            "mode_to_primary_ratio",
+            "peak_ratio",
+            "peak_detected_count",
+            "peak_total_count",
+            "peak_in_mode_count",
+            "peak_in_primary_count",
+            "peak_top_p_freqs_hz",
+            "peak_top_p_prominences_db",
+            "peak_top_p_bandwidths_hz",
+            "peak_top_p_heights_db",
+            "peak_top_p_in_mode_mask",
+            "peak_top_p_in_primary_mask",
+            "peak_valid_freqs_hz",
+            "peak_valid_prominences_db",
+            "peak_valid_bandwidths_hz",
+            "peak_valid_heights_db",
+        ]
+        for k in keep_keys:
+            if k in det_debug:
+                features[k] = self._decimate_feature_value(det_debug[k], step)
+
+        return features
+
     # ----------------------- Main API -----------------------
 
     def process(
@@ -749,6 +760,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         op_lo, op_hi = cfg.operating_band
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
+        disable_suppression = bool(getattr(cfg, "disable_suppression", False))
 
         # 2) Frame classification (optionally using lagged/bootstrapped noise PSD)
         bypass_classifier = bool(getattr(cfg, "detector", {}).get("bypass_classifier", False))
@@ -779,22 +791,14 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 # This gives a lagged baseline for the detector without creating a circular dependency
                 # with the final classifier-gated PSD estimate.
                 bootstrap_is_rain_for_psd = np.zeros(T, dtype=bool)
-                if cfg.noise_psd_mode == "fft":
-                    bootstrap_noise_psd = self._estimate_noise_psd_fft(
-                        P,
-                        freqs,
-                        bootstrap_is_rain_for_psd,
-                        sr=sr,
-                    )
-                elif cfg.noise_psd_mode == "mel":
-                    bootstrap_noise_psd, _ = self._estimate_noise_psd_mel(
-                        P,
-                        freqs,
-                        bootstrap_is_rain_for_psd,
-                        sr=sr,
-                    )
-                else:
+                if cfg.noise_psd_mode != "fft":
                     raise ValueError(f"Unknown PSD mode: {cfg.noise_psd_mode}")
+                bootstrap_noise_psd = self._estimate_noise_psd_fft(
+                    P,
+                    freqs,
+                    bootstrap_is_rain_for_psd,
+                    sr=sr,
+                )
 
                 detector_noise_psd_lag = bootstrap_noise_psd.copy()
                 if detector_noise_psd_lag.shape[1] > 1:
@@ -841,120 +845,146 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 except Exception:
                     pass
 
+        features = None
+        if bool(getattr(cfg, "dump_features", False)):
+            feature_step = max(1, int(getattr(cfg, "feature_decim", 1)))
+            features = self._build_features_payload(
+                times_s=times_s,
+                frame_class=frame_class,
+                is_rain=is_rain,
+                rain_conf=rain_conf,
+                noise_conf=noise_conf,
+                det_debug=det_debug,
+                step=feature_step,
+            )
+
         # PSD update gating is derived from the canonical frame class.
         # Only confident NOISE frames are used to update the final noise PSD.
         use_for_noise_psd = np.asarray(is_noise, dtype=bool)
         is_rain_for_psd = ~use_for_noise_psd
 
-        # 3) Noise PSD estimation (MCRA / quantile)
-        if cfg.noise_psd_mode == "fft":
-            noise_psd = self._estimate_noise_psd_fft(P, freqs, is_rain_for_psd, sr=sr)
-            mel_filter = None
-        elif cfg.noise_psd_mode == "mel":
-            noise_psd, mel_filter = self._estimate_noise_psd_mel(P, freqs, is_rain_for_psd, sr=sr)
-        else:
-            raise ValueError(f"Unknown PSD mode: {cfg.noise_psd_mode}")
-
-        # 4) Gain computation (confidence-weighted)
+        # 3) Noise PSD estimation / suppression.
+        # For offline feature extraction we may want the detector path active
+        # while completely bypassing the suppressor.
         P_band_all = P[band_mask]
-        N_band_all = noise_psd[band_mask]
-
-        # Optional: use lagged noise PSD for gain computation (N(t-1) applied to S(t))
-        if bool(getattr(cfg, "use_lagged_noise_psd", False)) and N_band_all.shape[1] > 1:
-            N_band_lag = np.roll(N_band_all, shift=1, axis=1)
-            # Bootstrap first frame with its own estimate
-            N_band_lag[:, 0] = N_band_all[:, 0]
-        else:
-            N_band_lag = N_band_all
-
-        # IMPORTANT: lagged PSD can exceed current-frame power when the signal dips.
-        # Clamp the effective PSD to current power to prevent ratio->1 everywhere and gain collapse.
-        maxr = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
-        maxr = 1.0 if (not np.isfinite(maxr)) else float(np.clip(maxr, 0.0, 1.0))
-        N_band_eff = np.minimum(N_band_lag, maxr * P_band_all)
-
-        ratio_med_t = np.median(N_band_eff / (P_band_all + cfg.eps), axis=0)  # (T,)
-
-        # ---- Optional spectral SNR gating (computed from mode bands) ----
+        mel_filter = None
         snr_gate = None
         snr_mode = None
-        if bool(getattr(cfg, "snr_gating_enable", False)):
-            # Use detector mode bands by default (falls back to whole operating band).
-            det = getattr(cfg, "detector", {}) or {}
-            mode_bands = det.get("mode_bands", None) if bool(getattr(cfg, "snr_gating_use_mode_bands", True)) else None
-
-            freqs_band = freqs[band_mask]
-            if mode_bands is not None:
-                mode_mask = self._mode_union_mask(freqs_band, mode_bands)
-            else:
-                mode_mask = np.ones(freqs_band.shape[0], dtype=bool)
-
-            if not np.any(mode_mask):
-                mode_mask = np.ones(freqs_band.shape[0], dtype=bool)
-
-            # Frame-level SNR in the selected region
-            Pm = np.sum(P_band_all[mode_mask, :], axis=0)
-            Nm = np.sum(N_band_eff[mode_mask, :], axis=0)
-            snr_mode = Pm / (Nm + cfg.eps)
-
-            snr1 = float(getattr(cfg, "snr_gating_snr1", 1.0))
-            snr1 = max(1e-9, snr1)
-            gate = snr_mode / (snr_mode + snr1)
-
-            pwr = float(getattr(cfg, "snr_gating_power", 1.0))
-            if pwr != 1.0 and np.isfinite(pwr) and pwr > 0.0:
-                gate = np.power(np.clip(gate, 0.0, 1.0), pwr)
-
-            snr_gate = np.clip(gate, 0.0, 1.0)
-
-        if getattr(cfg, "debug_enable", False):
-            ratio_med = float(np.median(N_band_all / (P_band_all + 1e-12)))
-            ratio_p90 = float(np.percentile(N_band_all / (P_band_all + 1e-12), 90))
-            print("median N/P:", ratio_med, "p90 N/P:", ratio_p90)
-
-        # Gain computation (confidence-weighted)
         gain_dbg: Dict[str, Any] = {}
-        G_band = self._compute_gain(
-            P_band_all,
-            N_band_eff,
-            noise_conf=noise_conf,
-            snr_gate=snr_gate,
-            debug_out=gain_dbg,
-        )
 
-        G = np.ones_like(P)
-        G[band_mask] = G_band
+        if disable_suppression:
+            noise_psd = np.zeros_like(P, dtype=np.float64)
+            N_band_all = noise_psd[band_mask]
+            N_band_eff = N_band_all
+            ratio_med_t = np.zeros(T, dtype=np.float64)
+            G = np.ones_like(P)
+            G_band = np.ones_like(P_band_all)
+            S_hat = S.copy()
+            y_hat = x_proc.copy()
+            y_out = x_proc.copy()
+            gain_dbg["suppression_disabled"] = True
+        else:
+            if cfg.noise_psd_mode != "fft":
+                raise ValueError(f"Unknown PSD mode: {cfg.noise_psd_mode}")
+            noise_psd = self._estimate_noise_psd_fft(P, freqs, is_rain_for_psd, sr=sr)
+            mel_filter = None
 
-        if getattr(cfg, "debug_enable", False):
-            try:
-                gmed = float(np.median(G_band))
-                gmin = float(np.min(G_band))
-                gp10 = float(np.percentile(G_band, 10))
-                nconf_med = float(np.median(noise_conf))
-                print(
-                    "[SpectralNoiseProcessor] gain stats:",
-                    f"median={gmed:.3f}",
-                    f"p10={gp10:.3f}",
-                    f"min={gmin:.3f}",
-                    f"noise_conf_median={nconf_med:.3f}",
-                )
-            except Exception:
-                pass
+            # 4) Gain computation (confidence-weighted)
+            N_band_all = noise_psd[band_mask]
 
-        # 5) Apply gain & ISTFT
-        S_hat = G * S
-        y_hat = librosa.istft(
-            S_hat,
-            hop_length=cfg.hop,
-            win_length=cfg.n_fft,
-            window="hann",
-            center=True,
-            length=len(x),
-        )
+            # Optional: use lagged noise PSD for gain computation (N(t-1) applied to S(t))
+            if bool(getattr(cfg, "use_lagged_noise_psd", False)) and N_band_all.shape[1] > 1:
+                N_band_lag = np.roll(N_band_all, shift=1, axis=1)
+                # Bootstrap first frame with its own estimate
+                N_band_lag[:, 0] = N_band_all[:, 0]
+            else:
+                N_band_lag = N_band_all
 
-        # Choose output waveform:
-        # Always output the normal noise-suppressed waveform
-        y_out = y_hat
+            # IMPORTANT: lagged PSD can exceed current-frame power when the signal dips.
+            # Clamp the effective PSD to current power to prevent ratio->1 everywhere and gain collapse.
+            maxr = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
+            maxr = 1.0 if (not np.isfinite(maxr)) else float(np.clip(maxr, 0.0, 1.0))
+            N_band_eff = np.minimum(N_band_lag, maxr * P_band_all)
+
+            ratio_med_t = np.median(N_band_eff / (P_band_all + cfg.eps), axis=0)  # (T,)
+
+            # ---- Optional spectral SNR gating (computed from mode bands) ----
+            if bool(getattr(cfg, "snr_gating_enable", False)):
+                # Use detector mode bands by default (falls back to whole operating band).
+                det = getattr(cfg, "detector", {}) or {}
+                mode_bands = det.get("mode_bands", None) if bool(getattr(cfg, "snr_gating_use_mode_bands", True)) else None
+
+                freqs_band = freqs[band_mask]
+                if mode_bands is not None:
+                    mode_mask = self._mode_union_mask(freqs_band, mode_bands)
+                else:
+                    mode_mask = np.ones(freqs_band.shape[0], dtype=bool)
+
+                if not np.any(mode_mask):
+                    mode_mask = np.ones(freqs_band.shape[0], dtype=bool)
+
+                # Frame-level SNR in the selected region
+                Pm = np.sum(P_band_all[mode_mask, :], axis=0)
+                Nm = np.sum(N_band_eff[mode_mask, :], axis=0)
+                snr_mode = Pm / (Nm + cfg.eps)
+
+                snr1 = float(getattr(cfg, "snr_gating_snr1", 1.0))
+                snr1 = max(1e-9, snr1)
+                gate = snr_mode / (snr_mode + snr1)
+
+                pwr = float(getattr(cfg, "snr_gating_power", 1.0))
+                if pwr != 1.0 and np.isfinite(pwr) and pwr > 0.0:
+                    gate = np.power(np.clip(gate, 0.0, 1.0), pwr)
+
+                snr_gate = np.clip(gate, 0.0, 1.0)
+
+            if getattr(cfg, "debug_enable", False):
+                ratio_med = float(np.median(N_band_all / (P_band_all + 1e-12)))
+                ratio_p90 = float(np.percentile(N_band_all / (P_band_all + 1e-12), 90))
+                print("median N/P:", ratio_med, "p90 N/P:", ratio_p90)
+
+            # Gain computation (confidence-weighted)
+            G_band = self._compute_gain(
+                P_band_all,
+                N_band_eff,
+                noise_conf=noise_conf,
+                snr_gate=snr_gate,
+                debug_out=gain_dbg,
+            )
+
+            G = np.ones_like(P)
+            G[band_mask] = G_band
+
+            if getattr(cfg, "debug_enable", False):
+                try:
+                    gmed = float(np.median(G_band))
+                    gmin = float(np.min(G_band))
+                    gp10 = float(np.percentile(G_band, 10))
+                    nconf_med = float(np.median(noise_conf))
+                    print(
+                        "[SpectralNoiseProcessor] gain stats:",
+                        f"median={gmed:.3f}",
+                        f"p10={gp10:.3f}",
+                        f"min={gmin:.3f}",
+                        f"noise_conf_median={nconf_med:.3f}",
+                    )
+                except Exception:
+                    pass
+
+            # 5) Apply gain & ISTFT
+            S_hat = G * S
+            y_hat = librosa.istft(
+                S_hat,
+                hop_length=cfg.hop,
+                win_length=cfg.n_fft,
+                window="hann",
+                center=True,
+                length=len(x),
+            )
+
+            # Choose output waveform:
+            # Always output the normal noise-suppressed waveform
+            y_out = y_hat
 
         # 6) Debug
         op_lo, op_hi = cfg.operating_band
@@ -988,6 +1018,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             "detector_noise_psd_lag": detector_noise_psd_lag,
             "detector_use_noise_norm": detector_use_noise_norm,
             "detector_noise_norm_mode": detector_noise_norm_mode,
+            "disable_suppression": disable_suppression,
 
             # Classifier outputs
             "rain_conf": rain_conf,
@@ -1013,11 +1044,9 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             "pre_filter_band": (float(cfg.operating_band[0]), float(cfg.operating_band[1])),
             "np_ratio_median_t": ratio_med_t,
             "noise_psd_max_ratio": float(getattr(cfg, "noise_psd_max_ratio", 1.0)),
+            "features_available": features is not None,
         }
 
-        # Optional: include mel filter if present
-        if mel_filter is not None:
-            debug["mel_filter"] = mel_filter
 
         return {
             "y": y_out,            # what your harness will treat as "denoised_audio"
@@ -1038,4 +1067,5 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             "use_for_noise_psd": use_for_noise_psd,
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
+            "features": features,
         }

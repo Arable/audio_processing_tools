@@ -8,6 +8,7 @@ import librosa
 import numpy as np
 import scipy.signal as spsig
 from scipy.stats import kurtosis
+from scipy.signal import peak_widths
 
 
 class FrameClass(IntEnum):
@@ -349,6 +350,9 @@ class RainFrameClassifierMixin:
 
         eps = float(self._dget("eps", 1e-9))
 
+        include_peak_payload = bool(self._dget("feature_dump_include_peak_payload", False))
+        include_td_soft_feature_dump = bool(self._dget("feature_dump_include_td_soft", True))
+
         op_band = self._dget("operating_band", (400.0, 3500.0))
         op_lo, op_hi = float(op_band[0]), float(op_band[1])
 
@@ -512,12 +516,56 @@ class RainFrameClassifierMixin:
         # name for possible future soft-scoring extensions.
         peak_gate_score = np.full(T, np.nan, dtype=np.float64)
 
+        # Per-mode raw / normalized flux features for offline threshold tuning.
+        mode_flux_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
+        mode_flux_baseline_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
+        mode_flux_excess_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
+        normalized_mode_flux_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
+        mode_to_primary_ratio = np.zeros((len(mode_bands), T), dtype=np.float64)
+
+        # Detailed per-peak payloads are optional because they are expensive for
+        # large batch runs. Keep them disabled by default and compute/store them
+        # only when explicitly requested for inspection.
+        if include_peak_payload:
+            peak_valid_freqs_hz = np.empty(T, dtype=object)
+            peak_valid_prominences_db = np.empty(T, dtype=object)
+            peak_valid_bandwidths_hz = np.empty(T, dtype=object)
+            peak_valid_heights_db = np.empty(T, dtype=object)
+            peak_top_p_freqs_hz = np.empty(T, dtype=object)
+            peak_top_p_prominences_db = np.empty(T, dtype=object)
+            peak_top_p_bandwidths_hz = np.empty(T, dtype=object)
+            peak_top_p_heights_db = np.empty(T, dtype=object)
+            peak_top_p_in_mode_mask = np.empty(T, dtype=object)
+            peak_top_p_in_primary_mask = np.empty(T, dtype=object)
+        else:
+            peak_valid_freqs_hz = None
+            peak_valid_prominences_db = None
+            peak_valid_bandwidths_hz = None
+            peak_valid_heights_db = None
+            peak_top_p_freqs_hz = None
+            peak_top_p_prominences_db = None
+            peak_top_p_bandwidths_hz = None
+            peak_top_p_heights_db = None
+            peak_top_p_in_mode_mask = None
+            peak_top_p_in_primary_mask = None
+
 
         prev_frame_1 = None  # frame at t-1
         prev_frame_2 = None  # frame at t-2
 
         for t in range(T):
             frame = P_band[:, t]
+            if include_peak_payload:
+                peak_valid_freqs_hz[t] = np.array([], dtype=np.float64)
+                peak_valid_prominences_db[t] = np.array([], dtype=np.float64)
+                peak_valid_bandwidths_hz[t] = np.array([], dtype=np.float64)
+                peak_valid_heights_db[t] = np.array([], dtype=np.float64)
+                peak_top_p_freqs_hz[t] = np.array([], dtype=np.float64)
+                peak_top_p_prominences_db[t] = np.array([], dtype=np.float64)
+                peak_top_p_bandwidths_hz[t] = np.array([], dtype=np.float64)
+                peak_top_p_heights_db[t] = np.array([], dtype=np.float64)
+                peak_top_p_in_mode_mask[t] = np.array([], dtype=bool)
+                peak_top_p_in_primary_mask[t] = np.array([], dtype=bool)
 
             if prev_frame_1 is None:
                 # First frame: no previous reference available.
@@ -554,8 +602,10 @@ class RainFrameClassifierMixin:
             # All modes
             total_flux_modes = 0.0
             for i, m_mask in enumerate(mode_masks):
+                mode_flux_i = float(np.sum(flux[m_mask]))
+                mode_flux_by_mode[i, t] = mode_flux_i
                 weight = mode_weights[i] if mode_weights is not None else 1.0
-                total_flux_modes += weight * float(np.sum(flux[m_mask]))
+                total_flux_modes += weight * mode_flux_i
 
             flux_modes[t] = total_flux_modes
 
@@ -580,14 +630,43 @@ class RainFrameClassifierMixin:
                 mode_ok_dbg[t] = 0.0
                 peak_gate_score[t] = 0.0
             else:
-                pk_h = props.get("peak_heights", spec_db[peaks])
+                pk_h = np.asarray(props.get("peak_heights", spec_db[peaks]), dtype=np.float64)
+                pk_prom = np.asarray(props.get("prominences", np.zeros(peaks.size)), dtype=np.float64)
+                widths_bins, *_ = peak_widths(spec_db, peaks, rel_height=0.5)
+                df_hz = float(freqs_band[1] - freqs_band[0]) if freqs_band.size > 1 else 0.0
+                pk_bw_hz = np.asarray(widths_bins, dtype=np.float64) * df_hz
+
+                # 1) All peaks satisfying the requested 3-6 dB prominence criterion.
+                valid_prom_mask = (pk_prom >= 3.0) & (pk_prom <= 6.0)
+                if include_peak_payload and np.any(valid_prom_mask):
+                    peak_valid_freqs_hz[t] = freqs_band[peaks[valid_prom_mask]].astype(np.float64)
+                    peak_valid_prominences_db[t] = pk_prom[valid_prom_mask].astype(np.float64)
+                    peak_valid_bandwidths_hz[t] = pk_bw_hz[valid_prom_mask].astype(np.float64)
+                    peak_valid_heights_db[t] = pk_h[valid_prom_mask].astype(np.float64)
+
+                # Strongest top-P peaks for gate computation.
                 order = np.argsort(pk_h)[::-1]
                 sel = peaks[order[:peak_top_p]]
+                sel_h = pk_h[order[:peak_top_p]]
+                sel_prom = pk_prom[order[:peak_top_p]]
+                sel_bw_hz = pk_bw_hz[order[:peak_top_p]]
 
                 in_primary = primary_mask[sel]
                 in_any_mode = np.zeros(sel.size, dtype=bool)
                 for m_mask in mode_masks:
                     in_any_mode |= m_mask[sel]
+
+                # 4) top-P peaks that also satisfy the 3-6 dB prominence criterion
+                # and are inside the expected mode bands.
+                if include_peak_payload:
+                    sel_valid_prom = (sel_prom >= 3.0) & (sel_prom <= 6.0)
+                    sel_keep = sel_valid_prom & in_any_mode
+                    peak_top_p_freqs_hz[t] = freqs_band[sel[sel_keep]].astype(np.float64)
+                    peak_top_p_prominences_db[t] = sel_prom[sel_keep].astype(np.float64)
+                    peak_top_p_bandwidths_hz[t] = sel_bw_hz[sel_keep].astype(np.float64)
+                    peak_top_p_heights_db[t] = sel_h[sel_keep].astype(np.float64)
+                    peak_top_p_in_mode_mask[t] = in_any_mode.astype(bool)
+                    peak_top_p_in_primary_mask[t] = in_primary.astype(bool)
 
                 top_m = min(primary_top_m, sel.size)
                 total = float(sel.size)
@@ -632,7 +711,12 @@ class RainFrameClassifierMixin:
                 i1 = min(Tloc, t + half + 1)
                 out[t] = np.quantile(x[i0:i1], q)
 
-            out = np.nan_to_num(out, nan=mode_flux_norm_min, posinf=mode_flux_norm_min, neginf=mode_flux_norm_min)
+            out = np.nan_to_num(
+                out,
+                nan=mode_flux_norm_min,
+                posinf=mode_flux_norm_min,
+                neginf=mode_flux_norm_min,
+            )
             out = np.maximum(out, mode_flux_norm_min)
             return out
 
@@ -656,6 +740,33 @@ class RainFrameClassifierMixin:
             mode_flux_score = mode_flux_excess / (mode_flux_baseline + mode_flux_norm_min)
         else:
             mode_flux_score = mode_flux_excess.copy()
+
+        # 2) normalized_mode_flux for each mode separately.
+        for i in range(len(mode_bands)):
+            baseline_i = rolling_low_quantile_baseline(mode_flux_by_mode[i])
+            excess_i = np.maximum(mode_flux_by_mode[i] - baseline_i, 0.0)
+            if mode_flux_norm_enable:
+                score_i = excess_i / (baseline_i + mode_flux_norm_min)
+            else:
+                score_i = excess_i.copy()
+            mode_flux_baseline_by_mode[i] = baseline_i
+            mode_flux_excess_by_mode[i] = excess_i
+            normalized_mode_flux_by_mode[i] = np.nan_to_num(
+                score_i,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+        # 3) Ratio of each mode_flux to primary_mode_flux.
+        primary_mode_flux = np.maximum(mode_flux_by_mode[primary_mode_idx], eps)
+        mode_to_primary_ratio = mode_flux_by_mode / primary_mode_flux[np.newaxis, :]
+        mode_to_primary_ratio = np.nan_to_num(
+            mode_to_primary_ratio,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
 
         # Peak confirmation gate: among the strongest peaks, require at least one
@@ -717,6 +828,11 @@ class RainFrameClassifierMixin:
             "mode_flux_excess": mode_flux_excess,
             "mode_flux_score": mode_flux_score,
             "mode_flux_rain_pass": mode_flux_rain_pass,
+            "mode_flux_by_mode": mode_flux_by_mode,
+            "mode_flux_baseline_by_mode": mode_flux_baseline_by_mode,
+            "mode_flux_excess_by_mode": mode_flux_excess_by_mode,
+            "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
+            "mode_to_primary_ratio": mode_to_primary_ratio,
             "rain_conf": rain_conf,
             "primary_flux_sanity": primary_flux_sanity,
             "primary_sanity": primary_sanity,
@@ -769,8 +885,24 @@ class RainFrameClassifierMixin:
                 "td_soft_crest_factor_min": td_soft_crest_factor_min,
                 "td_soft_kurtosis_min": td_soft_kurtosis_min,
                 "td_soft_min_positive_votes": td_soft_min_positive_votes,
+                "feature_dump_include_peak_payload": include_peak_payload,
+                "feature_dump_include_td_soft": include_td_soft_feature_dump,
             },
         }
+
+        if include_peak_payload:
+            det_debug.update({
+                "peak_valid_freqs_hz": peak_valid_freqs_hz,
+                "peak_valid_prominences_db": peak_valid_prominences_db,
+                "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
+                "peak_valid_heights_db": peak_valid_heights_db,
+                "peak_top_p_freqs_hz": peak_top_p_freqs_hz,
+                "peak_top_p_prominences_db": peak_top_p_prominences_db,
+                "peak_top_p_bandwidths_hz": peak_top_p_bandwidths_hz,
+                "peak_top_p_heights_db": peak_top_p_heights_db,
+                "peak_top_p_in_mode_mask": peak_top_p_in_mode_mask,
+                "peak_top_p_in_primary_mask": peak_top_p_in_primary_mask,
+            })
 
         feature_dump_level = int(self._dget("feature_dump_level", 0))
         feature_dump: Dict[str, Any] = {}
@@ -795,6 +927,11 @@ class RainFrameClassifierMixin:
                 "mode_flux_rain_pass": mode_flux_rain_pass,
                 "primary_flux_sanity": primary_flux_sanity.astype(np.int8),
                 "primary_sanity": primary_sanity.astype(np.int8),
+                "mode_flux_by_mode": mode_flux_by_mode,
+                "mode_flux_baseline_by_mode": mode_flux_baseline_by_mode,
+                "mode_flux_excess_by_mode": mode_flux_excess_by_mode,
+                "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
+                "mode_to_primary_ratio": mode_to_primary_ratio,
                 "peak_ratio": peak_ratio,
                 "peak_detected_count": peak_detected_count,
                 "peak_total_count": peak_total_count,
@@ -803,6 +940,20 @@ class RainFrameClassifierMixin:
                 "peak_gate_score": peak_gate_score,
                 "peak_gate": peak_gate.astype(np.int8),
             }
+
+            if include_peak_payload:
+                feature_dump.update({
+                    "peak_valid_freqs_hz": peak_valid_freqs_hz,
+                    "peak_valid_prominences_db": peak_valid_prominences_db,
+                    "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
+                    "peak_valid_heights_db": peak_valid_heights_db,
+                    "peak_top_p_freqs_hz": peak_top_p_freqs_hz,
+                    "peak_top_p_prominences_db": peak_top_p_prominences_db,
+                    "peak_top_p_bandwidths_hz": peak_top_p_bandwidths_hz,
+                    "peak_top_p_heights_db": peak_top_p_heights_db,
+                    "peak_top_p_in_mode_mask": peak_top_p_in_mode_mask,
+                    "peak_top_p_in_primary_mask": peak_top_p_in_primary_mask,
+                })
 
             if feature_dump_level > 1:
                 feature_dump.update({
@@ -835,10 +986,12 @@ class RainFrameClassifierMixin:
                         "td_soft_crest_factor_min": td_soft_crest_factor_min,
                         "td_soft_kurtosis_min": td_soft_kurtosis_min,
                         "td_soft_min_positive_votes": td_soft_min_positive_votes,
+                        "feature_dump_include_peak_payload": include_peak_payload,
+                        "feature_dump_include_td_soft": include_td_soft_feature_dump,
                     },
                 })
 
-                if td_soft_enable and td_soft_debug:
+                if include_td_soft_feature_dump and td_soft_enable and td_soft_debug:
                     for k in (
                         "frame_energy",
                         "frame_baseline",
@@ -944,10 +1097,7 @@ class RainFrameClassifierProcessor(RainFrameClassifierMixin):
 
         debug_level = int(self._dget("debug_level", 2))
         if debug_level > 0:
-            result.update({
-                "freqs": freqs,
-                "times": times,
-            })
+            result["times"] = times
 
         if debug_level > 1:
             result.update({
@@ -978,6 +1128,4 @@ class RainFrameClassifierProcessor(RainFrameClassifierMixin):
             "noise_conf": results.get("noise_conf"),
             "debug": results.get("debug"),
         }
-        if feature_dump_level > 1:
-            state["feature_dump"] = results.get("feature_dump")
         return results, state
