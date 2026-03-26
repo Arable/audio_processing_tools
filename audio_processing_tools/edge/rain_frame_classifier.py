@@ -758,9 +758,11 @@ class RainFrameClassifierMixin:
                 neginf=0.0,
             )
 
-        # 3) Ratio of each mode_flux to primary_mode_flux.
-        primary_mode_flux = np.maximum(mode_flux_by_mode[primary_mode_idx], eps)
-        mode_to_primary_ratio = mode_flux_by_mode / primary_mode_flux[np.newaxis, :]
+        # 3) Per-mode fraction of the total mode flux.
+        # This is more stable than dividing by the primary-mode flux, which can
+        # become numerically tiny and create extreme ratios.
+        total_mode_flux = np.maximum(np.sum(mode_flux_by_mode, axis=0), eps)
+        mode_to_primary_ratio = mode_flux_by_mode / total_mode_flux[np.newaxis, :]
         mode_to_primary_ratio = np.nan_to_num(
             mode_to_primary_ratio,
             nan=0.0,
@@ -832,6 +834,8 @@ class RainFrameClassifierMixin:
             "mode_flux_baseline_by_mode": mode_flux_baseline_by_mode,
             "mode_flux_excess_by_mode": mode_flux_excess_by_mode,
             "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
+            # Note: kept historical key name for backward compatibility; values
+            # now represent per-mode fraction of total mode flux.
             "mode_to_primary_ratio": mode_to_primary_ratio,
             "rain_conf": rain_conf,
             "primary_flux_sanity": primary_flux_sanity,
@@ -878,6 +882,7 @@ class RainFrameClassifierMixin:
                 "flux_modes_winsor_enable": flux_modes_winsor_enable,
                 "flux_modes_winsor_q": flux_modes_winsor_q,
                 "primary_mode_idx": primary_mode_idx,
+                "mode_ratio_definition": "mode_flux_over_total_mode_flux",
                 "mode_bands": mode_bands,
                 "td_soft_enable": td_soft_enable,
                 "td_soft_time_flux_band": td_soft_time_flux_band,
@@ -931,6 +936,8 @@ class RainFrameClassifierMixin:
                 "mode_flux_baseline_by_mode": mode_flux_baseline_by_mode,
                 "mode_flux_excess_by_mode": mode_flux_excess_by_mode,
                 "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
+                # Note: kept historical key name for backward compatibility; values
+                # now represent per-mode fraction of total mode flux.
                 "mode_to_primary_ratio": mode_to_primary_ratio,
                 "peak_ratio": peak_ratio,
                 "peak_detected_count": peak_detected_count,
@@ -979,6 +986,7 @@ class RainFrameClassifierMixin:
                         "flux_modes_winsor_enable": flux_modes_winsor_enable,
                         "flux_modes_winsor_q": flux_modes_winsor_q,
                         "primary_mode_idx": primary_mode_idx,
+                        "mode_ratio_definition": "mode_flux_over_total_mode_flux",
                         "mode_bands": mode_bands,
                         "td_soft_enable": td_soft_enable,
                         "td_soft_time_flux_band": td_soft_time_flux_band,
