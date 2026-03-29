@@ -658,6 +658,8 @@ class RainFrameClassifierMixin:
                     "time_flux_score": td_soft_full.get("time_flux_score"),
                     "crest_factor": td_soft_full.get("crest_factor"),
                     "kurtosis": td_soft_full.get("kurtosis"),
+                    "vote_count": td_soft_full.get("vote_count"),
+                    "soft_score": td_soft_full.get("soft_score"),
                 }
             except Exception as e:
                 td_soft_debug = {"error": str(e)}
@@ -1066,13 +1068,26 @@ class RainFrameClassifierMixin:
                 "frame_times": detector_frame_times,
                 "frame_class": frame_class,
                 "is_rain": is_rain.astype(np.int8),
+                "is_rain_raw": is_rain_raw.astype(np.int8),
                 "flux_primary": flux_primary,
                 "mode_flux_score": mode_flux_score,
                 "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
-                "peak_count_by_mode": peak_count_by_mode,
                 "peak_ratio": peak_ratio,
                 "peak_gate_score": peak_gate_score,
+                "peak_gate": peak_gate.astype(np.int8),
+                "rain_conf": rain_conf,
+                "noise_conf": noise_conf,
             }
+
+            if include_td_soft_feature_dump and td_soft_debug and ("error" not in td_soft_debug):
+                feature_dump.update({
+                    "td_soft_label": np.asarray(td_soft_debug.get("soft_label"), dtype=np.int8),
+                    "td_time_flux_score": td_soft_debug.get("time_flux_score"),
+                    "td_crest_factor": td_soft_debug.get("crest_factor"),
+                    "td_kurtosis": td_soft_debug.get("kurtosis"),
+                    "td_vote_count": td_soft_debug.get("vote_count"),
+                    "td_soft_score": td_soft_debug.get("soft_score"),
+                })
 
             if include_peak_payload:
                 feature_dump.update({
@@ -1081,31 +1096,6 @@ class RainFrameClassifierMixin:
                     "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
                 })
 
-            if feature_dump_level > 1:
-                feature_dump.update({
-                    "frame_class_name": np.array(
-                        [FrameClass(v).name.lower() for v in frame_class], dtype=object
-                    ),
-                    "primary_ok": primary_ok_dbg,
-                    "mode_ok": mode_ok_dbg,
-                    "tuning_params": {
-                        "operating_band": (op_lo, op_hi),
-                        "mode_bands": mode_bands,
-                        "primary_mode_idx": primary_mode_idx,
-                        "noise_hi": noise_hi,
-                        "mode_flux_rain_min": mode_flux_rain_min,
-                        "primary_flux_sanity_min": primary_flux_sanity_min,
-                        "mode_flux_noise_max": mode_flux_noise_max,
-                        "mode_flux_norm_win_sec": mode_flux_norm_win_sec,
-                        "mode_flux_norm_q": mode_flux_norm_q,
-                        "mode_flux_norm_min": mode_flux_norm_min,
-                        "peak_top_p": peak_top_p,
-                        "primary_top_m": primary_top_m,
-                        "peak_ratio_min": peak_ratio_min,
-                        "peak_prominence_db": peak_prominence_db,
-                        "peak_min_db_above_floor": peak_min_db_above_floor,
-                        "td_soft_enable": td_soft_enable,
-                    },
-                })
+            # Level-2 feature dump block removed for leaner big-run payloads.
 
         return frame_class, rain_conf, det_debug, feature_dump
