@@ -395,23 +395,3 @@ def process_audio_batches_v2(
 # Backwards-compatible alias
 process_audio_batches = process_audio_batches_v2
 
-
-
-# old code - To Be Deleted 
-#             # # ----------------------------------------------------------
-            # # 2.1 Run all processors on this audio buffer
-            # # ----------------------------------------------------------
-            # for proc in processors:
-            #     proc_params = {**params_global, **params_by_processor.get(proc.name, {})}
-
-            #     if hasattr(proc, "setup"):
-            #         proc.setup(proc_params)   # or setup(proc_params, params_global["sample_rate"])
-
-            #     proc_results, proc_state = proc.run(audio, proc_params)
-
-            #     proc_state = dict(proc_state)
-            #     proc_state["file_key"] = file_key
-
-            #     row.update(_flatten_with_namespace(proc.name, proc_results))
-            #     states_by_processor[proc.name].append(proc_state)
-
