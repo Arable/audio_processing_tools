@@ -1,6 +1,6 @@
 # edge/spectral_noise_processor.py
 
-from __future__ import annotations
+
 
 from dataclasses import dataclass, fields, field
 
@@ -11,8 +11,8 @@ import scipy.signal as spsig
 import scipy.ndimage as ndi
 import librosa
 
-
 from .rain_frame_classifier import RainFrameClassifierMixin, FrameClass
+
 
 
 @dataclass
@@ -139,6 +139,13 @@ class NoiseProcessorConfig:
     # This is useful when we want to extract detector features on raw clips
     # and compare them directly against soft frame labels.
     disable_suppression: bool = False
+
+    # Classifier-only mode: run the exact same detector frontend and frame
+    # classifier path as stage-1, but return early before final PSD update,
+    # gain computation, and ISTFT. This lets SpectralNoiseProcessor act as the
+    # tuning / analysis processor without requiring a separate
+    # RainFrameClassifierProcessor wrapper.
+    classifier_only_mode: bool = False
 
     # -----------------------------------------------------------
     # Debug / tuning
@@ -671,6 +678,10 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             "mode_flux_score",
             "flux_primary",
             "flux_modes",
+            "flux_modes_proc",
+            "mode_flux_baseline",
+            "mode_flux_excess",
+            "weak_mode_flux",
             # Frequency-domain tuning features
             "mode_flux_by_mode",
             "normalized_mode_flux_by_mode",
@@ -714,6 +725,9 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         # Ensure x is float64 and 1-D
         x = np.asarray(x, dtype=np.float64).reshape(-1)
+        # Needed by RainFrameClassifierMixin for optional time-domain soft labeller
+        # comparison during classifier tuning.
+        setattr(self.cfg, "last_input_audio", x)
         x_proc = x
         mode = str(getattr(cfg, "pre_filter_mode", "highpass")).lower()
 
@@ -761,6 +775,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         op_lo, op_hi = cfg.operating_band
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
         disable_suppression = bool(getattr(cfg, "disable_suppression", False))
+        classifier_only_mode = bool(getattr(cfg, "classifier_only_mode", False))
 
         # 2) Frame classification (optionally using lagged/bootstrapped noise PSD)
         bypass_classifier = bool(getattr(cfg, "detector", {}).get("bypass_classifier", False))
@@ -782,6 +797,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 "onset_mask": np.zeros(T, dtype=bool),
                 "onset_indices": np.zeros(0, dtype=np.int32),
             }
+            feature_dump = None
         else:
             P_for_detection = P.copy()
             P_for_detection[~band_mask, :] = 0.0
@@ -819,9 +835,10 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 # legacy detector input: absolute spectrum in dB
                 P_for_detection = 10.0 * np.log10(P_for_detection + cfg.eps)
 
-            frame_class, rain_conf, det_debug = self._detect_rain_over_time(
+            frame_class, rain_conf, det_debug, feature_dump = self._detect_rain_over_time(
                 P_for_detection,
                 freqs,
+                detector_frame_times=np.asarray(times, dtype=np.float64),
             )
 
         frame_class = np.asarray(frame_class, dtype=np.int8)
@@ -845,6 +862,9 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 except Exception:
                     pass
 
+        if "feature_dump" not in locals():
+            feature_dump = None
+
         features = None
         if bool(getattr(cfg, "dump_features", False)):
             feature_step = max(1, int(getattr(cfg, "feature_decim", 1)))
@@ -857,6 +877,65 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 det_debug=det_debug,
                 step=feature_step,
             )
+
+        # Keep large tensors and verbose debug only when explicitly requested.
+        keep_debug = bool(getattr(cfg, "debug_enable", False))
+        keep_detector_debug = keep_debug
+        keep_spectra = keep_debug
+        keep_noise_psd = keep_debug
+        keep_filtered_audio = keep_debug
+        keep_gain_debug = keep_debug
+
+        if classifier_only_mode:
+            debug = None
+            if keep_debug:
+                debug = {
+                    "detector": det_debug,
+                    "detector_params": dict(getattr(cfg, "detector", {}) or {}),
+                    "suppressor_params": dict(getattr(cfg, "suppressor", {}) or {}),
+                    "times_s": times_s,
+                    "freqs": freqs,
+                    "bootstrap_noise_psd": bootstrap_noise_psd,
+                    "detector_noise_psd_lag": detector_noise_psd_lag,
+                    "detector_use_noise_norm": detector_use_noise_norm,
+                    "detector_noise_norm_mode": detector_noise_norm_mode,
+                    "disable_suppression": disable_suppression,
+                    "classifier_only_mode": True,
+                    "rain_conf": rain_conf,
+                    "noise_conf": noise_conf,
+                    "is_rain": is_rain,
+                    "is_noise": is_noise,
+                    "operating_band": (float(op_lo), float(op_hi)),
+                    "band_mask": band_mask,
+                    "pre_filter_mode": mode,
+                    "pre_filter_band": (float(cfg.operating_band[0]), float(cfg.operating_band[1])),
+                    "features_available": features is not None,
+                }
+
+            result = {
+                "y": x_proc if keep_filtered_audio else None,
+                "y_suppressed": None,
+                "S": S if keep_spectra else None,
+                "S_hat": S if keep_spectra else None,
+                "noise_psd": np.zeros_like(P, dtype=np.float64) if keep_noise_psd else None,
+                "frame_class": frame_class,
+                "is_rain": is_rain,
+                "rain_conf": rain_conf,
+                "noise_conf": noise_conf,
+                "freqs": freqs,
+                "times": times,
+                "det_debug": det_debug if keep_detector_debug else None,
+                "debug": debug,
+                "x_hp": x_proc if keep_filtered_audio else None,
+                "x_filt": x_proc if keep_filtered_audio else None,
+                "use_for_noise_psd": np.zeros_like(is_rain, dtype=bool),
+                "features": features,
+                "feature_dump": feature_dump,
+                "classifier_only_mode": True,
+            }
+
+            return result
+
 
         # PSD update gating is derived from the canonical frame class.
         # Only confident NOISE frames are used to update the final noise PSD.
@@ -990,82 +1069,86 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         op_lo, op_hi = cfg.operating_band
 
         # Keep detector debug under a dedicated key to avoid collisions and make plots simpler.
-        debug = {
-            "detector": det_debug,
-            "detector_params": dict(getattr(cfg, "detector", {}) or {}),
-            "suppressor_params": dict(getattr(cfg, "suppressor", {}) or {}),
-            # Extract useful detector tuning signals if present
-            "z_primary": (det_debug.get("z_primary") if isinstance(det_debug, dict) else None),
-            "z_modes": (det_debug.get("z_modes") if isinstance(det_debug, dict) else None),
-            "peak_ratio": (det_debug.get("peak_ratio") if isinstance(det_debug, dict) else None),
-            "flux_primary": (det_debug.get("flux_primary") if isinstance(det_debug, dict) else None),
-            "flux_modes": (det_debug.get("flux_modes") if isinstance(det_debug, dict) else None),
-            "rain_score_raw": (det_debug.get("rain_score_raw") if isinstance(det_debug, dict) else None),
-            "frame_class": (det_debug.get("frame_class") if isinstance(det_debug, dict) else None),
-            "frame_class_name": (det_debug.get("frame_class_name") if isinstance(det_debug, dict) else None),
-            "is_rain_raw": (det_debug.get("is_rain_raw") if isinstance(det_debug, dict) else None),
-            "onset_mask": (det_debug.get("onset_mask") if isinstance(det_debug, dict) else None),
-            "onset_indices": (det_debug.get("onset_indices") if isinstance(det_debug, dict) else None),
+        debug = None
+        if keep_debug:
+            debug = {
+                "detector": det_debug,
+                "detector_params": dict(getattr(cfg, "detector", {}) or {}),
+                "suppressor_params": dict(getattr(cfg, "suppressor", {}) or {}),
+                # Extract useful detector tuning signals if present
+                "peak_ratio": (det_debug.get("peak_ratio") if isinstance(det_debug, dict) else None),
+                "flux_primary": (det_debug.get("flux_primary") if isinstance(det_debug, dict) else None),
+                "frame_class": (det_debug.get("frame_class") if isinstance(det_debug, dict) else None),
+                "frame_class_name": (
+                    np.array([FrameClass(v).name.lower() for v in det_debug.get("frame_class", [])], dtype=object)
+                    if isinstance(det_debug, dict) and det_debug.get("frame_class") is not None
+                    else None
+                ),
+                "is_rain_raw": (det_debug.get("is_rain_raw") if isinstance(det_debug, dict) else None),
+                "onset_mask": (det_debug.get("onset_mask") if isinstance(det_debug, dict) else None),
+                "onset_indices": (det_debug.get("onset_indices") if isinstance(det_debug, dict) else None),
 
-            # SNR gating (optional)
-            "snr_mode": snr_mode,
-            "snr_gate": snr_gate,
+                # SNR gating (optional)
+                "snr_mode": snr_mode,
+                "snr_gate": snr_gate,
 
-            # Common time axis and frequency axis
-            "times_s": times_s,
-            "freqs": freqs,
-            "bootstrap_noise_psd": bootstrap_noise_psd,
-            "detector_noise_psd_lag": detector_noise_psd_lag,
-            "detector_use_noise_norm": detector_use_noise_norm,
-            "detector_noise_norm_mode": detector_noise_norm_mode,
-            "disable_suppression": disable_suppression,
+                # Common time axis and frequency axis
+                "times_s": times_s,
+                "freqs": freqs,
+                "bootstrap_noise_psd": bootstrap_noise_psd,
+                "detector_noise_psd_lag": detector_noise_psd_lag,
+                "detector_use_noise_norm": detector_use_noise_norm,
+                "detector_noise_norm_mode": detector_noise_norm_mode,
+                "disable_suppression": disable_suppression,
+                "classifier_only_mode": classifier_only_mode,
 
-            # Classifier outputs
-            "rain_conf": rain_conf,
-            "noise_conf": noise_conf,
-            "is_rain": is_rain,
-            "is_noise": is_noise,
-            "use_for_noise_psd": use_for_noise_psd,
-            "is_rain_for_psd": is_rain_for_psd,
+                # Classifier outputs
+                "rain_conf": rain_conf,
+                "noise_conf": noise_conf,
+                "is_rain": is_rain,
+                "is_noise": is_noise,
+                "use_for_noise_psd": use_for_noise_psd,
+                "is_rain_for_psd": is_rain_for_psd,
 
-            # Suppression / PSD
-            "G": G,
-            "noise_psd": noise_psd,
-            "use_lagged_noise_psd": bool(getattr(cfg, "use_lagged_noise_psd", False)),
-            # Gain diagnostics (where suppression can collapse)
-            "gain_dbg": gain_dbg,
+                # Suppression / PSD
+                "G": G,
+                "noise_psd": noise_psd,
+                "use_lagged_noise_psd": bool(getattr(cfg, "use_lagged_noise_psd", False)),
+                "gain_dbg": gain_dbg if keep_gain_debug else None,
 
-            # Band metadata
-            "operating_band": (float(op_lo), float(op_hi)),
-            "band_mask": band_mask,
+                # Band metadata
+                "operating_band": (float(op_lo), float(op_hi)),
+                "band_mask": band_mask,
 
-            # Pre-filter info for debug/tuning/plots
-            "pre_filter_mode": mode,
-            "pre_filter_band": (float(cfg.operating_band[0]), float(cfg.operating_band[1])),
-            "np_ratio_median_t": ratio_med_t,
-            "noise_psd_max_ratio": float(getattr(cfg, "noise_psd_max_ratio", 1.0)),
-            "features_available": features is not None,
-        }
+                # Pre-filter info for debug/tuning/plots
+                "pre_filter_mode": mode,
+                "pre_filter_band": (float(cfg.operating_band[0]), float(cfg.operating_band[1])),
+                "np_ratio_median_t": ratio_med_t,
+                "noise_psd_max_ratio": float(getattr(cfg, "noise_psd_max_ratio", 1.0)),
+                "features_available": features is not None,
+            }
 
 
         return {
-            "y": y_out,            # what your harness will treat as "denoised_audio"
-            "y_suppressed": y_hat, # always available for A/B
-            "S": S,
-            "S_hat": S_hat,
-            "noise_psd": noise_psd,
+            "y": y_out if keep_filtered_audio else None,  # keep sample-level output only in debug mode
+            "y_suppressed": y_hat if keep_filtered_audio else None,
+            "S": S if keep_spectra else None,
+            "S_hat": S_hat if keep_spectra else None,
+            "noise_psd": noise_psd if keep_noise_psd else None,
             "frame_class": frame_class,
             "is_rain": is_rain,
             "freqs": freqs,
             "times": times,
             # Back-compat convenience: top-level detector keys (if present)
-            "det_debug": det_debug,
+            "det_debug": det_debug if keep_detector_debug else None,
             "debug": debug,
-            "x_hp": x_proc,   # back-compat name
-            "x_filt": x_proc, # clearer name (HPF/BPF/none)
+            "x_hp": x_proc if keep_filtered_audio else None,   # back-compat name
+            "x_filt": x_proc if keep_filtered_audio else None, # clearer name (HPF/BPF/none)
             # Added explicit outputs for harness convenience
             "use_for_noise_psd": use_for_noise_psd,
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
             "features": features,
+            "feature_dump": feature_dump,
+            "classifier_only_mode": classifier_only_mode,
         }

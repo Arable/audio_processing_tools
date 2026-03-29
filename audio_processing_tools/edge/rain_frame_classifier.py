@@ -26,6 +26,7 @@ class TimeDomainSoftLabelConfig:
     hop: int = 128
 
     operating_band: Tuple[float, float] = (400.0, 3500.0)
+    mode_bands: Optional[Tuple[Tuple[float, float], ...]] = None
     time_flux_band: Optional[Tuple[float, float]] = None
     bp_order: int = 4
 
@@ -90,6 +91,33 @@ class TimeDomainSoftLabeller:
             return spsig.sosfiltfilt(sos, x)
         except ValueError:
             return spsig.sosfilt(sos, x)
+
+    def _mode_band_comb(
+        self,
+        x: np.ndarray,
+        mode_bands: Optional[Tuple[Tuple[float, float], ...]] = None,
+        fallback_band: Optional[Tuple[float, float]] = None,
+    ) -> np.ndarray:
+        """
+        Build a simple mode-band comb-filtered signal by summing bandpassed
+        outputs across the configured rain mode bands.
+
+        If no mode bands are provided, fall back to a single bandpass.
+        """
+        cfg = self.cfg
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        if x.size == 0:
+            return x.copy()
+
+        use_mode_bands = cfg.mode_bands if mode_bands is None else mode_bands
+        if not use_mode_bands:
+            use_band = cfg.operating_band if fallback_band is None else fallback_band
+            return self._bandpass(x, use_band)
+
+        y_sum = np.zeros_like(x, dtype=np.float64)
+        for band in use_mode_bands:
+            y_sum += self._bandpass(x, band)
+        return y_sum
 
     def _frame_view(self, x: np.ndarray) -> np.ndarray:
         cfg = self.cfg
@@ -183,9 +211,16 @@ class TimeDomainSoftLabeller:
     def process(self, x: np.ndarray) -> Dict[str, Any]:
         cfg = self.cfg
         x = np.asarray(x, dtype=np.float64).reshape(-1)
-        x_bp = self._bandpass(x, cfg.operating_band)
-        flux_band = cfg.time_flux_band if cfg.time_flux_band is not None else cfg.operating_band
-        x_flux = self._bandpass(x, flux_band)
+        # Waveform-shape features use a mode-band comb-filtered signal so the
+        # time-domain soft labeller focuses on the known rain resonance bands.
+        x_bp = self._mode_band_comb(x, cfg.mode_bands, cfg.operating_band)
+
+        # Time-flux path can optionally use its own dedicated band. If not
+        # provided, reuse the same comb-filtered input as the waveform path.
+        if cfg.time_flux_band is not None:
+            x_flux = self._bandpass(x, cfg.time_flux_band)
+        else:
+            x_flux = x_bp.copy()
         frames = self._frame_view(x_bp)
         T = frames.shape[0]
 
@@ -324,6 +359,160 @@ class RainFrameClassifierMixin:
                 "or as flat cfg attributes."
             )
 
+    def _build_td_soft_comparison(
+        self,
+        frame_class: np.ndarray,
+        is_rain: np.ndarray,
+        td_soft_debug: Dict[str, Any],
+        detector_frame_times: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compare detector output against optional time-domain soft labels.
+
+        Notes
+        -----
+        - Raw detector and soft-label frame grids are expected to share the same
+          frame rate / hop.
+        - Detector decisions are known to lag soft labels by roughly 2 frames,
+          with an acceptable tolerance of +/- 1 frame.
+        - We therefore keep both:
+            1) strict index-aligned comparison for diagnostics
+            2) lag-aware comparison for tuning metrics
+        """
+        out: Dict[str, Any] = {}
+        if not isinstance(td_soft_debug, dict):
+            return out
+
+        if "soft_label" not in td_soft_debug:
+            return out
+
+        td_soft_label = np.asarray(td_soft_debug.get("soft_label"), dtype=bool).reshape(-1)
+        if td_soft_label.size == 0:
+            return out
+
+        frame_class = np.asarray(frame_class, dtype=np.int8).reshape(-1)
+        is_rain = np.asarray(is_rain, dtype=bool).reshape(-1)
+        n = int(min(frame_class.size, is_rain.size, td_soft_label.size))
+        if n <= 0:
+            return out
+
+        frame_class_cmp = frame_class[:n]
+        is_rain_cmp = is_rain[:n]
+        td_soft_label_cmp = td_soft_label[:n]
+
+        detector_times_cmp = None
+        td_soft_times_cmp = None
+        same_grid = False
+        max_abs_time_diff = np.nan
+        alignment_mode = "shared_prefix_index_alignment"
+
+        if detector_frame_times is not None and "frame_times" in td_soft_debug:
+            det_times = np.asarray(detector_frame_times, dtype=np.float64).reshape(-1)
+            td_times = np.asarray(td_soft_debug.get("frame_times"), dtype=np.float64).reshape(-1)
+            if det_times.size > 0 and td_times.size > 0:
+                detector_times_cmp = det_times[:n]
+                td_soft_times_cmp = td_times[:n]
+                if detector_times_cmp.size == td_soft_times_cmp.size and detector_times_cmp.size > 0:
+                    dt = detector_times_cmp - td_soft_times_cmp
+                    max_abs_time_diff = float(np.max(np.abs(dt)))
+                    same_grid = bool(
+                        np.allclose(
+                            detector_times_cmp,
+                            td_soft_times_cmp,
+                            atol=1e-9,
+                            rtol=0.0,
+                        )
+                    )
+                    alignment_mode = (
+                        "time_aligned_prefix"
+                        if same_grid
+                        else "time_mismatch_shared_prefix"
+                    )
+
+        # Strict index-aligned comparison (diagnostic only)
+        agree = is_rain_cmp == td_soft_label_cmp
+        tp = is_rain_cmp & td_soft_label_cmp
+        fp = is_rain_cmp & (~td_soft_label_cmp)
+        fn = (~is_rain_cmp) & td_soft_label_cmp
+        tn = (~is_rain_cmp) & (~td_soft_label_cmp)
+
+        # Lag-aware comparison for tuning metrics.
+        # Detector rain decisions lag soft labels by ~2 frames, with +/-1 frame tolerance.
+        lag_frames = 2
+        tolerance_frames = 1
+        soft_label_lagged_target = np.zeros(n, dtype=bool)
+        for t in range(n):
+            center = t - lag_frames
+            j0 = max(0, center - tolerance_frames)
+            j1 = min(n, center + tolerance_frames + 1)
+            if j1 > j0:
+                soft_label_lagged_target[t] = bool(np.any(td_soft_label_cmp[j0:j1]))
+
+        agree_lagged = is_rain_cmp == soft_label_lagged_target
+        tp_lagged = is_rain_cmp & soft_label_lagged_target
+        fp_lagged = is_rain_cmp & (~soft_label_lagged_target)
+        fn_lagged = (~is_rain_cmp) & soft_label_lagged_target
+        tn_lagged = (~is_rain_cmp) & (~soft_label_lagged_target)
+
+        uncertain_mask = frame_class_cmp == FrameClass.UNCERTAIN
+        noise_mask = frame_class_cmp == FrameClass.NOISE
+        rain_mask = frame_class_cmp == FrameClass.RAIN
+
+        out = {
+            "aligned": True,
+            "alignment_mode": alignment_mode,
+            "same_grid": same_grid,
+            "max_abs_time_diff_sec": max_abs_time_diff,
+            "lag_frames": lag_frames,
+            "tolerance_frames": tolerance_frames,
+            "n_compare": n,
+            "frame_class": frame_class_cmp,
+            "is_rain": is_rain_cmp,
+            "soft_label": td_soft_label_cmp,
+            "soft_label_lagged_target": soft_label_lagged_target,
+            "agree": agree,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "tn": tn,
+            "agree_lagged": agree_lagged,
+            "tp_lagged": tp_lagged,
+            "fp_lagged": fp_lagged,
+            "fn_lagged": fn_lagged,
+            "tn_lagged": tn_lagged,
+            "uncertain_mask": uncertain_mask,
+            "noise_mask": noise_mask,
+            "rain_mask": rain_mask,
+            "agree_count": int(np.sum(agree)),
+            "disagree_count": int(n - np.sum(agree)),
+            "tp_count": int(np.sum(tp)),
+            "fp_count": int(np.sum(fp)),
+            "fn_count": int(np.sum(fn)),
+            "tn_count": int(np.sum(tn)),
+            "agree_count_lagged": int(np.sum(agree_lagged)),
+            "disagree_count_lagged": int(n - np.sum(agree_lagged)),
+            "tp_count_lagged": int(np.sum(tp_lagged)),
+            "fp_count_lagged": int(np.sum(fp_lagged)),
+            "fn_count_lagged": int(np.sum(fn_lagged)),
+            "tn_count_lagged": int(np.sum(tn_lagged)),
+            "uncertain_count": int(np.sum(uncertain_mask)),
+            "noise_count": int(np.sum(noise_mask)),
+            "rain_count": int(np.sum(rain_mask)),
+        }
+
+        if detector_times_cmp is not None:
+            out["detector_frame_times"] = detector_times_cmp
+        if td_soft_times_cmp is not None:
+            out["soft_frame_times"] = td_soft_times_cmp
+
+        denom = max(n, 1)
+        out["agreement_rate"] = float(out["agree_count"]) / float(denom)
+        out["agreement_rate_lagged"] = float(out["agree_count_lagged"]) / float(denom)
+        out["soft_positive_rate"] = float(np.sum(td_soft_label_cmp)) / float(denom)
+        out["soft_positive_rate_lagged_target"] = float(np.sum(soft_label_lagged_target)) / float(denom)
+        out["rain_positive_rate"] = float(np.sum(is_rain_cmp)) / float(denom)
+        return out
+
     # ------------------------------------------------------------
     # Core detection
     # ------------------------------------------------------------
@@ -332,6 +521,7 @@ class RainFrameClassifierMixin:
         self,
         P: np.ndarray,
         freqs: np.ndarray,
+        detector_frame_times: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """
         Returns
@@ -437,6 +627,7 @@ class RainFrameClassifierMixin:
         # Precompute masks once; these do not change across frames.
         F, T = P.shape
         td_soft_debug: Dict[str, Any] = {}
+        td_soft_compare: Dict[str, Any] = {}
         if td_soft_enable and self._dhas("last_input_audio"):
             try:
                 x_in = np.asarray(getattr(self.cfg, "last_input_audio"), dtype=np.float64).reshape(-1)
@@ -445,6 +636,7 @@ class RainFrameClassifierMixin:
                     frame_len=int(self._dget("n_fft", 256)),
                     hop=int(self._dget("hop", 128)),
                     operating_band=(op_lo, op_hi),
+                    mode_bands=tuple((float(a), float(b)) for (a, b) in mode_bands),
                     time_flux_band=td_soft_time_flux_band,
                     bp_order=td_soft_bp_order,
                     subframe_len=td_soft_subframe_len,
@@ -459,9 +651,22 @@ class RainFrameClassifierMixin:
                     min_positive_votes=td_soft_min_positive_votes,
                     eps=eps,
                 )
-                td_soft_debug = TimeDomainSoftLabeller(td_soft_cfg).process(x_in)
+                td_soft_full = TimeDomainSoftLabeller(td_soft_cfg).process(x_in)
+                td_soft_debug = {
+                    "frame_times": td_soft_full.get("frame_times"),
+                    "soft_label": td_soft_full.get("soft_label"),
+                    "time_flux_score": td_soft_full.get("time_flux_score"),
+                    "crest_factor": td_soft_full.get("crest_factor"),
+                    "kurtosis": td_soft_full.get("kurtosis"),
+                }
             except Exception as e:
                 td_soft_debug = {"error": str(e)}
+        if detector_frame_times is None:
+            detector_frame_times = (
+                np.arange(T, dtype=np.float64) * float(self._dget("hop", 128))
+            ) / float(self._dget("sample_rate", self._dget("fs", 11162)))
+        else:
+            detector_frame_times = np.asarray(detector_frame_times, dtype=np.float64).reshape(-1)
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
 
         if P.shape[0] != freqs.shape[0]:
@@ -518,36 +723,20 @@ class RainFrameClassifierMixin:
 
         # Per-mode raw / normalized flux features for offline threshold tuning.
         mode_flux_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
-        mode_flux_baseline_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
-        mode_flux_excess_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
         normalized_mode_flux_by_mode = np.zeros((len(mode_bands), T), dtype=np.float64)
-        mode_to_primary_ratio = np.zeros((len(mode_bands), T), dtype=np.float64)
+        peak_count_by_mode = np.zeros((len(mode_bands), T), dtype=np.int32)
 
-        # Detailed per-peak payloads are optional because they are expensive for
-        # large batch runs. Keep them disabled by default and compute/store them
-        # only when explicitly requested for inspection.
+        # Optional per-mode representative peak payload for inspection.
+        # For each mode band and frame, store at most one valid peak: the tallest
+        # peak whose prominence falls in the requested valid range.
         if include_peak_payload:
-            peak_valid_freqs_hz = np.empty(T, dtype=object)
-            peak_valid_prominences_db = np.empty(T, dtype=object)
-            peak_valid_bandwidths_hz = np.empty(T, dtype=object)
-            peak_valid_heights_db = np.empty(T, dtype=object)
-            peak_top_p_freqs_hz = np.empty(T, dtype=object)
-            peak_top_p_prominences_db = np.empty(T, dtype=object)
-            peak_top_p_bandwidths_hz = np.empty(T, dtype=object)
-            peak_top_p_heights_db = np.empty(T, dtype=object)
-            peak_top_p_in_mode_mask = np.empty(T, dtype=object)
-            peak_top_p_in_primary_mask = np.empty(T, dtype=object)
+            peak_valid_freqs_hz = np.empty((len(mode_bands), T), dtype=object)
+            peak_valid_prominences_db = np.empty((len(mode_bands), T), dtype=object)
+            peak_valid_bandwidths_hz = np.empty((len(mode_bands), T), dtype=object)
         else:
             peak_valid_freqs_hz = None
             peak_valid_prominences_db = None
             peak_valid_bandwidths_hz = None
-            peak_valid_heights_db = None
-            peak_top_p_freqs_hz = None
-            peak_top_p_prominences_db = None
-            peak_top_p_bandwidths_hz = None
-            peak_top_p_heights_db = None
-            peak_top_p_in_mode_mask = None
-            peak_top_p_in_primary_mask = None
 
 
         prev_frame_1 = None  # frame at t-1
@@ -556,16 +745,10 @@ class RainFrameClassifierMixin:
         for t in range(T):
             frame = P_band[:, t]
             if include_peak_payload:
-                peak_valid_freqs_hz[t] = np.array([], dtype=np.float64)
-                peak_valid_prominences_db[t] = np.array([], dtype=np.float64)
-                peak_valid_bandwidths_hz[t] = np.array([], dtype=np.float64)
-                peak_valid_heights_db[t] = np.array([], dtype=np.float64)
-                peak_top_p_freqs_hz[t] = np.array([], dtype=np.float64)
-                peak_top_p_prominences_db[t] = np.array([], dtype=np.float64)
-                peak_top_p_bandwidths_hz[t] = np.array([], dtype=np.float64)
-                peak_top_p_heights_db[t] = np.array([], dtype=np.float64)
-                peak_top_p_in_mode_mask[t] = np.array([], dtype=bool)
-                peak_top_p_in_primary_mask[t] = np.array([], dtype=bool)
+                for i in range(len(mode_bands)):
+                    peak_valid_freqs_hz[i, t] = np.array([], dtype=np.float64)
+                    peak_valid_prominences_db[i, t] = np.array([], dtype=np.float64)
+                    peak_valid_bandwidths_hz[i, t] = np.array([], dtype=np.float64)
 
             if prev_frame_1 is None:
                 # First frame: no previous reference available.
@@ -579,6 +762,7 @@ class RainFrameClassifierMixin:
                 primary_ok_dbg[t] = 0.0
                 mode_ok_dbg[t] = 0.0
                 peak_gate_score[t] = 0.0
+                peak_count_by_mode[:, t] = 0
                 prev_frame_1 = frame
                 continue
 
@@ -629,44 +813,47 @@ class RainFrameClassifierMixin:
                 primary_ok_dbg[t] = 0.0
                 mode_ok_dbg[t] = 0.0
                 peak_gate_score[t] = 0.0
+                peak_count_by_mode[:, t] = 0
             else:
+                # Valid peaks are those satisfying the requested prominence range.
                 pk_h = np.asarray(props.get("peak_heights", spec_db[peaks]), dtype=np.float64)
                 pk_prom = np.asarray(props.get("prominences", np.zeros(peaks.size)), dtype=np.float64)
                 widths_bins, *_ = peak_widths(spec_db, peaks, rel_height=0.5)
                 df_hz = float(freqs_band[1] - freqs_band[0]) if freqs_band.size > 1 else 0.0
                 pk_bw_hz = np.asarray(widths_bins, dtype=np.float64) * df_hz
 
-                # 1) All peaks satisfying the requested 3-6 dB prominence criterion.
                 valid_prom_mask = (pk_prom >= 3.0) & (pk_prom <= 6.0)
-                if include_peak_payload and np.any(valid_prom_mask):
-                    peak_valid_freqs_hz[t] = freqs_band[peaks[valid_prom_mask]].astype(np.float64)
-                    peak_valid_prominences_db[t] = pk_prom[valid_prom_mask].astype(np.float64)
-                    peak_valid_bandwidths_hz[t] = pk_bw_hz[valid_prom_mask].astype(np.float64)
-                    peak_valid_heights_db[t] = pk_h[valid_prom_mask].astype(np.float64)
+                peaks_valid = peaks[valid_prom_mask]
+                pk_h_valid = pk_h[valid_prom_mask]
+                pk_prom_valid = pk_prom[valid_prom_mask]
+                pk_bw_hz_valid = pk_bw_hz[valid_prom_mask]
+
+                # Per-mode peak counts and optional representative peak payload.
+                for i, m_mask in enumerate(mode_masks):
+                    if peaks_valid.size == 0:
+                        peak_count_by_mode[i, t] = 0
+                        continue
+
+                    in_mode_valid = m_mask[peaks_valid]
+                    peak_count_by_mode[i, t] = int(np.sum(in_mode_valid))
+                    if include_peak_payload and np.any(in_mode_valid):
+                        mode_freqs = freqs_band[peaks_valid[in_mode_valid]].astype(np.float64)
+                        mode_prom = pk_prom_valid[in_mode_valid].astype(np.float64)
+                        mode_bw = pk_bw_hz_valid[in_mode_valid].astype(np.float64)
+                        mode_heights = pk_h_valid[in_mode_valid].astype(np.float64)
+
+                        best_idx = int(np.argmax(mode_heights))
+                        peak_valid_freqs_hz[i, t] = np.asarray([mode_freqs[best_idx]], dtype=np.float64)
+                        peak_valid_prominences_db[i, t] = np.asarray([mode_prom[best_idx]], dtype=np.float64)
+                        peak_valid_bandwidths_hz[i, t] = np.asarray([mode_bw[best_idx]], dtype=np.float64)
 
                 # Strongest top-P peaks for gate computation.
                 order = np.argsort(pk_h)[::-1]
                 sel = peaks[order[:peak_top_p]]
-                sel_h = pk_h[order[:peak_top_p]]
-                sel_prom = pk_prom[order[:peak_top_p]]
-                sel_bw_hz = pk_bw_hz[order[:peak_top_p]]
-
                 in_primary = primary_mask[sel]
                 in_any_mode = np.zeros(sel.size, dtype=bool)
                 for m_mask in mode_masks:
                     in_any_mode |= m_mask[sel]
-
-                # 4) top-P peaks that also satisfy the 3-6 dB prominence criterion
-                # and are inside the expected mode bands.
-                if include_peak_payload:
-                    sel_valid_prom = (sel_prom >= 3.0) & (sel_prom <= 6.0)
-                    sel_keep = sel_valid_prom & in_any_mode
-                    peak_top_p_freqs_hz[t] = freqs_band[sel[sel_keep]].astype(np.float64)
-                    peak_top_p_prominences_db[t] = sel_prom[sel_keep].astype(np.float64)
-                    peak_top_p_bandwidths_hz[t] = sel_bw_hz[sel_keep].astype(np.float64)
-                    peak_top_p_heights_db[t] = sel_h[sel_keep].astype(np.float64)
-                    peak_top_p_in_mode_mask[t] = in_any_mode.astype(bool)
-                    peak_top_p_in_primary_mask[t] = in_primary.astype(bool)
 
                 top_m = min(primary_top_m, sel.size)
                 total = float(sel.size)
@@ -720,15 +907,13 @@ class RainFrameClassifierMixin:
             out = np.maximum(out, mode_flux_norm_min)
             return out
 
-        flux_modes_raw = flux_modes.copy()
         flux_modes_proc = flux_modes.copy()
-        flux_modes_winsor_hi = np.nan
 
         if flux_modes_winsor_enable:
             finite_mask = np.isfinite(flux_modes_proc)
             if np.any(finite_mask):
-                flux_modes_winsor_hi = float(np.percentile(flux_modes_proc[finite_mask], flux_modes_winsor_q))
-                flux_modes_proc = np.minimum(flux_modes_proc, flux_modes_winsor_hi)
+                winsor_hi = float(np.percentile(flux_modes_proc[finite_mask], flux_modes_winsor_q))
+                flux_modes_proc = np.minimum(flux_modes_proc, winsor_hi)
 
         # Local flux normalization: convert raw/winsorized mode novelty into an
         # excess-over-baseline score. Using (flux - baseline) in the numerator
@@ -749,8 +934,6 @@ class RainFrameClassifierMixin:
                 score_i = excess_i / (baseline_i + mode_flux_norm_min)
             else:
                 score_i = excess_i.copy()
-            mode_flux_baseline_by_mode[i] = baseline_i
-            mode_flux_excess_by_mode[i] = excess_i
             normalized_mode_flux_by_mode[i] = np.nan_to_num(
                 score_i,
                 nan=0.0,
@@ -758,17 +941,6 @@ class RainFrameClassifierMixin:
                 neginf=0.0,
             )
 
-        # 3) Per-mode fraction of the total mode flux.
-        # This is more stable than dividing by the primary-mode flux, which can
-        # become numerically tiny and create extreme ratios.
-        total_mode_flux = np.maximum(np.sum(mode_flux_by_mode, axis=0), eps)
-        mode_to_primary_ratio = mode_flux_by_mode / total_mode_flux[np.newaxis, :]
-        mode_to_primary_ratio = np.nan_to_num(
-            mode_to_primary_ratio,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
 
 
         # Peak confirmation gate: among the strongest peaks, require at least one
@@ -817,30 +989,27 @@ class RainFrameClassifierMixin:
         frame_class[is_rain] = FrameClass.RAIN
 
 
+        if td_soft_enable and td_soft_debug and ("error" not in td_soft_debug):
+            td_soft_compare = self._build_td_soft_comparison(
+                frame_class=frame_class,
+                is_rain=is_rain,
+                td_soft_debug=td_soft_debug,
+                detector_frame_times=detector_frame_times,
+            )
         # PSD update gating is intentionally not decided here.
         # Downstream suppressor should derive it from FrameClass.
 
         det_debug = {
-            # Inter-frame evidence
+            # Core classifier features
             "flux_primary": flux_primary,
-            "flux_modes": flux_modes_raw,
-            "flux_modes_proc": flux_modes_proc,
-            "flux_modes_winsor_hi": flux_modes_winsor_hi,
-            "mode_flux_baseline": mode_flux_baseline,
-            "mode_flux_excess": mode_flux_excess,
             "mode_flux_score": mode_flux_score,
-            "mode_flux_rain_pass": mode_flux_rain_pass,
-            "mode_flux_by_mode": mode_flux_by_mode,
-            "mode_flux_baseline_by_mode": mode_flux_baseline_by_mode,
-            "mode_flux_excess_by_mode": mode_flux_excess_by_mode,
             "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
-            # Note: kept historical key name for backward compatibility; values
-            # now represent per-mode fraction of total mode flux.
-            "mode_to_primary_ratio": mode_to_primary_ratio,
+
+            # Peak-structure features
+            "peak_count_by_mode": peak_count_by_mode,
             "rain_conf": rain_conf,
-            "primary_flux_sanity": primary_flux_sanity,
-            "primary_sanity": primary_sanity,
             "noise_conf": noise_conf,
+            "is_rain": is_rain,
 
             # Intra-frame peak structure
             "peak_detected_count": peak_detected_count,
@@ -858,19 +1027,18 @@ class RainFrameClassifierMixin:
             "onset_mask": onset_mask,
             "onset_indices": onset_indices,
             "frame_class": frame_class,
-            "frame_class_name": np.array(
-                [FrameClass(v).name.lower() for v in frame_class], dtype=object
-            ),
             "td_soft": td_soft_debug,
+            "td_soft_compare": td_soft_compare,
 
             # Thresholds / detector settings useful during tuning
             "tuning_params": {
+                "operating_band": (op_lo, op_hi),
+                "mode_bands": mode_bands,
+                "primary_mode_idx": primary_mode_idx,
                 "noise_hi": noise_hi,
                 "mode_flux_rain_min": mode_flux_rain_min,
                 "primary_flux_sanity_min": primary_flux_sanity_min,
                 "mode_flux_noise_max": mode_flux_noise_max,
-                "rain_conf_threshold_mapped_from_score": True,
-                "mode_flux_norm_enable": mode_flux_norm_enable,
                 "mode_flux_norm_win_sec": mode_flux_norm_win_sec,
                 "mode_flux_norm_q": mode_flux_norm_q,
                 "mode_flux_norm_min": mode_flux_norm_min,
@@ -879,19 +1047,7 @@ class RainFrameClassifierMixin:
                 "peak_ratio_min": peak_ratio_min,
                 "peak_prominence_db": peak_prominence_db,
                 "peak_min_db_above_floor": peak_min_db_above_floor,
-                "flux_modes_winsor_enable": flux_modes_winsor_enable,
-                "flux_modes_winsor_q": flux_modes_winsor_q,
-                "primary_mode_idx": primary_mode_idx,
-                "mode_ratio_definition": "mode_flux_over_total_mode_flux",
-                "mode_bands": mode_bands,
                 "td_soft_enable": td_soft_enable,
-                "td_soft_time_flux_band": td_soft_time_flux_band,
-                "td_soft_time_flux_score_min": td_soft_time_flux_score_min,
-                "td_soft_crest_factor_min": td_soft_crest_factor_min,
-                "td_soft_kurtosis_min": td_soft_kurtosis_min,
-                "td_soft_min_positive_votes": td_soft_min_positive_votes,
-                "feature_dump_include_peak_payload": include_peak_payload,
-                "feature_dump_include_td_soft": include_td_soft_feature_dump,
             },
         }
 
@@ -900,13 +1056,6 @@ class RainFrameClassifierMixin:
                 "peak_valid_freqs_hz": peak_valid_freqs_hz,
                 "peak_valid_prominences_db": peak_valid_prominences_db,
                 "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
-                "peak_valid_heights_db": peak_valid_heights_db,
-                "peak_top_p_freqs_hz": peak_top_p_freqs_hz,
-                "peak_top_p_prominences_db": peak_top_p_prominences_db,
-                "peak_top_p_bandwidths_hz": peak_top_p_bandwidths_hz,
-                "peak_top_p_heights_db": peak_top_p_heights_db,
-                "peak_top_p_in_mode_mask": peak_top_p_in_mode_mask,
-                "peak_top_p_in_primary_mask": peak_top_p_in_primary_mask,
             })
 
         feature_dump_level = int(self._dget("feature_dump_level", 0))
@@ -914,38 +1063,15 @@ class RainFrameClassifierMixin:
 
         if feature_dump_level > 0:
             feature_dump = {
-                "frame_times": (np.arange(T, dtype=np.float64) * float(self._dget("hop", 128)))
-                / float(self._dget("sample_rate", self._dget("fs", 11162))),
+                "frame_times": detector_frame_times,
                 "frame_class": frame_class,
-                "rain_conf": rain_conf,
-                "noise_conf": noise_conf,
-                "is_rain_raw": is_rain_raw,
-                "onset_mask": onset_mask,
-                "onset_indices": onset_indices,
+                "is_rain": is_rain.astype(np.int8),
                 "flux_primary": flux_primary,
-                "flux_modes_raw": flux_modes_raw,
-                "flux_modes_proc": flux_modes_proc,
-                "flux_modes_winsor_hi": np.asarray([flux_modes_winsor_hi], dtype=np.float64),
-                "mode_flux_baseline": mode_flux_baseline,
-                "mode_flux_excess": mode_flux_excess,
                 "mode_flux_score": mode_flux_score,
-                "mode_flux_rain_pass": mode_flux_rain_pass,
-                "primary_flux_sanity": primary_flux_sanity.astype(np.int8),
-                "primary_sanity": primary_sanity.astype(np.int8),
-                "mode_flux_by_mode": mode_flux_by_mode,
-                "mode_flux_baseline_by_mode": mode_flux_baseline_by_mode,
-                "mode_flux_excess_by_mode": mode_flux_excess_by_mode,
                 "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
-                # Note: kept historical key name for backward compatibility; values
-                # now represent per-mode fraction of total mode flux.
-                "mode_to_primary_ratio": mode_to_primary_ratio,
+                "peak_count_by_mode": peak_count_by_mode,
                 "peak_ratio": peak_ratio,
-                "peak_detected_count": peak_detected_count,
-                "peak_total_count": peak_total_count,
-                "peak_in_mode_count": peak_in_mode_count,
-                "peak_in_primary_count": peak_in_primary_count,
                 "peak_gate_score": peak_gate_score,
-                "peak_gate": peak_gate.astype(np.int8),
             }
 
             if include_peak_payload:
@@ -953,13 +1079,6 @@ class RainFrameClassifierMixin:
                     "peak_valid_freqs_hz": peak_valid_freqs_hz,
                     "peak_valid_prominences_db": peak_valid_prominences_db,
                     "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
-                    "peak_valid_heights_db": peak_valid_heights_db,
-                    "peak_top_p_freqs_hz": peak_top_p_freqs_hz,
-                    "peak_top_p_prominences_db": peak_top_p_prominences_db,
-                    "peak_top_p_bandwidths_hz": peak_top_p_bandwidths_hz,
-                    "peak_top_p_heights_db": peak_top_p_heights_db,
-                    "peak_top_p_in_mode_mask": peak_top_p_in_mode_mask,
-                    "peak_top_p_in_primary_mask": peak_top_p_in_primary_mask,
                 })
 
             if feature_dump_level > 1:
@@ -970,11 +1089,13 @@ class RainFrameClassifierMixin:
                     "primary_ok": primary_ok_dbg,
                     "mode_ok": mode_ok_dbg,
                     "tuning_params": {
+                        "operating_band": (op_lo, op_hi),
+                        "mode_bands": mode_bands,
+                        "primary_mode_idx": primary_mode_idx,
                         "noise_hi": noise_hi,
                         "mode_flux_rain_min": mode_flux_rain_min,
                         "primary_flux_sanity_min": primary_flux_sanity_min,
                         "mode_flux_noise_max": mode_flux_noise_max,
-                        "mode_flux_norm_enable": mode_flux_norm_enable,
                         "mode_flux_norm_win_sec": mode_flux_norm_win_sec,
                         "mode_flux_norm_q": mode_flux_norm_q,
                         "mode_flux_norm_min": mode_flux_norm_min,
@@ -983,157 +1104,8 @@ class RainFrameClassifierMixin:
                         "peak_ratio_min": peak_ratio_min,
                         "peak_prominence_db": peak_prominence_db,
                         "peak_min_db_above_floor": peak_min_db_above_floor,
-                        "flux_modes_winsor_enable": flux_modes_winsor_enable,
-                        "flux_modes_winsor_q": flux_modes_winsor_q,
-                        "primary_mode_idx": primary_mode_idx,
-                        "mode_ratio_definition": "mode_flux_over_total_mode_flux",
-                        "mode_bands": mode_bands,
                         "td_soft_enable": td_soft_enable,
-                        "td_soft_time_flux_band": td_soft_time_flux_band,
-                        "td_soft_time_flux_score_min": td_soft_time_flux_score_min,
-                        "td_soft_crest_factor_min": td_soft_crest_factor_min,
-                        "td_soft_kurtosis_min": td_soft_kurtosis_min,
-                        "td_soft_min_positive_votes": td_soft_min_positive_votes,
-                        "feature_dump_include_peak_payload": include_peak_payload,
-                        "feature_dump_include_td_soft": include_td_soft_feature_dump,
                     },
                 })
 
-                if include_td_soft_feature_dump and td_soft_enable and td_soft_debug:
-                    for k in (
-                        "frame_energy",
-                        "frame_baseline",
-                        "frame_warm_ok",
-                        "frame_flux",
-                        "time_flux_score",
-                        "crest_factor",
-                        "kurtosis",
-                        "vote_count",
-                        "soft_score",
-                        "soft_label",
-                        "frame_times",
-                    ):
-                        if k in td_soft_debug:
-                            feature_dump[f"td_{k}"] = td_soft_debug[k]
-
         return frame_class, rain_conf, det_debug, feature_dump
-
-
-class RainFrameClassifierProcessor(RainFrameClassifierMixin):
-    """
-    Standalone processor wrapper for tuning the rain frame classifier with the
-    audio processing framework.
-
-    This lets the classifier be run independently of SpectralNoiseProcessor
-    while reusing the same detector configuration structure.
-    """
-
-    def __init__(
-        self,
-        name: str = "rain_frame_classifier",
-        config: Optional[Any] = None,
-    ):
-        self.name = name
-        self.cfg = config
-        self._is_setup = config is not None
-
-    def setup(self, params: Dict[str, Any]) -> None:
-        if self._is_setup:
-            return
-
-        # Reuse the stage-1 config builder so detector params are interpreted
-        # exactly the same way as in SpectralNoiseProcessor.
-        from .spectral_noise_processor import build_noise_config
-
-        sr = int(params.get("sample_rate", params.get("fs", 11162)))
-        self.cfg = build_noise_config(sample_rate=sr, params=params)
-        self._is_setup = True
-
-    def process(self, x: np.ndarray, sr: Optional[int] = None) -> Dict[str, Any]:
-        if self.cfg is None:
-            raise RuntimeError(
-                "RainFrameClassifierProcessor is not initialized. Call setup(params) before process(...)."
-            )
-
-        cfg = self.cfg
-        if sr is None:
-            sr = int(getattr(cfg, "fs", 11162))
-
-        x = np.asarray(x, dtype=np.float64).reshape(-1)
-
-        setattr(self.cfg, "last_input_audio", x)
-
-        # Match the spectral front-end used by SpectralNoiseProcessor so tuning
-        # results transfer directly back into the full stage-1 processor.
-        window = getattr(cfg, "window", "hann")
-        S = librosa.stft(
-            x,
-            n_fft=cfg.n_fft,
-            hop_length=cfg.hop,
-            win_length=cfg.n_fft,
-            window=window,
-            center=True,
-        )
-        P = librosa.amplitude_to_db(np.abs(S) + cfg.eps, ref=np.max)
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=cfg.n_fft)
-        times = librosa.frames_to_time(
-            np.arange(P.shape[1]),
-            sr=sr,
-            hop_length=cfg.hop,
-            n_fft=cfg.n_fft,
-        )
-
-        frame_class, rain_conf, det_debug, feature_dump = self._detect_rain_over_time(P, freqs)
-        frame_class = np.asarray(frame_class, dtype=np.int8)
-        is_rain = frame_class == FrameClass.RAIN
-        noise_conf = np.asarray(
-            det_debug.get("noise_conf", np.clip(1.0 - rain_conf, 0.0, 1.0)),
-            dtype=np.float64,
-        )
-
-        feature_dump_level = int(self._dget("feature_dump_level", 0))
-
-        result = {
-            "frame_class": frame_class,
-            "is_rain": is_rain,
-            "rain_conf": rain_conf,
-            "noise_conf": noise_conf,
-        }
-
-        if feature_dump_level > 0:
-            result["feature_dump"] = feature_dump
-
-        debug_level = int(self._dget("debug_level", 2))
-        if debug_level > 0:
-            result["times"] = times
-
-        if debug_level > 1:
-            result.update({
-                "S": S,
-                "x_filt": det_debug.get("td_soft", {}).get("x_bp", x),
-                "debug": det_debug,
-            })
-
-        return result
-
-    def run(self, audio: np.ndarray, params: Dict[str, Any]):
-        """
-        Framework-compatible wrapper.
-
-        The audio_processing_framework expects each processor to expose:
-            run(audio, params) -> (results_dict, state_dict)
-        """
-        self.setup(params)
-
-        sr = int(params.get("sample_rate", params.get("fs", 11162)))
-        results = self.process(audio, sr=sr)
-
-        feature_dump_level = int(params.get("feature_dump_level", 0))
-        state = {
-            "frame_class": results.get("frame_class"),
-            "is_rain": results.get("is_rain"),
-            "rain_conf": results.get("rain_conf"),
-            "noise_conf": results.get("noise_conf"),
-            "debug": results.get("debug"),
-        }
-        return results, state
