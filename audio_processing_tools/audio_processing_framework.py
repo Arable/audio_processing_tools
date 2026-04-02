@@ -16,11 +16,13 @@ injected via the get_keys_fn and get_input_data_fn parameters.
 """
 
 import gc
+from pathlib import Path
 from typing import (
     Any,
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Protocol,
     Tuple,
@@ -132,6 +134,204 @@ def _flatten_with_namespace(ns: str, d: Dict[str, Any]) -> Dict[str, Any]:
     return {f"{ns}__{k}": v for k, v in d.items()}
 
 
+
+# ----------------------------------------------------------------------
+# Parquet batch helpers
+# ----------------------------------------------------------------------
+
+def _write_parquet_chunk(rows: List[Dict[str, Any]], path: Path, sort_by_file_key: bool = True) -> None:
+    """
+    Write a list of dict rows to a parquet file if non-empty.
+    """
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows)
+    if sort_by_file_key and not df.empty and "file_key" in df.columns:
+        df = df.sort_values("file_key").reset_index(drop=True)
+    df.to_parquet(path, index=False)
+
+
+# ----------------------------------------------------------------------
+# Parquet compatibility helpers for nested numpy payloads in state dicts
+# ----------------------------------------------------------------------
+
+def _to_parquet_compatible_value(value: Any) -> Any:
+    """
+    Convert nested numpy-heavy values into parquet-friendly Python objects.
+
+    Rules
+    -----
+    - np.ndarray -> list (recursively via tolist)
+    - np scalar  -> Python scalar via .item()
+    - dict       -> dict with converted values
+    - list/tuple -> list with converted values
+    - other      -> unchanged
+    """
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {k: _to_parquet_compatible_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_parquet_compatible_value(v) for v in value]
+    return value
+
+
+
+def _make_state_rows_parquet_safe(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert state rows into parquet-safe dict rows.
+
+    Special handling:
+    - If a row has a `features` dict containing `normalized_mode_flux_by_mode`
+      with shape (n_modes, n_frames), expand it into separate top-level columns:
+      `normalized_mode_flux_by_mode_0`, `..._1`, etc.
+    - Keep the remaining `features` payload, but convert nested numpy objects to
+      plain Python lists/scalars.
+
+    The in-memory state rows are not modified; a transformed copy is returned
+    for parquet writing only.
+    """
+    safe_rows: List[Dict[str, Any]] = []
+
+    for row in rows:
+        safe_row = dict(row)
+
+        # Convert existing top-level numpy/list-like values first.
+        for key, value in list(safe_row.items()):
+            if key == "features":
+                continue
+            safe_row[key] = _to_parquet_compatible_value(value)
+
+        features = safe_row.get("features")
+        if isinstance(features, Mapping):
+            features_copy = dict(features)
+            nmfbm = features_copy.pop("normalized_mode_flux_by_mode", None)
+
+            if nmfbm is not None:
+                nmfbm_arr = np.asarray(nmfbm)
+                if nmfbm_arr.ndim != 2:
+                    raise ValueError(
+                        "features['normalized_mode_flux_by_mode'] must be a 2-D array "
+                        f"when present; got shape {nmfbm_arr.shape}"
+                    )
+                for mode_idx in range(nmfbm_arr.shape[0]):
+                    safe_row[f"normalized_mode_flux_by_mode_{mode_idx}"] = nmfbm_arr[mode_idx].tolist()
+
+            safe_row["features"] = _to_parquet_compatible_value(features_copy)
+        else:
+            safe_row["features"] = _to_parquet_compatible_value(features)
+
+        safe_rows.append(safe_row)
+
+    return safe_rows
+
+
+def _flush_saved_batches(
+    *,
+    results_rows: List[Dict[str, Any]],
+    states_by_processor: Dict[str, List[Dict[str, Any]]],
+    save_dir: Path,
+    save_prefix: str,
+    flush_idx: int,
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Flush accumulated results/state rows to parquet and return saved paths.
+
+    State rows are converted to parquet-safe objects on write so that nested
+    NumPy payloads (including 2-D `normalized_mode_flux_by_mode` inside the
+    `features` dict) do not break parquet serialization.
+    """
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_result_paths: List[str] = []
+    saved_state_paths: Dict[str, List[str]] = {name: [] for name in states_by_processor}
+
+    if results_rows:
+        results_path = save_dir / f"{save_prefix}__results_part_{flush_idx:05d}.parquet"
+        _write_parquet_chunk(results_rows, results_path)
+        saved_result_paths.append(str(results_path))
+
+    for name, rows in states_by_processor.items():
+        if not rows:
+            continue
+        state_path = save_dir / f"{save_prefix}__state__{name}_part_{flush_idx:05d}.parquet"
+        parquet_safe_rows = _make_state_rows_parquet_safe(rows)
+        _write_parquet_chunk(parquet_safe_rows, state_path)
+        saved_state_paths[name].append(str(state_path))
+
+
+    return saved_result_paths, saved_state_paths
+
+
+# ----------------------------------------------------------------------
+# Helper for restoring state DataFrame from parquet
+# ----------------------------------------------------------------------
+
+def restore_state_df_from_parquet(path: str | Path) -> pd.DataFrame:
+    """
+    Restore a single saved state parquet file into the in-memory state schema.
+
+    This reverses the parquet-write compatibility transform applied by
+    `_make_state_rows_parquet_safe()` for the special
+    `features['normalized_mode_flux_by_mode']` payload. If the parquet file
+    contains top-level columns named `normalized_mode_flux_by_mode_<i>`, those
+    columns are reassembled into a 2-D NumPy array and inserted back into the
+    per-row `features` dict under the key `normalized_mode_flux_by_mode`.
+
+    Parameters
+    ----------
+    path :
+        Path to a single parquet file previously written by
+        `_flush_saved_batches()` for processor state rows.
+
+    Returns
+    -------
+    pd.DataFrame
+        Restored DataFrame matching the in-memory state schema as closely as
+        possible for a single parquet chunk.
+    """
+    df = pd.read_parquet(path).copy()
+
+    nmf_cols = sorted(
+        [
+            col
+            for col in df.columns
+            if col.startswith("normalized_mode_flux_by_mode_")
+        ],
+        key=lambda c: int(c.rsplit("_", 1)[1]),
+    )
+
+    if not nmf_cols:
+        return df
+
+    restored_features: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        feat = dict(row["features"]) if isinstance(row.get("features"), dict) else {}
+
+        parts = []
+        valid = True
+        for col in nmf_cols:
+            v = row[col]
+            if v is None:
+                valid = False
+                break
+            parts.append(np.asarray(v))
+
+        if valid:
+            feat["normalized_mode_flux_by_mode"] = np.stack(parts, axis=0)
+
+        restored_features.append(feat)
+
+    df["features"] = restored_features
+    df = df.drop(columns=nmf_cols)
+
+    return df
+
+
 # ----------------------------------------------------------------------
 # Orchestrator
 # ----------------------------------------------------------------------
@@ -149,6 +349,9 @@ def process_audio_batches_v2(
     adse_engine=None,
     batch_size: int = 1000,
     max_files: Optional[int] = None,
+    max_batch_save: int = 10_000,
+    batch_save_dir: Optional[str] = "./save_dir",
+    batch_save_prefix: str = "audio_processing_dump",
     local_cache: Optional[str] = None,
     localStatus: bool = True,
     get_keys_fn: Optional[
@@ -207,6 +410,17 @@ def process_audio_batches_v2(
     get_input_data_fn :
         Optional audio-loading function. If None, uses audio_io.get_input_data.
 
+    max_batch_save :
+        Maximum number of accumulated result rows to keep in memory before
+        flushing both results and per-processor states to parquet files.
+        Set to 0 or a negative value to disable periodic flushing.
+    batch_save_dir :
+        Directory where parquet chunks will be written when in-memory rows
+        exceed `max_batch_save`. Defaults to "./save_dir". Set to None to
+        disable periodic flushing.
+    batch_save_prefix :
+        File prefix used for saved parquet chunks.
+
     Returns
     -------
     results_df :
@@ -216,15 +430,30 @@ def process_audio_batches_v2(
             - namespaced metrics "<processor>__<metric>" for each processor.
             - optional "rain__predicted" and "rain__mismatch" if a "rain"
               processor is present and debug options are enabled.
+        When periodic flushing is enabled, intermediate chunks are written to
+        parquet during processing, and the final in-memory remainder is both
+        flushed to parquet and returned in these DataFrames.
+        Saved parquet paths are attached via DataFrame `.attrs`.
     states_df_by_proc :
         Mapping from processor name to a DataFrame of internal state for that
         processor. Each row corresponds to one input file and includes "file_key"
         plus whatever keys the processor returned in its state dict.
+        When periodic flushing is enabled, intermediate chunks are written to
+        parquet during processing, and the final in-memory remainder is both
+        flushed to parquet and returned in these DataFrames.
+        Saved parquet paths are attached via DataFrame `.attrs`.
     """
     if params_by_processor is None:
         params_by_processor = {}
     if debug_params is None:
         debug_params = {}
+
+    if max_batch_save is None:
+        max_batch_save = 10_000
+    if batch_save_dir is not None and max_batch_save <= 0:
+        raise ValueError("max_batch_save must be > 0 when batch_save_dir is provided")
+
+    save_dir_path = Path(batch_save_dir) if batch_save_dir is not None else None
 
     # Require basic global parameters
     if "sample_rate" not in params_global or "check_duration" not in params_global:
@@ -264,6 +493,9 @@ def process_audio_batches_v2(
 
     results_rows: List[Dict[str, Any]] = []
     states_by_processor: Dict[str, List[Dict[str, Any]]] = {p.name: [] for p in processors}
+    saved_result_paths: List[str] = []
+    saved_state_paths: Dict[str, List[str]] = {p.name: [] for p in processors}
+    flush_idx = 0
 
     print_mismatched = bool(debug_params.get("print_mismatched", False))
     debug_all = bool(debug_params.get("debug_all", False))
@@ -369,9 +601,44 @@ def process_audio_batches_v2(
 
             results_rows.append(row)
 
+        # Flush accumulated rows once they exceed the configured in-memory threshold.
+        if save_dir_path is not None and max_batch_save > 0 and len(results_rows) >= max_batch_save:
+            flush_idx += 1
+            chunk_result_paths, chunk_state_paths = _flush_saved_batches(
+                results_rows=results_rows,
+                states_by_processor=states_by_processor,
+                save_dir=save_dir_path,
+                save_prefix=batch_save_prefix,
+                flush_idx=flush_idx,
+            )
+            saved_result_paths.extend(chunk_result_paths)
+            for name, paths in chunk_state_paths.items():
+                saved_state_paths[name].extend(paths)
+
+            results_rows.clear()
+            for rows in states_by_processor.values():
+                rows.clear()
+            gc.collect()
+
         # Free per-batch data to keep memory bounded
         del dir_content
         gc.collect()
+
+    # Final flush: persist the last in-memory remainder as parquet as well,
+    # while still returning it to the caller for backward compatibility.
+    has_pending_state = any(rows for rows in states_by_processor.values())
+    if save_dir_path is not None and (results_rows or has_pending_state):
+        flush_idx += 1
+        chunk_result_paths, chunk_state_paths = _flush_saved_batches(
+            results_rows=results_rows,
+            states_by_processor=states_by_processor,
+            save_dir=save_dir_path,
+            save_prefix=batch_save_prefix,
+            flush_idx=flush_idx,
+        )
+        saved_result_paths.extend(chunk_result_paths)
+        for name, paths in chunk_state_paths.items():
+            saved_state_paths[name].extend(paths)
 
     # ------------------------------------------------------------------
     # 3) Collate results into DataFrames
@@ -379,6 +646,7 @@ def process_audio_batches_v2(
     results_df = pd.DataFrame(results_rows)
     if not results_df.empty:
         results_df = results_df.sort_values("file_key").reset_index(drop=True)
+    results_df.attrs["saved_parquet_files"] = saved_result_paths
 
     states_df_by_proc: Dict[str, pd.DataFrame] = {}
     for name, rows in states_by_processor.items():
@@ -387,6 +655,7 @@ def process_audio_batches_v2(
             df = df.sort_values("file_key").reset_index(drop=True)
         else:
             df = pd.DataFrame()
+        df.attrs["saved_parquet_files"] = saved_state_paths.get(name, [])
         states_df_by_proc[name] = df
 
     return results_df, states_df_by_proc

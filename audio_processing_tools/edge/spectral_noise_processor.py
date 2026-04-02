@@ -5,6 +5,7 @@
 from dataclasses import dataclass, fields, field
 
 from typing import Any, Dict, Optional, Tuple
+import json
 
 import numpy as np
 import scipy.signal as spsig
@@ -60,11 +61,9 @@ class NoiseProcessorConfig:
     # -----------------------------------------------------------
     # Noise tracking (quantile/min-stats)
     # -----------------------------------------------------------
-    q: float = 0.25        # quantile level. 0.4 as default
-    win_sec: float = 0.5 # rolling window size (seconds). 1.0 as default
+    q: float = 0.25        # target low-quantile level for causal stochastic baseline tracking
+    win_sec: float = 0.5   # effective adaptation horizon (seconds) for the stochastic tracker
 
-    # Smoothing for PSD evolution
-    ema_feedback: float = 0.80  # fallback if ema_up/ema_down not provided
 
     median_frames: int = 0  # optional median filter over time; 0 disables
 
@@ -99,8 +98,6 @@ class NoiseProcessorConfig:
     # Optional frequency-domain smoothing of gain (helps reduce musical noise)
     gain_freq_smooth_enable: bool = True
     gain_freq_kernel: Tuple[float, ...] = (0.2, 0.6, 0.2)
-    # Noise PSD estimation mode
-    noise_psd_mode: str = "fft"
 
     # New / refined PSD tracking params
     pre_smooth_frames: int = 0      # try 3–5, 0 disables
@@ -159,6 +156,14 @@ class NoiseProcessorConfig:
     # both soft-label / detector outputs and frequency-domain tuning features.
     dump_features: bool = False
     feature_decim: int = 1  # keep every Nth frame in exported features; 1 = all
+
+    # -----------------------------------------------------------
+    # Runtime / performance
+    # -----------------------------------------------------------
+    # Use float32 by default to better match CM7/single-precision behavior.
+    process_dtype: str = "float32"   # "float32" | "float64"
+    # Only reconstruct time-domain output audio when explicitly requested.
+    compute_output_audio: bool = False
 
     # -----------------------------------------------------------
     # Nested detector configuration (framework-friendly)
@@ -311,12 +316,44 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         if not (0.0 <= float(cfg.gain_smooth_alpha) <= 1.0):
             raise ValueError(f"Invalid gain_smooth_alpha: {cfg.gain_smooth_alpha}")
 
+    def _work_dtype(self):
+        cfg = self.cfg
+        dt = str(getattr(cfg, "process_dtype", "float32")).lower()
+        return np.float32 if dt == "float32" else np.float64
+    def _detector_param(self, name: str, default: Any = None) -> Any:
+        """Resolve detector params using the same precedence as RainFrameClassifierMixin."""
+        return self._dget(name, default)
+
+    def _detector_flag(self, name: str, default: bool = False) -> bool:
+        """Bool helper for detector params resolved via cfg.detector -> cfg attr -> default."""
+        return bool(self._detector_param(name, default))
+
+    def _build_prefilter_sos(self, sr: int, mode: str):
+        cfg = self.cfg
+        nyq = 0.5 * sr
+
+        if mode == "bandpass":
+            op_lo, op_hi = cfg.operating_band
+            lo = float(op_lo)
+            hi = float(op_hi)
+            lo = np.clip(lo, 1e-3, nyq * 0.999)
+            hi = np.clip(hi, lo + 1e-3, nyq * 0.999)
+            wn = [lo / nyq, hi / nyq]
+            return spsig.butter(int(getattr(cfg, "bp_order", cfg.hp_order)), wn, btype="bandpass", output="sos")
+
+        if mode == "highpass" and cfg.hp_cutoff_hz > 0:
+            norm_cut = np.clip(cfg.hp_cutoff_hz / nyq, 1e-4, 0.9999)
+            return spsig.butter(cfg.hp_order, norm_cut, btype="highpass", output="sos")
+
+        return None
+
     def _time_smooth(self, X: np.ndarray, L: int) -> np.ndarray:
         if L <= 1:
             return X
+        dtype = self._work_dtype()
         B, T = X.shape
-        Y = np.empty_like(X, dtype=np.float64)
-        csum = np.cumsum(X, axis=1, dtype=np.float64)
+        Y = np.empty_like(X, dtype=dtype)
+        csum = np.cumsum(X, axis=1, dtype=dtype)
         for t in range(T):
             t0 = max(0, t - L + 1)
             if t0 == 0:
@@ -346,6 +383,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         """
         cfg = self.cfg
         eps = cfg.eps
+        dtype = self._work_dtype()
 
         K, T = P_band.shape
         assert N_band.shape == (K, T)
@@ -363,21 +401,21 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
             # Optional: spectral SNR gating (frame-level). High SNR => reduce oversubtraction.
             if snr_gate is not None:
-                sg = np.asarray(snr_gate, dtype=np.float64).reshape(-1)
+                sg = np.asarray(snr_gate, dtype=dtype).reshape(-1)
                 if sg.shape[0] == T:
                     sg = np.clip(sg, 0.0, 1.0)
                     oversub = oversub * (1.0 - sg)
         else:
             # Debug mode for isolating PSD-driven modulation:
             # use a time-uniform oversubtraction independent of frame class / confidence.
-            eff_noise = np.zeros(T, dtype=np.float64)
-            oversub = np.full(T, float(cfg.oversub_base), dtype=np.float64)
+            eff_noise = np.zeros(T, dtype=dtype)
+            oversub = np.full(T, float(cfg.oversub_base), dtype=dtype)
 
         if debug_out is not None:
             debug_out["th"] = float(th)
             debug_out["adaptive_gain_enable"] = adaptive_gain_enable
-            debug_out["eff_noise_t"] = eff_noise.astype(np.float64, copy=False)
-            debug_out["oversub_t"] = np.asarray(oversub, dtype=np.float64)
+            debug_out["eff_noise_t"] = eff_noise.astype(dtype, copy=False)
+            debug_out["oversub_t"] = np.asarray(oversub, dtype=dtype)
 
         oversub_2d = oversub[None, :]  # (1, T) → broadcast to (K, T)
 
@@ -411,9 +449,9 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         gain_freq_smooth_enable = bool(getattr(cfg, "gain_freq_smooth_enable", True))
         kernel_cfg = getattr(cfg, "gain_freq_kernel", (0.2, 0.6, 0.2))
-        kernel = np.asarray(kernel_cfg, dtype=np.float64).reshape(-1)
+        kernel = np.asarray(kernel_cfg, dtype=dtype).reshape(-1)
         if kernel.size < 1:
-            kernel = np.array([1.0], dtype=np.float64)
+            kernel = np.array([1.0], dtype=dtype)
         kernel = kernel / (kernel.sum() + 1e-12)
 
         G_freq = np.empty_like(G_raw)
@@ -462,7 +500,8 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         return G_time
     def _mode_union_mask(self, freqs_band: np.ndarray, mode_bands: Any) -> np.ndarray:
         """Return boolean mask over `freqs_band` selecting the union of mode bands."""
-        fb = np.asarray(freqs_band, dtype=np.float64).reshape(-1)
+        dtype = self._work_dtype()
+        fb = np.asarray(freqs_band, dtype=dtype).reshape(-1)
         mask = np.zeros(fb.shape[0], dtype=bool)
         if not isinstance(mode_bands, (list, tuple)):
             return mask
@@ -491,6 +530,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         """
         cfg = self.cfg
         eps = cfg.eps
+        dtype = self._work_dtype()
 
         K, T = P_band.shape
         assert N_band.shape == (K, T)
@@ -512,7 +552,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         G_raw = np.clip(G_raw, cfg.gain_floor, cfg.gain_ceil)
 
         # -------- frequency smoothing --------
-        kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
+        kernel = np.array([0.25, 0.5, 0.25], dtype=dtype)
         G_freq = np.empty_like(G_raw)
         for t in range(T):
             G_freq[:, t] = np.convolve(G_raw[:, t], kernel, mode="same")
@@ -557,35 +597,53 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         if L and L > 1:
             P_band_all = self._time_smooth(P_band_all, L)
 
-        # Ring buffer of noise-only frames for quantile stats
-        buffer = np.full((W, K), np.nan, dtype=np.float64)
-        buf_idx = 0
-        buf_count = 0
+        dtype = self._work_dtype()
+        noise_psd = np.zeros_like(P, dtype=dtype)
 
-        noise_psd = np.zeros_like(P, dtype=np.float64)
+        # Causal stochastic low-quantile tracker.
+        # q controls the target lower quantile; win_sec sets the effective adaptation horizon.
+        # This replaces the much more expensive rolling-buffer quantile computation.
+        eta = float(2.0 / max(W + 1, 2))
+        eta = float(np.clip(eta, 1e-4, 1.0))
+        scale_alpha = float(cfg.ema_down)
+        step_floor = float(max(cfg.eps, 1e-9))
 
-        ema_up = float(getattr(cfg, "ema_up", cfg.ema_feedback))
-        ema_down = float(getattr(cfg, "ema_down", cfg.ema_feedback))
+        tracker = np.maximum(P_band_all[:, 0].astype(dtype, copy=True), 0.0)
+        tracker_scale = np.maximum(np.abs(P_band_all[:, 0]).astype(dtype, copy=True), step_floor)
+        warmup_count = 0
+        ema_up = float(cfg.ema_up)
+        ema_down = float(cfg.ema_down)
 
         for t in range(T):
             P_band = P_band_all[:, t]
 
-            # Warmup protection: until buffer is reasonably filled, keep learning from *all* frames.
-            # Otherwise, early "rain" decisions can prevent any buffer fill → buf_count stays 0 → PSD diverges.
-            warmup_need = max(10, W // 2)  # fill at least half the window (tunable)
-            if buf_count < warmup_need or (not is_rain[t]):
-                buffer[buf_idx] = P_band
-                buf_idx = (buf_idx + 1) % W
-                buf_count = min(buf_count + 1, W)
+            # Warmup protection: during the initial phase keep adapting from all frames.
+            warmup_need = max(10, W // 2)
+            allow_update = (warmup_count < warmup_need) or (not is_rain[t])
 
-            # Robust min-stats via quantile over buffer
-            if buf_count == 0:
-                raw_q = P_band
+            if t == 0:
+                raw_q = tracker
+                if allow_update:
+                    warmup_count += 1
             else:
-                valid = buffer[:buf_count]
-                raw_q = np.nanquantile(valid, cfg.q, axis=0)
+                err = P_band - tracker
+                tracker_scale = scale_alpha * tracker_scale + (1.0 - scale_alpha) * np.abs(err)
+                step = eta * np.maximum(tracker_scale, step_floor)
 
-            # EMA with asymmetric rates (fast-up / slow-down)
+                # Stochastic low-quantile update:
+                #  - above baseline: move up slowly by q * step
+                #  - below baseline: move down by (1-q) * step
+                delta = np.where(P_band >= tracker, cfg.q * step, -(1.0 - cfg.q) * step)
+                candidate = tracker + delta
+                candidate = np.maximum(candidate, 0.0)
+
+                if allow_update:
+                    tracker = candidate
+                    warmup_count += 1
+
+                raw_q = tracker
+
+            # Optional asymmetric EMA smoothing on top of the stochastic baseline.
             if t == 0:
                 N_band = raw_q
             else:
@@ -600,7 +658,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             N_band = np.minimum(N_band, maxr * P_band_all[:, t])
             noise_psd[band_mask, t] = np.maximum(N_band, 0.0)
 
-        # Optional median smoothing over time (per frequency)
+        # Optional median smoothing over time (per frequency) after stochastic tracking
         m = int(getattr(cfg, "median_frames", 0))
         if m and m > 1:
             if m % 2 == 0:
@@ -645,12 +703,13 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         The payload is intentionally separate from `debug` so training / plotting
         code can consume a stable structure without carrying all suppressor state.
         """
+        dtype = self._work_dtype()
         features: Dict[str, Any] = {
-            "frame_times": self._decimate_feature_value(np.asarray(times_s, dtype=np.float64), step),
+            "frame_times": self._decimate_feature_value(np.asarray(times_s, dtype=dtype), step),
             "frame_class": self._decimate_feature_value(np.asarray(frame_class), step),
             "is_rain": self._decimate_feature_value(np.asarray(is_rain), step),
-            "rain_conf": self._decimate_feature_value(np.asarray(rain_conf, dtype=np.float64), step),
-            "noise_conf": self._decimate_feature_value(np.asarray(noise_conf, dtype=np.float64), step),
+            "rain_conf": self._decimate_feature_value(np.asarray(rain_conf, dtype=dtype), step),
+            "noise_conf": self._decimate_feature_value(np.asarray(noise_conf, dtype=dtype), step),
         }
 
         if not isinstance(det_debug, dict):
@@ -663,56 +722,11 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 features[k] = self._decimate_feature_value(v, step)
             return features
 
-        # Otherwise export a compact curated subset of detector outputs.
-        keep_keys = [
-            # Current soft-labeller / detector decision streams
-            "frame_class_name",
-            "rain_score_raw",
-            "is_rain_raw",
-            "onset_mask",
-            "onset_indices",
-            "primary_flux_sanity",
-            "primary_sanity",
-            "peak_gate",
-            "peak_gate_score",
-            "mode_flux_rain_pass",
-            "mode_flux_score",
-            "flux_primary",
-            "flux_modes",
-            "flux_modes_proc",
-            "mode_flux_baseline",
-            "mode_flux_excess",
-            "weak_mode_flux",
-            # Time-domain soft-labeller features
-            "td_soft_label",
-            "td_time_flux_score",
-            "td_crest_factor",
-            "td_kurtosis",
-            "td_vote_count",
-            "td_soft_score",
-            # Frequency-domain tuning features
-            "mode_flux_by_mode",
-            "normalized_mode_flux_by_mode",
-            "mode_to_primary_ratio",
-            "peak_ratio",
-            "peak_detected_count",
-            "peak_total_count",
-            "peak_in_mode_count",
-            "peak_in_primary_count",
-            "peak_top_p_freqs_hz",
-            "peak_top_p_prominences_db",
-            "peak_top_p_bandwidths_hz",
-            "peak_top_p_heights_db",
-            "peak_top_p_in_mode_mask",
-            "peak_top_p_in_primary_mask",
-            "peak_valid_freqs_hz",
-            "peak_valid_prominences_db",
-            "peak_valid_bandwidths_hz",
-            "peak_valid_heights_db",
-        ]
-        for k in keep_keys:
-            if k in det_debug:
-                features[k] = self._decimate_feature_value(det_debug[k], step)
+        # Otherwise pass through whatever the detector exported, decimating where possible.
+        for k, v in det_debug.items():
+            if k == "feature_dump":
+                continue
+            features[k] = self._decimate_feature_value(v, step)
 
         return features
 
@@ -731,11 +745,11 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         if sr is None:
             sr = cfg.fs
 
-        # Ensure x is float64 and 1-D
-        x = np.asarray(x, dtype=np.float64).reshape(-1)
-        # Needed by RainFrameClassifierMixin for optional time-domain soft labeller
-        # comparison during classifier tuning.
-        setattr(self.cfg, "last_input_audio", x)
+        work_dtype = self._work_dtype()
+        compute_output_audio = bool(getattr(cfg, "compute_output_audio", False))
+
+        # Ensure x is configured precision and 1-D
+        x = np.asarray(x, dtype=work_dtype).reshape(-1)
         x_proc = x
         mode = str(getattr(cfg, "pre_filter_mode", "highpass")).lower()
 
@@ -743,27 +757,9 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             mode = "highpass"
 
         if mode != "none":
-            nyq = 0.5 * sr
-
-            if mode == "bandpass":
-                op_lo, op_hi = cfg.operating_band
-                lo = float(op_lo)
-                hi = float(op_hi)
-
-                # Clamp to valid digital band limits
-                lo = np.clip(lo, 1e-3, nyq * 0.999)
-                hi = np.clip(hi, lo + 1e-3, nyq * 0.999)
-
-                wn = [lo / nyq, hi / nyq]
-                sos = spsig.butter(int(getattr(cfg, "bp_order", cfg.hp_order)), wn, btype="bandpass", output="sos")
-                x_proc = spsig.sosfiltfilt(sos, x_proc)
-
-            else:
-                # highpass
-                if cfg.hp_cutoff_hz > 0:
-                    norm_cut = np.clip(cfg.hp_cutoff_hz / nyq, 1e-4, 0.9999)
-                    sos = spsig.butter(cfg.hp_order, norm_cut, btype="highpass", output="sos")
-                    x_proc = spsig.sosfiltfilt(sos, x_proc)
+            sos = self._build_prefilter_sos(sr, mode)
+            if sos is not None:
+                x_proc = spsig.sosfiltfilt(sos, x_proc).astype(work_dtype, copy=False)
 
         # 1) STFT
         S = librosa.stft(
@@ -774,9 +770,9 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             window="hann",
             center=True,
         )
-        P = np.abs(S) ** 2
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=cfg.n_fft)
-        times = librosa.frames_to_time(np.arange(P.shape[1]), sr=sr, hop_length=cfg.hop)
+        P = (np.abs(S).astype(work_dtype, copy=False)) ** 2
+        freqs = np.asarray(librosa.fft_frequencies(sr=sr, n_fft=cfg.n_fft), dtype=work_dtype)
+        times = np.asarray(librosa.frames_to_time(np.arange(P.shape[1]), sr=sr, hop_length=cfg.hop), dtype=work_dtype)
 
         F, T = P.shape
 
@@ -786,8 +782,8 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         classifier_only_mode = bool(getattr(cfg, "classifier_only_mode", False))
 
         # 2) Frame classification (optionally using lagged/bootstrapped noise PSD)
-        bypass_classifier = bool(getattr(cfg, "detector", {}).get("bypass_classifier", False))
-        detector_use_noise_norm = bool(getattr(cfg, "detector_use_noise_norm", True))
+        bypass_classifier = self._detector_flag("bypass_classifier", False)
+        detector_use_noise_norm = self._detector_flag("detector_use_noise_norm", True)
         detector_noise_norm_mode = str(getattr(cfg, "detector_noise_norm_mode", "log_sub")).lower()
 
         bootstrap_noise_psd = None
@@ -796,11 +792,11 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         if bypass_classifier:
             # Treat all frames as noise so we can inspect suppressor behavior.
             frame_class = np.full(T, FrameClass.NOISE, dtype=np.int8)
-            rain_conf = np.zeros(T, dtype=np.float64)
+            rain_conf = np.zeros(T, dtype=work_dtype)
             det_debug = {
                 "frame_class": frame_class,
                 "frame_class_name": np.array(["noise"] * T, dtype=object),
-                "rain_score_raw": np.zeros(T, dtype=np.float64),
+                "rain_score_raw": np.zeros(T, dtype=work_dtype),
                 "is_rain_raw": np.zeros(T, dtype=bool),
                 "onset_mask": np.zeros(T, dtype=bool),
                 "onset_indices": np.zeros(0, dtype=np.int32),
@@ -815,8 +811,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 # This gives a lagged baseline for the detector without creating a circular dependency
                 # with the final classifier-gated PSD estimate.
                 bootstrap_is_rain_for_psd = np.zeros(T, dtype=bool)
-                if cfg.noise_psd_mode != "fft":
-                    raise ValueError(f"Unknown PSD mode: {cfg.noise_psd_mode}")
                 bootstrap_noise_psd = self._estimate_noise_psd_fft(
                     P,
                     freqs,
@@ -846,7 +840,8 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             frame_class, rain_conf, det_debug, feature_dump = self._detect_rain_over_time(
                 P_for_detection,
                 freqs,
-                detector_frame_times=np.asarray(times, dtype=np.float64),
+                detector_frame_times=np.asarray(times, dtype=work_dtype),
+                input_audio=x,
             )
             if isinstance(det_debug, dict) and isinstance(feature_dump, dict):
                 det_debug["feature_dump"] = feature_dump
@@ -856,11 +851,11 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         is_noise = frame_class == FrameClass.NOISE
         noise_conf = np.asarray(
             det_debug.get("noise_conf", np.clip(1.0 - rain_conf, 0.0, 1.0)),
-            dtype=np.float64,
+            dtype=work_dtype,
         )
 
         # Ensure we have a time axis in seconds for tuning/plots
-        times_s = np.asarray(times, dtype=np.float64)
+        times_s = np.asarray(times, dtype=work_dtype)
 
         # If the detector provides FrameFeatures, optionally decimate to reduce payload
         if isinstance(det_debug, dict) and "frame_features" in det_debug:
@@ -900,7 +895,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             debug = None
             if keep_debug:
                 debug = {
-                    "detector": det_debug,
                     "detector_params": dict(getattr(cfg, "detector", {}) or {}),
                     "suppressor_params": dict(getattr(cfg, "suppressor", {}) or {}),
                     "times_s": times_s,
@@ -908,13 +902,11 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                     "bootstrap_noise_psd": bootstrap_noise_psd,
                     "detector_noise_psd_lag": detector_noise_psd_lag,
                     "detector_use_noise_norm": detector_use_noise_norm,
+                    "td_soft_enable": self._detector_flag("td_soft_enable", False),
+                    "bypass_classifier": bypass_classifier,
                     "detector_noise_norm_mode": detector_noise_norm_mode,
                     "disable_suppression": disable_suppression,
                     "classifier_only_mode": True,
-                    "rain_conf": rain_conf,
-                    "noise_conf": noise_conf,
-                    "is_rain": is_rain,
-                    "is_noise": is_noise,
                     "operating_band": (float(op_lo), float(op_hi)),
                     "band_mask": band_mask,
                     "pre_filter_mode": mode,
@@ -923,24 +915,26 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 }
 
             result = {
-                "y": x_proc if keep_filtered_audio else None,
-                "y_suppressed": None,
-                "S": S if keep_spectra else None,
-                "S_hat": S if keep_spectra else None,
-                "noise_psd": np.zeros_like(P, dtype=np.float64) if keep_noise_psd else None,
                 "frame_class": frame_class,
-                "is_rain": is_rain,
                 "rain_conf": rain_conf,
                 "noise_conf": noise_conf,
-                "freqs": freqs,
                 "times": times,
-                "det_debug": det_debug if keep_detector_debug else None,
-                "debug": debug,
-                "x_filt": x_proc if keep_filtered_audio else None,
-                "use_for_noise_psd": np.zeros_like(is_rain, dtype=bool),
-                "features": features,
-                "classifier_only_mode": True,
+                "freqs": freqs,
             }
+            if features is not None:
+                result["features"] = features
+            if keep_detector_debug:
+                result["det_debug"] = det_debug
+            if debug is not None:
+                result["debug"] = debug
+            if keep_filtered_audio:
+                result["x_filt"] = x_proc
+                result["y"] = x_proc
+            if keep_spectra:
+                result["S"] = S
+                result["S_hat"] = S
+            if keep_noise_psd:
+                result["noise_psd"] = np.zeros_like(P, dtype=work_dtype)
 
             return result
 
@@ -960,19 +954,17 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         gain_dbg: Dict[str, Any] = {}
 
         if disable_suppression:
-            noise_psd = np.zeros_like(P, dtype=np.float64)
+            noise_psd = np.zeros_like(P, dtype=work_dtype)
             N_band_all = noise_psd[band_mask]
             N_band_eff = N_band_all
-            ratio_med_t = np.zeros(T, dtype=np.float64)
+            ratio_med_t = np.zeros(T, dtype=work_dtype)
             G = np.ones_like(P)
             G_band = np.ones_like(P_band_all)
             S_hat = S.copy()
-            y_hat = x_proc.copy()
-            y_out = x_proc.copy()
+            y_hat = x_proc.copy() if compute_output_audio else None
+            y_out = x_proc.copy() if compute_output_audio else None
             gain_dbg["suppression_disabled"] = True
         else:
-            if cfg.noise_psd_mode != "fft":
-                raise ValueError(f"Unknown PSD mode: {cfg.noise_psd_mode}")
             noise_psd = self._estimate_noise_psd_fft(P, freqs, is_rain_for_psd, sr=sr)
             mel_filter = None
 
@@ -1060,18 +1052,21 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
             # 5) Apply gain & ISTFT
             S_hat = G * S
-            y_hat = librosa.istft(
-                S_hat,
-                hop_length=cfg.hop,
-                win_length=cfg.n_fft,
-                window="hann",
-                center=True,
-                length=len(x),
-            )
-
-            # Choose output waveform:
-            # Always output the normal noise-suppressed waveform
-            y_out = y_hat
+            if compute_output_audio:
+                y_hat = librosa.istft(
+                    S_hat,
+                    hop_length=cfg.hop,
+                    win_length=cfg.n_fft,
+                    window="hann",
+                    center=True,
+                    length=len(x),
+                ).astype(work_dtype, copy=False)
+                # Choose output waveform:
+                # Always output the normal noise-suppressed waveform
+                y_out = y_hat
+            else:
+                y_hat = None
+                y_out = None
 
         # 6) Debug
         op_lo, op_hi = cfg.operating_band
@@ -1080,22 +1075,8 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         debug = None
         if keep_debug:
             debug = {
-                "detector": det_debug,
                 "detector_params": dict(getattr(cfg, "detector", {}) or {}),
                 "suppressor_params": dict(getattr(cfg, "suppressor", {}) or {}),
-                # Extract useful detector tuning signals if present
-                "peak_ratio": (det_debug.get("peak_ratio") if isinstance(det_debug, dict) else None),
-                "flux_primary": (det_debug.get("flux_primary") if isinstance(det_debug, dict) else None),
-                "frame_class": (det_debug.get("frame_class") if isinstance(det_debug, dict) else None),
-                "frame_class_name": (
-                    np.array([FrameClass(v).name.lower() for v in det_debug.get("frame_class", [])], dtype=object)
-                    if isinstance(det_debug, dict) and det_debug.get("frame_class") is not None
-                    else None
-                ),
-                "is_rain_raw": (det_debug.get("is_rain_raw") if isinstance(det_debug, dict) else None),
-                "onset_mask": (det_debug.get("onset_mask") if isinstance(det_debug, dict) else None),
-                "onset_indices": (det_debug.get("onset_indices") if isinstance(det_debug, dict) else None),
-
                 # SNR gating (optional)
                 "snr_mode": snr_mode,
                 "snr_gate": snr_gate,
@@ -1107,18 +1088,14 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 "detector_noise_psd_lag": detector_noise_psd_lag,
                 "detector_use_noise_norm": detector_use_noise_norm,
                 "detector_noise_norm_mode": detector_noise_norm_mode,
+                "td_soft_enable": self._detector_flag("td_soft_enable", False),
+                "bypass_classifier": bypass_classifier,
                 "disable_suppression": disable_suppression,
                 "classifier_only_mode": classifier_only_mode,
 
-                # Classifier outputs
-                "rain_conf": rain_conf,
-                "noise_conf": noise_conf,
-                "is_rain": is_rain,
-                "is_noise": is_noise,
+                # PSD update / suppressor-side signals
                 "use_for_noise_psd": use_for_noise_psd,
                 "is_rain_for_psd": is_rain_for_psd,
-
-                # Suppression / PSD
                 "G": G,
                 "noise_psd": noise_psd,
                 "use_lagged_noise_psd": bool(getattr(cfg, "use_lagged_noise_psd", False)),
@@ -1136,28 +1113,30 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 "features_available": features is not None,
             }
 
-
-        return {
-            "y": y_out if keep_filtered_audio else None,  # keep sample-level output only in debug mode
-            "y_suppressed": y_hat if keep_filtered_audio else None,
-            "S": S if keep_spectra else None,
-            "S_hat": S_hat if keep_spectra else None,
-            "noise_psd": noise_psd if keep_noise_psd else None,
+        result = {
             "frame_class": frame_class,
-            "is_rain": is_rain,
             "freqs": freqs,
             "times": times,
-            # Back-compat convenience: top-level detector keys (if present)
-            "det_debug": det_debug if keep_detector_debug else None,
-            "debug": debug,
-            "x_filt": x_proc if keep_filtered_audio else None,
-            # Added explicit outputs for harness convenience
-            "use_for_noise_psd": use_for_noise_psd,
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
-            "features": features,
-            "classifier_only_mode": classifier_only_mode,
         }
+        if features is not None:
+            result["features"] = features
+        if keep_detector_debug:
+            result["det_debug"] = det_debug
+        if debug is not None:
+            result["debug"] = debug
+        if keep_filtered_audio:
+            result["x_filt"] = x_proc
+            result["y"] = y_out
+            result["y_suppressed"] = y_hat
+        if keep_spectra:
+            result["S"] = S
+            result["S_hat"] = S_hat
+        if keep_noise_psd:
+            result["noise_psd"] = noise_psd
+
+        return result
 
 
 # -----------------------------------------------------------
@@ -1181,6 +1160,13 @@ class RainDetectorProcessor(BaseProcessor):
 
     def __init__(self, name: str = "rain_detector"):
         self.name = name
+        self._proc_cache: Dict[str, SpectralNoiseProcessor] = {}
+
+    def _params_cache_key(self, params: Dict[str, Any]) -> str:
+        try:
+            return json.dumps(params, sort_keys=True, default=str)
+        except Exception:
+            return repr(sorted(params.items(), key=lambda kv: kv[0]))
 
     def run(
         self,
@@ -1190,18 +1176,49 @@ class RainDetectorProcessor(BaseProcessor):
         # Basic input validation from the shared processor base.
         self._validate_audio(audio_data, params)
 
-        sample_rate = int(params.get("sample_rate", 11162))
-        proc = SpectralNoiseProcessor()
-        proc.setup(params)
+        params_local = dict(params)
+        keep_state_audio = bool(params_local.get("keep_state_audio", False))
+        params_local.setdefault("compute_output_audio", keep_state_audio)
+
+        sample_rate = int(params_local.get("sample_rate", 11162))
+        cache_key = self._params_cache_key(params_local)
+        proc = self._proc_cache.get(cache_key)
+        if proc is None:
+            proc = SpectralNoiseProcessor()
+            proc.setup(params_local)
+            self._proc_cache[cache_key] = proc
         cfg = proc.cfg
         out, latency = self._with_timing(proc.process, audio_data, sr=sample_rate)
 
-        is_rain = np.asarray(out.get("is_rain", []), dtype=bool)
+        frame_class = np.asarray(out.get("frame_class", []), dtype=np.int8)
+        is_rain = frame_class == FrameClass.RAIN
+        clip_rain_min_frames = int(params_local.get("clip_rain_min_frames", 1))
+        clip_rain_min_frames = max(1, clip_rain_min_frames)
+        rain_frame_count = int(np.sum(is_rain))
+        clip_rain_fraction = float(np.mean(is_rain)) if is_rain.size else 0.0
+        clip_is_rain = bool(rain_frame_count >= clip_rain_min_frames)
+        rain_conf_arr = np.asarray(out.get("rain_conf", []), dtype=np.float32).reshape(-1)
+        if rain_frame_count > 0 and rain_conf_arr.size == is_rain.size:
+            median_rain_conf = float(np.median(rain_conf_arr[is_rain]))
+        else:
+            median_rain_conf = 0.0
+
+        # Promote clip confidence toward 1.0 when rain is sustained well beyond the
+        # minimum frame threshold required to call the clip rainy.
+        abundance_ref = max(2 * clip_rain_min_frames, 1)
+        abundance_conf = float(np.clip(rain_frame_count / float(abundance_ref), 0.0, 1.0))
+        clip_rain_conf = float(max(median_rain_conf, abundance_conf))
         freqs = out.get("freqs", None)
         noise_psd = out.get("noise_psd", None)
 
         metrics: Dict[str, Any] = {
-            "rain_frame_fraction": float(np.mean(is_rain)) if is_rain.size else 0.0,
+            "rain_frame_fraction": clip_rain_fraction,  # backward-compatible name
+            "clip_rain_fraction": clip_rain_fraction,
+            "rain_frame_count": rain_frame_count,
+            "clip_is_rain": clip_is_rain,
+            "clip_rain_conf": clip_rain_conf,
+            "median_rain_conf": median_rain_conf,
+            "clip_rain_min_frames": clip_rain_min_frames,
             "latency_s": latency,
         }
 
@@ -1219,18 +1236,22 @@ class RainDetectorProcessor(BaseProcessor):
                 metrics["mean_noise_floor_db"] = float(np.mean(noise_db))
                 metrics["median_noise_floor_db"] = float(np.median(noise_db))
 
-        keep_state_audio = bool(params.get("keep_state_audio", False))
-        keep_state_spectra = bool(params.get("keep_state_spectra", False))
-        keep_state_debug = bool(params.get("keep_state_debug", False))
-        keep_state_config = bool(params.get("keep_state_config", False))
-        keep_state_features = bool(params.get("keep_state_features", True))
+        keep_state_spectra = bool(params_local.get("keep_state_spectra", False))
+        keep_state_debug = bool(params_local.get("keep_state_debug", False))
+        keep_state_config = bool(params_local.get("keep_state_config", False))
+        keep_state_features = bool(params_local.get("keep_state_features", True))
 
         state: Dict[str, Any] = {
             "frame_class": out.get("frame_class"),
-            "is_rain": out.get("is_rain"),
             "times": out.get("times"),
             "rain_conf": out.get("rain_conf"),
             "noise_conf": out.get("noise_conf"),
+            "rain_frame_count": rain_frame_count,
+            "clip_rain_fraction": clip_rain_fraction,
+            "clip_is_rain": clip_is_rain,
+            "clip_rain_conf": clip_rain_conf,
+            "median_rain_conf": median_rain_conf,
+            "clip_rain_min_frames": clip_rain_min_frames,
             "latency_s": latency,
             "processor": self.name,
         }
