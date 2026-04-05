@@ -175,13 +175,97 @@ def extract_td_features_inline(
             energy = np.array([float(np.mean(sig**2))], dtype=dtype)
             times = np.array([0.0], dtype=dtype)
             return energy, times
-        vals = []
-        times = []
-        for start in range(0, sig.size - B + 1, H):
-            seg = sig[start : start + B]
-            vals.append(float(np.mean(seg**2)))
-            times.append(start / float(fs))
-        return np.asarray(vals, dtype=dtype), np.asarray(times, dtype=dtype)
+
+        starts = np.arange(0, sig.size - B + 1, H, dtype=np.int64)
+        sig2 = np.asarray(sig, dtype=np.float64) ** 2
+        csum = np.empty(sig2.size + 1, dtype=np.float64)
+        csum[0] = 0.0
+        csum[1:] = np.cumsum(sig2, dtype=np.float64)
+        sums = csum[starts + B] - csum[starts]
+        energy = (sums / float(B)).astype(dtype, copy=False)
+        times = (starts / float(fs)).astype(dtype, copy=False)
+        return energy, times
+
+    def _subframe_peak_shape_features(sub_vals: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        env = np.asarray(sub_vals, dtype=dtype).reshape(-1)
+        N = env.size
+        if N == 0:
+            z = np.zeros(0, dtype=dtype)
+            return z, z, z, z, z, np.zeros(0, dtype=bool)
+
+        if N >= 3:
+            kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
+            env_smooth = np.convolve(env.astype(np.float64), kernel, mode="same")
+        else:
+            env_smooth = env.astype(np.float64, copy=False)
+
+        rise_time = np.zeros(N, dtype=dtype)
+        fall_time = np.zeros(N, dtype=dtype)
+        peak_level = np.zeros(N, dtype=dtype)
+        peak_mask = np.zeros(N, dtype=bool)
+        rise_slope = np.zeros(N, dtype=dtype)
+        fall_slope = np.zeros(N, dtype=dtype)
+        dt_sec = float(subframe_hop) / float(fs)
+
+        if N >= 3:
+            peak_idx = np.flatnonzero(
+                (env_smooth[1:-1] >= env_smooth[:-2])
+                & (env_smooth[1:-1] > env_smooth[2:])
+            ) + 1
+        elif N == 2:
+            peak_idx = np.array([int(np.argmax(env_smooth))], dtype=np.int64)
+        else:
+            peak_idx = np.array([0], dtype=np.int64)
+
+        for p in peak_idx:
+            peak = float(max(env_smooth[p], eps))
+            lo = 0.1 * peak
+            hi = 0.9 * peak
+
+            left = env_smooth[: p + 1]
+            lo_left = np.where(left <= lo)[0]
+            i_lo = int(lo_left[-1]) if lo_left.size else 0
+            hi_after = np.where(left[i_lo:] >= hi)[0]
+            i_hi = int(i_lo + hi_after[0]) if hi_after.size else int(p)
+
+            right = env_smooth[p:]
+            below_hi = np.where(right[1:] <= hi)[0]
+            i_hi_fall = int(1 + below_hi[0]) if below_hi.size else 0
+            below_lo = np.where(right[i_hi_fall:] <= lo)[0]
+            i_lo_fall = int(i_hi_fall + below_lo[0]) if below_lo.size else int(max(right.size - 1, 0))
+
+            rise_dt = float(max(i_hi - i_lo, 0)) * dt_sec
+            fall_dt = float(max(i_lo_fall, 0)) * dt_sec
+            rise_time[p] = rise_dt
+            fall_time[p] = fall_dt
+
+            amp_delta_rise = max(hi - lo, 0.0)
+            amp_delta_fall = max(hi - lo, 0.0)
+            rise_slope[p] = float(amp_delta_rise / max(rise_dt, dt_sec))
+            fall_slope[p] = float(amp_delta_fall / max(fall_dt, dt_sec))
+
+            peak_level[p] = peak
+            peak_mask[p] = True
+
+        return (
+            np.asarray(env_smooth, dtype=dtype),
+            rise_time,
+            fall_time,
+            rise_slope,
+            fall_slope,
+            peak_level,
+            peak_mask,
+        )
+
+    def _frame_max_from_subframes(sub_vals: np.ndarray, n_frames: int) -> np.ndarray:
+        sub_vals = np.asarray(sub_vals, dtype=dtype).reshape(-1)
+        out = np.zeros(n_frames, dtype=dtype)
+        if n_frames == 0 or sub_vals.size == 0:
+            return out
+        padded = np.zeros(n_frames + 1, dtype=dtype)
+        ncopy = min(sub_vals.size, n_frames + 1)
+        padded[:ncopy] = sub_vals[:ncopy]
+        return np.maximum(padded[:-1], padded[1:])
 
     def _frame_sum_from_subframes(sub_vals: np.ndarray, n_frames: int) -> np.ndarray:
         sub_vals = np.asarray(sub_vals, dtype=dtype).reshape(-1)
@@ -204,6 +288,7 @@ def extract_td_features_inline(
     Tloc = frames.shape[0]
     frame_times = (np.arange(Tloc, dtype=dtype) * hop) / float(fs)
     sub_energy, sub_times = _subframe_energy(x_flux)
+    sub_envelope, sub_rise_time, sub_fall_time, sub_rise_slope, sub_fall_slope, sub_peak_level, sub_peak_mask = _subframe_peak_shape_features(sub_energy)
     sub_baseline, sub_warm_ok = causal_stochastic_low_quantile_baseline(
         sub_energy,
         q_percent=float(baseline_q),
@@ -214,6 +299,12 @@ def extract_td_features_inline(
         dtype=dtype,
     )
     frame_energy = _frame_sum_from_subframes(sub_energy, Tloc)
+    frame_envelope = _frame_sum_from_subframes(sub_envelope, Tloc)
+    frame_rise_time = _frame_max_from_subframes(sub_rise_time, Tloc)
+    frame_fall_time = _frame_max_from_subframes(sub_fall_time, Tloc)
+    frame_rise_slope = _frame_max_from_subframes(sub_rise_slope, Tloc)
+    frame_fall_slope = _frame_max_from_subframes(sub_fall_slope, Tloc)
+    frame_peak_level = _frame_max_from_subframes(sub_peak_level, Tloc)
     frame_baseline = _frame_sum_from_subframes(sub_baseline, Tloc)
     frame_warm_ok = np.zeros(Tloc, dtype=bool)
     if sub_warm_ok.size > 0:
@@ -250,6 +341,12 @@ def extract_td_features_inline(
         "time_flux_score": td_time_flux_score,
         "crest_factor": td_crest_factor,
         "kurtosis": td_kurtosis,
+        "energy_envelope": frame_envelope,
+        "rise_time_sec": frame_rise_time,
+        "fall_time_sec": frame_fall_time,
+        "rise_slope": frame_rise_slope,
+        "fall_slope": frame_fall_slope,
+        "peak_energy": frame_peak_level,
     }
 
 class RainFrameClassifierMixin:
@@ -519,6 +616,12 @@ class RainFrameClassifierMixin:
         td_time_flux_score = np.zeros(T, dtype=dtype)
         td_crest_factor = np.zeros(T, dtype=dtype)
         td_kurtosis = np.zeros(T, dtype=dtype)
+        td_rise_time_sec = np.zeros(T, dtype=dtype)
+        td_fall_time_sec = np.zeros(T, dtype=dtype)
+        td_rise_slope = np.zeros(T, dtype=dtype)
+        td_fall_slope = np.zeros(T, dtype=dtype)
+        td_energy_envelope = np.zeros(T, dtype=dtype)
+        td_peak_energy = np.zeros(T, dtype=dtype)
         td_vote_count = np.zeros(T, dtype=np.int32)
         td_soft_score = np.zeros(T, dtype=dtype)
 
@@ -537,6 +640,42 @@ class RainFrameClassifierMixin:
             )
             td_kurtosis = self._align_feature_to_frames(
                 td_soft_debug.get("kurtosis"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            td_rise_time_sec = self._align_feature_to_frames(
+                td_soft_debug.get("rise_time_sec"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            td_fall_time_sec = self._align_feature_to_frames(
+                td_soft_debug.get("fall_time_sec"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            td_rise_slope = self._align_feature_to_frames(
+                td_soft_debug.get("rise_slope"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            td_fall_slope = self._align_feature_to_frames(
+                td_soft_debug.get("fall_slope"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            td_energy_envelope = self._align_feature_to_frames(
+                td_soft_debug.get("energy_envelope"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            td_peak_energy = self._align_feature_to_frames(
+                td_soft_debug.get("peak_energy"),
                 n_frames=T,
                 dtype=dtype,
                 fill_value=0,
@@ -852,6 +991,12 @@ class RainFrameClassifierMixin:
             "td_time_flux_score": td_time_flux_score,
             "td_crest_factor": td_crest_factor,
             "td_kurtosis": td_kurtosis,
+            "td_rise_time_sec": td_rise_time_sec,
+            "td_fall_time_sec": td_fall_time_sec,
+            "td_rise_slope": td_rise_slope,
+            "td_fall_slope": td_fall_slope,
+            "td_energy_envelope": td_energy_envelope,
+            "td_peak_energy": td_peak_energy,
             "td_vote_count": td_vote_count,
             "td_soft_score": td_soft_score,
         }
@@ -875,7 +1020,10 @@ class RainFrameClassifierMixin:
                 "td_time_flux_score": td_time_flux_score,
                 "td_crest_factor": td_crest_factor,
                 "td_kurtosis": td_kurtosis,
-   
+                "td_rise_time_sec": td_rise_time_sec,
+                "td_fall_time_sec": td_fall_time_sec,
+                "td_rise_slope": td_rise_slope,
+                "td_fall_slope": td_fall_slope,
             }
             if feature_dump_level == 1:
                 feature_dump.update({
@@ -900,6 +1048,12 @@ class RainFrameClassifierMixin:
                     "td_soft_label": td_soft_label.astype(np.int8),
                     "td_vote_count": td_vote_count,
                     "td_soft_score": td_soft_score,
+                    "td_rise_time_sec": td_rise_time_sec,
+                    "td_fall_time_sec": td_fall_time_sec,
+                    "td_rise_slope": td_rise_slope,
+                    "td_fall_slope": td_fall_slope,
+                    "td_energy_envelope": td_energy_envelope,
+                    "td_peak_energy": td_peak_energy,
                 })
 
                 if include_peak_payload:

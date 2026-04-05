@@ -16,7 +16,15 @@ injected via the get_keys_fn and get_input_data_fn parameters.
 """
 
 import gc
+import os
+import time
+try:
+    import psutil
+except ImportError:
+    psutil = None
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
 from typing import (
     Any,
     Callable,
@@ -109,6 +117,197 @@ def _extract_param_updates(obj: Any) -> Dict[str, Any]:
 # Helper for namespaced result columns
 # ----------------------------------------------------------------------
 
+def _discover_keys(
+    *,
+    InputType: Optional[str],
+    test_vector_path: Optional[str],
+    query: Optional[str],
+    adse_engine,
+    batch_size: int,
+    localStatus: bool,
+    max_files: Optional[int],
+    get_keys_fn: Callable[..., List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    keys: List[Dict[str, Any]] = get_keys_fn(
+        InputType,
+        test_vector_path=test_vector_path,
+        query=query,
+        adse_engine=adse_engine,
+        batch_size=batch_size,
+        localStatus=localStatus,
+    )
+
+    if max_files is not None:
+        if max_files < 0:
+            raise ValueError("max_files must be >= 0 or None")
+        keys = keys[:max_files]
+
+    return keys
+
+
+def _process_single_file_task(
+    *,
+    file_key: str,
+    meta: Dict[str, Any],
+    processors: List[AudioProcessor],
+    params_global: Dict[str, Any],
+    params_by_processor: Dict[str, Dict[str, Any]],
+    required_samples: int,
+    rain_min_thr,
+) -> Optional[Dict[str, Any]]:
+    audio = meta.get("file_contents")
+    rain_actual = meta.get("raining", None)
+
+    if audio is None:
+        return None
+
+    audio = np.asarray(audio)
+    if audio.ndim != 1:
+        raise ValueError(f"audio for {file_key} must be 1-D, got shape {audio.shape}")
+    if audio.size < required_samples:
+        return None
+
+    row: Dict[str, Any] = {
+        "file_key": file_key,
+        "rain_actual": rain_actual,
+    }
+    states_for_file: Dict[str, Dict[str, Any]] = {}
+
+    ctx_params: Dict[str, Any] = dict(params_global)
+
+    for proc in processors:
+        proc_params = dict(ctx_params)
+        proc_params.update(params_by_processor.get(proc.name, {}))
+
+        if hasattr(proc, "setup"):
+            proc.setup(proc_params)
+
+        proc_results, proc_state = proc.run(audio, proc_params)
+
+        proc_results = dict(proc_results) if isinstance(proc_results, dict) else {"value": proc_results}
+        proc_state = dict(proc_state) if isinstance(proc_state, dict) else {"state": proc_state}
+
+        proc_state["file_key"] = file_key
+        states_for_file[proc.name] = proc_state
+
+        row.update(_flatten_with_namespace(proc.name, proc_results))
+
+        updates = {}
+        updates.update(_extract_param_updates(proc_results))
+        updates.update(_extract_param_updates(proc_state))
+        if updates:
+            ctx_params.update(updates)
+
+    if (
+        "rain__rain_drops" in row
+        and rain_actual is not None
+        and rain_min_thr is not None
+    ):
+        rain_predicted = bool(row["rain__rain_drops"] > rain_min_thr)
+        row["rain__predicted"] = rain_predicted
+        row["rain__mismatch"] = (rain_predicted != bool(rain_actual))
+
+    return {
+        "row": row,
+        "states": states_for_file,
+    }
+
+
+def _run_batch_serial(
+    *,
+    dir_content: Dict[str, Dict[str, Any]],
+    processors: List[AudioProcessor],
+    params_global: Dict[str, Any],
+    params_by_processor: Dict[str, Dict[str, Any]],
+    required_samples: int,
+    rain_min_thr,
+) -> List[Dict[str, Any]]:
+    outputs: List[Dict[str, Any]] = []
+    for file_key, meta in dir_content.items():
+        item = _process_single_file_task(
+            file_key=file_key,
+            meta=meta,
+            processors=processors,
+            params_global=params_global,
+            params_by_processor=params_by_processor,
+            required_samples=required_samples,
+            rain_min_thr=rain_min_thr,
+        )
+        if item is not None:
+            outputs.append(item)
+    return outputs
+
+
+def _run_batch_parallel(
+    *,
+    dir_content: Dict[str, Dict[str, Any]],
+    processors: List[AudioProcessor],
+    params_global: Dict[str, Any],
+    params_by_processor: Dict[str, Dict[str, Any]],
+    required_samples: int,
+    rain_min_thr,
+    num_workers: Optional[int] = None,
+    executor: Optional[ProcessPoolExecutor] = None,
+) -> List[Dict[str, Any]]:
+    max_workers = num_workers if num_workers is not None else max(1, (os.cpu_count() or 1) - 1)
+    outputs: List[Dict[str, Any]] = []
+
+    owns_executor = executor is None
+    if executor is None:
+        executor = ProcessPoolExecutor(max_workers=max_workers)
+
+    try:
+        futures = [
+            executor.submit(
+                _process_single_file_task,
+                file_key=file_key,
+                meta=meta,
+                processors=processors,
+                params_global=params_global,
+                params_by_processor=params_by_processor,
+                required_samples=required_samples,
+                rain_min_thr=rain_min_thr,
+            )
+            for file_key, meta in dir_content.items()
+        ]
+
+        for fut in as_completed(futures):
+            item = fut.result()
+            if item is not None:
+                outputs.append(item)
+    finally:
+        if owns_executor and executor is not None:
+            executor.shutdown(wait=True)
+
+    return outputs
+
+
+def _collect_batch_outputs(
+    *,
+    batch_outputs: List[Dict[str, Any]],
+    results_rows: List[Dict[str, Any]],
+    states_by_processor: Dict[str, List[Dict[str, Any]]],
+    print_mismatched: bool,
+    debug_all: bool,
+) -> None:
+    for item in batch_outputs:
+        row = item["row"]
+        states_for_file = item["states"]
+
+        if (
+            "rain__mismatch" in row
+            and ((print_mismatched and row["rain__mismatch"]) or debug_all)
+        ):
+            rd = row.get("rain__rain_drop_count", row.get("rain__rain_drops"))
+            print(
+                f"[mismatch] {row['file_key']}  "
+                f"actual={row.get('rain_actual')}  predicted={row.get('rain__predicted')}  "
+                f"rain_drops={rd}"
+            )
+
+        results_rows.append(row)
+        for proc_name, proc_state in states_for_file.items():
+            states_by_processor[proc_name].append(proc_state)
 
 def _flatten_with_namespace(ns: str, d: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -132,6 +331,35 @@ def _flatten_with_namespace(ns: str, d: Dict[str, Any]) -> Dict[str, Any]:
     {'rain__frain_mean': 0.8, 'rain__rain_drops': 10}
     """
     return {f"{ns}__{k}": v for k, v in d.items()}
+
+
+# ----------------------------------------------------------------------
+# Memory logging helper
+# ----------------------------------------------------------------------
+
+def _log_memory_usage(prefix: str = "") -> None:
+    """
+    Log memory usage of main process and child processes (if psutil available).
+    """
+    if psutil is None:
+        print(f"{prefix} psutil not available for memory logging")
+        return
+
+    try:
+        proc = psutil.Process(os.getpid())
+        main_mb = proc.memory_info().rss / 1024**2
+
+        child_mb = 0.0
+        for c in proc.children(recursive=True):
+            try:
+                child_mb += c.memory_info().rss / 1024**2
+            except Exception:
+                pass
+
+        total_mb = main_mb + child_mb
+        print(f"{prefix} memory: main={main_mb:.1f} MB  children={child_mb:.1f} MB  total={total_mb:.1f} MB")
+    except Exception as e:
+        print(f"{prefix} memory logging failed: {e}")
 
 
 
@@ -431,18 +659,20 @@ def process_audio_batches_v2(
             - optional "rain__predicted" and "rain__mismatch" if a "rain"
               processor is present and debug options are enabled.
         When periodic flushing is enabled, intermediate chunks are written to
-        parquet during processing, and the final in-memory remainder is both
-        flushed to parquet and returned in these DataFrames.
-        Saved parquet paths are attached via DataFrame `.attrs`.
+        parquet during processing. The returned DataFrame contains only the
+        final in-memory remainder (which is also flushed at the end), while
+        all saved parquet chunk paths are attached via DataFrame `.attrs`.
     states_df_by_proc :
         Mapping from processor name to a DataFrame of internal state for that
         processor. Each row corresponds to one input file and includes "file_key"
         plus whatever keys the processor returned in its state dict.
         When periodic flushing is enabled, intermediate chunks are written to
-        parquet during processing, and the final in-memory remainder is both
-        flushed to parquet and returned in these DataFrames.
-        Saved parquet paths are attached via DataFrame `.attrs`.
+        parquet during processing. Each returned state DataFrame contains only
+        the final in-memory remainder for that processor (which is also flushed
+        at the end), while all saved parquet chunk paths are attached via
+        DataFrame `.attrs`.
     """
+    _wall_t0 = time.perf_counter()
     if params_by_processor is None:
         params_by_processor = {}
     if debug_params is None:
@@ -472,19 +702,16 @@ def process_audio_batches_v2(
     # ------------------------------------------------------------------
     # 1) Discover all keys to process
     # ------------------------------------------------------------------
-    keys: List[Dict[str, Any]] = get_keys_fn(
-        InputType,
+    keys = _discover_keys(
+        InputType=InputType,
         test_vector_path=test_vector_path,
         query=query,
         adse_engine=adse_engine,
         batch_size=batch_size,
         localStatus=localStatus,
+        max_files=max_files,
+        get_keys_fn=get_keys_fn,
     )
-    # Optionally limit number of files processed
-    if max_files is not None:
-        if max_files < 0:
-            raise ValueError("max_files must be >= 0 or None")
-        keys = keys[:max_files]
 
     if max_files is None:
         print(f"received {len(keys)} test vectors")
@@ -500,8 +727,16 @@ def process_audio_batches_v2(
     print_mismatched = bool(debug_params.get("print_mismatched", False))
     debug_all = bool(debug_params.get("debug_all", False))
     rain_min_thr = debug_params.get("rain_drop_min_thr", params_global.get("rain_drop_min_thr"))
+    log_memory = bool(debug_params.get("log_memory", False))
+
+    parallel = bool(debug_params.get("parallel", False))
+    num_workers = debug_params.get("num_workers")
 
     total_batches = (len(keys) + batch_size - 1) // batch_size if batch_size > 0 else 1
+    executor: Optional[ProcessPoolExecutor] = None
+    if parallel:
+        max_workers = num_workers if num_workers is not None else max(1, (os.cpu_count() or 1) - 1)
+        executor = ProcessPoolExecutor(max_workers=max_workers)
 
     # ------------------------------------------------------------------
     # 2) Process keys in batches
@@ -522,84 +757,37 @@ def process_audio_batches_v2(
         )
 
         # dir_content: {file_key: {"file_contents": np.ndarray, "raining": bool, ...}}
-        for file_key, meta in dir_content.items():
-            audio = meta.get("file_contents")
-            rain_actual = meta.get("raining", None)
+        if parallel:
+            batch_outputs = _run_batch_parallel(
+                dir_content=dir_content,
+                processors=processors,
+                params_global=params_global,
+                params_by_processor=params_by_processor,
+                required_samples=required_samples,
+                rain_min_thr=rain_min_thr,
+                num_workers=num_workers,
+                executor=executor,
+            )
+        else:
+            batch_outputs = _run_batch_serial(
+                dir_content=dir_content,
+                processors=processors,
+                params_global=params_global,
+                params_by_processor=params_by_processor,
+                required_samples=required_samples,
+                rain_min_thr=rain_min_thr,
+            )
 
-            if audio is None:
-                continue
+        _collect_batch_outputs(
+            batch_outputs=batch_outputs,
+            results_rows=results_rows,
+            states_by_processor=states_by_processor,
+            print_mismatched=print_mismatched,
+            debug_all=debug_all,
+        )
 
-            audio = np.asarray(audio)
-            if audio.ndim != 1:
-                raise ValueError(f"audio for {file_key} must be 1-D, got shape {audio.shape}")
-            if audio.size < required_samples:
-                # Skip files shorter than required duration
-                continue
-
-            row: Dict[str, Any] = {
-                "file_key": file_key,
-                "rain_actual": rain_actual,
-            }
-                        # ----------------------------------------------------------
-            # 2.1 Run all processors on this audio buffer
-            #     + allow earlier processors to update params for later processors
-            # ----------------------------------------------------------
-
-            # Context params are per-file and accumulate updates as processors run
-            ctx_params: Dict[str, Any] = dict(params_global)
-
-            for proc in processors:
-                # Merge in any accumulated param updates + per-processor overrides
-                proc_params = dict(ctx_params)
-                proc_params.update(params_by_processor.get(proc.name, {}))
-
-                # Optional: allow processor-local setup
-                if hasattr(proc, "setup"):
-                    proc.setup(proc_params)
-
-                proc_results, proc_state = proc.run(audio, proc_params)
-
-                # Normalize to dicts
-                proc_results = dict(proc_results) if isinstance(proc_results, dict) else {"value": proc_results}
-                proc_state = dict(proc_state) if isinstance(proc_state, dict) else {"state": proc_state}
-
-                # Record state
-                proc_state["file_key"] = file_key
-                states_by_processor[proc.name].append(proc_state)
-
-                # Record scalar metrics into main row
-                row.update(_flatten_with_namespace(proc.name, proc_results))
-
-                # Pull param updates (prefer state; optionally also allow results)
-                updates = {}
-                updates.update(_extract_param_updates(proc_results))
-                updates.update(_extract_param_updates(proc_state))
-
-                # Apply updates for downstream processors (same file only)
-                if updates:
-                    ctx_params.update(updates)
-
-            # ----------------------------------------------------------
-            # 2.2 Optional rain/no-rain mismatch diagnostics
-            # ----------------------------------------------------------
-            if (
-                "rain__rain_drops" in row
-                and rain_actual is not None
-                and rain_min_thr is not None
-            ):
-                rain_predicted = bool(row["rain__rain_drops"] > rain_min_thr)
-                row["rain__predicted"] = rain_predicted
-                row["rain__mismatch"] = (rain_predicted != bool(rain_actual))
-
-                if (print_mismatched and row["rain__mismatch"]) or debug_all:
-                    rd = row.get("rain__rain_drop_count", row["rain__rain_drops"])
-                    print(
-                        f"[mismatch] {file_key}  "
-                        f"actual={rain_actual}  predicted={rain_predicted}  "
-                        f"rain_drops={rd}"
-                    )
-
-            results_rows.append(row)
+        if log_memory:
+            _log_memory_usage(prefix=f"[batch {batch_idx}]")
 
         # Flush accumulated rows once they exceed the configured in-memory threshold.
         if save_dir_path is not None and max_batch_save > 0 and len(results_rows) >= max_batch_save:
@@ -623,6 +811,9 @@ def process_audio_batches_v2(
         # Free per-batch data to keep memory bounded
         del dir_content
         gc.collect()
+
+    if executor is not None:
+        executor.shutdown(wait=True)
 
     # Final flush: persist the last in-memory remainder as parquet as well,
     # while still returning it to the caller for backward compatibility.
@@ -657,6 +848,28 @@ def process_audio_batches_v2(
             df = pd.DataFrame()
         df.attrs["saved_parquet_files"] = saved_state_paths.get(name, [])
         states_df_by_proc[name] = df
+
+    _wall_t1 = time.perf_counter()
+    total_wall_time_sec = _wall_t1 - _wall_t0
+    total_files_processed = len(keys)
+    files_per_sec_total = (
+        (total_files_processed / total_wall_time_sec)
+        if total_wall_time_sec > 0 else None
+    )
+
+    results_df.attrs["wall_time_sec"] = total_wall_time_sec
+    results_df.attrs["num_files_processed_total"] = total_files_processed
+    results_df.attrs["files_per_sec_total"] = files_per_sec_total
+
+    for df in states_df_by_proc.values():
+        df.attrs["wall_time_sec"] = total_wall_time_sec
+        df.attrs["num_files_processed_total"] = total_files_processed
+        df.attrs["files_per_sec_total"] = files_per_sec_total
+
+    print(f"Total wall time: {total_wall_time_sec:.3f} s")
+    print(f"Total files processed: {total_files_processed}")
+    if files_per_sec_total is not None:
+        print(f"Throughput: {files_per_sec_total:.3f} files/s")
 
     return results_df, states_df_by_proc
 

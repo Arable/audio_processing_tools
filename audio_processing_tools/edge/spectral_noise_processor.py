@@ -837,11 +837,13 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 # legacy detector input: absolute spectrum in dB
                 P_for_detection = 10.0 * np.log10(P_for_detection + cfg.eps)
 
+            # Use the pre-filtered waveform for TD features as well, so once x_proc
+            # is computed it is the single signal used everywhere in the pipeline.
             frame_class, rain_conf, det_debug, feature_dump = self._detect_rain_over_time(
                 P_for_detection,
                 freqs,
                 detector_frame_times=np.asarray(times, dtype=work_dtype),
-                input_audio=x,
+                input_audio=x_proc,
             )
             if isinstance(det_debug, dict) and isinstance(feature_dump, dict):
                 det_debug["feature_dump"] = feature_dump
