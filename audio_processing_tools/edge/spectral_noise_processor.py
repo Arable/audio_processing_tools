@@ -9,7 +9,6 @@ import json
 
 import numpy as np
 import scipy.signal as spsig
-import scipy.ndimage as ndi
 import librosa
 
 from audio_processing_tools.processors import BaseProcessor
@@ -63,6 +62,13 @@ class NoiseProcessorConfig:
     # -----------------------------------------------------------
     q: float = 0.25        # target low-quantile level for causal stochastic baseline tracking
     win_sec: float = 0.5   # effective adaptation horizon (seconds) for the stochastic tracker
+
+    # Optional adaptive quantile driven by causal rain-frame prevalence.
+    # q acts as the dry/noisy baseline and is reduced toward adaptive_q_min
+    # as recent rain prevalence increases.
+    adaptive_q_enable: bool = False
+    adaptive_q_min: float = 0.10
+    adaptive_q_alpha: float = 0.95  # EMA smoothing for causal rain prevalence
 
 
     median_frames: int = 0  # optional median filter over time; 0 disables
@@ -362,6 +368,23 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 Y[:, t] = (csum[:, t] - csum[:, t0 - 1]) / (t - t0 + 1)
         return Y
 
+    def _causal_time_median_filter(self, X: np.ndarray, L: int) -> np.ndarray:
+        """
+        Causal median filter over time.
+        For frame t, only uses frames [max(0, t-L+1) : t].
+        """
+        if L <= 1:
+            return X
+        if L % 2 == 0:
+            L += 1
+        dtype = self._work_dtype()
+        B, T = X.shape
+        Y = np.empty_like(X, dtype=dtype)
+        for t in range(T):
+            t0 = max(0, t - L + 1)
+            Y[:, t] = np.median(X[:, t0:t + 1], axis=1).astype(dtype, copy=False)
+        return Y
+
     # ----------------------- Gain computation -----------------------
 
     def _compute_gain(
@@ -517,58 +540,121 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             mask |= (fb >= lo) & (fb <= hi)
         return mask
 
-    def _compute_gain_noise_only(
-        self,
-        P_band: np.ndarray,   # (K, T)
-        N_band: np.ndarray,   # (K, T)
-    ) -> np.ndarray:
-        """
-        Gain for pure noise case using square-root spectral subtraction
-        or Wiener-like rule, with simple smoothing.
 
-        Assumes every frame is noise.
+
+    def _init_noise_psd_tracker(self, first_band_frame: np.ndarray, W: int) -> Dict[str, Any]:
+        """
+        Initialize state for causal frame-wise noise PSD tracking.
         """
         cfg = self.cfg
-        eps = cfg.eps
         dtype = self._work_dtype()
 
-        K, T = P_band.shape
-        assert N_band.shape == (K, T)
+        eta = float(2.0 / max(W + 1, 2))
+        eta = float(np.clip(eta, 1e-4, 1.0))
+        scale_alpha = float(cfg.ema_down)
+        step_floor = float(max(cfg.eps, 1e-9))
+        maxr = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
+        maxr = 1.0 if (not np.isfinite(maxr)) else float(np.clip(maxr, 0.0, 1.0))
 
-        alpha = cfg.oversub_max  # use max oversub for noise-only tuning
+        adaptive_q_enable = bool(getattr(cfg, "adaptive_q_enable", False))
+        adaptive_q_base = float(getattr(cfg, "q", 0.25))
+        adaptive_q_min = float(getattr(cfg, "adaptive_q_min", 0.10))
+        adaptive_q_min = float(np.clip(adaptive_q_min, 1e-4, adaptive_q_base))
+        adaptive_q_alpha = float(getattr(cfg, "adaptive_q_alpha", 0.95))
+        adaptive_q_alpha = float(np.clip(adaptive_q_alpha, 0.0, 1.0))
 
-        if cfg.gain_mode.lower() == "wiener":
-            # G = max(P - alpha N, 0) / (P + eps)
-            P_clean = np.maximum(P_band - alpha * N_band, 0.0)
-            G_raw = P_clean / (P_band + eps)
+        return {
+            "tracker": np.maximum(np.asarray(first_band_frame, dtype=dtype).copy(), 0.0),
+            "tracker_scale": np.maximum(np.abs(np.asarray(first_band_frame, dtype=dtype)), step_floor),
+            "warmup_count": 0,
+            "warmup_need": max(10, W // 2),
+            "eta": eta,
+            "scale_alpha": scale_alpha,
+            "step_floor": step_floor,
+            "ema_up": float(cfg.ema_up),
+            "ema_down": float(cfg.ema_down),
+            "maxr": maxr,
+            "adaptive_q_enable": adaptive_q_enable,
+            "adaptive_q_base": adaptive_q_base,
+            "adaptive_q_min": adaptive_q_min,
+            "adaptive_q_alpha": adaptive_q_alpha,
+            "rain_prev_ema": 0.0,
+        }
+
+    def _update_noise_psd_frame(
+        self,
+        P_band: np.ndarray,
+        is_rain_t: bool,
+        prev_N_band: Optional[np.ndarray],
+        state: Dict[str, Any],
+    ) -> np.ndarray:
+        """
+        Update the causal noise PSD tracker using one frame and return N(t).
+        """
+        cfg = self.cfg
+        dtype = self._work_dtype()
+
+        tracker = state["tracker"]
+        tracker_scale = state["tracker_scale"]
+        warmup_count = int(state["warmup_count"])
+        warmup_need = int(state["warmup_need"])
+        eta = float(state["eta"])
+        scale_alpha = float(state["scale_alpha"])
+        step_floor = float(state["step_floor"])
+        ema_up = float(state["ema_up"])
+        ema_down = float(state["ema_down"])
+        maxr = float(state["maxr"])
+
+        adaptive_q_enable = bool(state.get("adaptive_q_enable", False))
+        adaptive_q_base = float(state.get("adaptive_q_base", cfg.q))
+        adaptive_q_min = float(state.get("adaptive_q_min", adaptive_q_base))
+        adaptive_q_alpha = float(state.get("adaptive_q_alpha", 0.95))
+        rain_prev_ema = float(state.get("rain_prev_ema", 0.0))
+
+        P_band = np.asarray(P_band, dtype=dtype)
+        allow_update = (warmup_count < warmup_need) or (not bool(is_rain_t))
+
+        if prev_N_band is None:
+            raw_q = tracker
+            if allow_update:
+                warmup_count += 1
         else:
-            # sqrt spectral subtraction:
-            # G = 1 - alpha * sqrt(N / (P + eps))
-            ratio = N_band / (P_band + eps)
-            ratio = np.clip(ratio, 0.0, 1.0)
-            G_raw = 1.0 - alpha * np.sqrt(ratio)
+            err = P_band - tracker
+            tracker_scale = scale_alpha * tracker_scale + (1.0 - scale_alpha) * np.abs(err)
+            step = eta * np.maximum(tracker_scale, step_floor)
 
-        # Bound
-        G_raw = np.clip(G_raw, cfg.gain_floor, cfg.gain_ceil)
+            if adaptive_q_enable:
+                q_eff = adaptive_q_base - (adaptive_q_base - adaptive_q_min) * rain_prev_ema
+                q_eff = float(np.clip(q_eff, adaptive_q_min, adaptive_q_base))
+            else:
+                q_eff = float(cfg.q)
 
-        # -------- frequency smoothing --------
-        kernel = np.array([0.25, 0.5, 0.25], dtype=dtype)
-        G_freq = np.empty_like(G_raw)
-        for t in range(T):
-            G_freq[:, t] = np.convolve(G_raw[:, t], kernel, mode="same")
+            delta = np.where(P_band >= tracker, q_eff * step, -(1.0 - q_eff) * step)
+            candidate = np.maximum(tracker + delta, 0.0)
 
-        # -------- temporal smoothing --------
-        alpha_g = float(np.clip(cfg.gain_smooth_alpha, 0.0, 1.0))
-        G_time = np.empty_like(G_freq)
-        G_time[:, 0] = G_freq[:, 0]
+            if allow_update:
+                tracker = candidate
+                warmup_count += 1
 
-        for t in range(1, T):
-            G_time[:, t] = alpha_g * G_time[:, t-1] + (1 - alpha_g) * G_freq[:, t]
+            raw_q = tracker
 
-        return np.clip(G_time, cfg.gain_floor, cfg.gain_ceil)
+        if prev_N_band is None:
+            N_band = raw_q
+        else:
+            up = raw_q > prev_N_band
+            lam = np.where(up, ema_up, ema_down)
+            N_band = lam * prev_N_band + (1.0 - lam) * raw_q
 
+        N_band = np.minimum(N_band, maxr * P_band)
+        N_band = np.maximum(N_band, 0.0).astype(dtype, copy=False)
 
-  
+        rain_prev_ema = adaptive_q_alpha * rain_prev_ema + (1.0 - adaptive_q_alpha) * float(bool(is_rain_t))
+        state["rain_prev_ema"] = rain_prev_ema
+        state["tracker"] = tracker
+        state["tracker_scale"] = tracker_scale
+        state["warmup_count"] = warmup_count
+        return N_band
+
     def _estimate_noise_psd_fft(
         self,
         P: np.ndarray,         # (F, T)
@@ -579,7 +665,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         cfg = self.cfg
         _, T = P.shape
-        eps = cfg.eps
 
         op_lo, op_hi = cfg.operating_band
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
@@ -587,7 +672,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             sr = cfg.fs
         frames_per_sec = float(sr) / float(cfg.hop)
         W = max(10, int(cfg.win_sec * frames_per_sec))
-        K = int(band_mask.sum())
 
         # Extract band power
         P_band_all = P[band_mask, :]  # (K, T)
@@ -600,70 +684,28 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         dtype = self._work_dtype()
         noise_psd = np.zeros_like(P, dtype=dtype)
 
-        # Causal stochastic low-quantile tracker.
-        # q controls the target lower quantile; win_sec sets the effective adaptation horizon.
-        # This replaces the much more expensive rolling-buffer quantile computation.
-        eta = float(2.0 / max(W + 1, 2))
-        eta = float(np.clip(eta, 1e-4, 1.0))
-        scale_alpha = float(cfg.ema_down)
-        step_floor = float(max(cfg.eps, 1e-9))
+        K = P_band_all.shape[0]
+        if K == 0 or T == 0:
+            return noise_psd
 
-        tracker = np.maximum(P_band_all[:, 0].astype(dtype, copy=True), 0.0)
-        tracker_scale = np.maximum(np.abs(P_band_all[:, 0]).astype(dtype, copy=True), step_floor)
-        warmup_count = 0
-        ema_up = float(cfg.ema_up)
-        ema_down = float(cfg.ema_down)
+        state = self._init_noise_psd_tracker(P_band_all[:, 0], W)
+        prev_N_band = None
 
         for t in range(T):
             P_band = P_band_all[:, t]
+            N_band = self._update_noise_psd_frame(
+                P_band=P_band,
+                is_rain_t=bool(is_rain[t]),
+                prev_N_band=prev_N_band,
+                state=state,
+            )
+            noise_psd[band_mask, t] = N_band
+            prev_N_band = N_band
 
-            # Warmup protection: during the initial phase keep adapting from all frames.
-            warmup_need = max(10, W // 2)
-            allow_update = (warmup_count < warmup_need) or (not is_rain[t])
-
-            if t == 0:
-                raw_q = tracker
-                if allow_update:
-                    warmup_count += 1
-            else:
-                err = P_band - tracker
-                tracker_scale = scale_alpha * tracker_scale + (1.0 - scale_alpha) * np.abs(err)
-                step = eta * np.maximum(tracker_scale, step_floor)
-
-                # Stochastic low-quantile update:
-                #  - above baseline: move up slowly by q * step
-                #  - below baseline: move down by (1-q) * step
-                delta = np.where(P_band >= tracker, cfg.q * step, -(1.0 - cfg.q) * step)
-                candidate = tracker + delta
-                candidate = np.maximum(candidate, 0.0)
-
-                if allow_update:
-                    tracker = candidate
-                    warmup_count += 1
-
-                raw_q = tracker
-
-            # Optional asymmetric EMA smoothing on top of the stochastic baseline.
-            if t == 0:
-                N_band = raw_q
-            else:
-                prev = noise_psd[band_mask, t - 1]
-                up = raw_q > prev
-                lam = np.where(up, ema_up, ema_down)
-                N_band = lam * prev + (1.0 - lam) * raw_q
-
-            # Clamp: PSD estimate should not exceed instantaneous band power (prevents runaway)
-            maxr = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
-            maxr = 1.0 if (not np.isfinite(maxr)) else float(np.clip(maxr, 0.0, 1.0))
-            N_band = np.minimum(N_band, maxr * P_band_all[:, t])
-            noise_psd[band_mask, t] = np.maximum(N_band, 0.0)
-
-        # Optional median smoothing over time (per frequency) after stochastic tracking
+        # Optional causal median smoothing over time (per frequency) after stochastic tracking
         m = int(getattr(cfg, "median_frames", 0))
         if m and m > 1:
-            if m % 2 == 0:
-                m += 1
-            noise_psd = ndi.median_filter(noise_psd, size=(1, m))
+            noise_psd = self._causal_time_median_filter(noise_psd, m)
 
         return noise_psd
 
@@ -788,6 +830,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         bootstrap_noise_psd = None
         detector_noise_psd_lag = None
+        feature_dump = None
 
         if bypass_classifier:
             # Treat all frames as noise so we can inspect suppressor behavior.
@@ -801,7 +844,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 "onset_mask": np.zeros(T, dtype=bool),
                 "onset_indices": np.zeros(0, dtype=np.int32),
             }
-            feature_dump = None
         else:
             P_for_detection = P.copy()
             P_for_detection[~band_mask, :] = 0.0
@@ -869,8 +911,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 except Exception:
                     pass
 
-        if "feature_dump" not in locals():
-            feature_dump = None
 
         features = None
         if bool(getattr(cfg, "dump_features", False)):
@@ -889,7 +929,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         keep_debug = bool(getattr(cfg, "debug_enable", False))
         keep_detector_debug = keep_debug
         keep_spectra = keep_debug
-        keep_noise_psd = bool(getattr(cfg, "keep_noise_psd", False)) or (not classifier_only_mode)
+        keep_noise_psd = bool(getattr(cfg, "keep_noise_psd", False))
         keep_filtered_audio = keep_debug
         keep_gain_debug = keep_debug
 
@@ -950,15 +990,13 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         # For offline feature extraction we may want the detector path active
         # while completely bypassing the suppressor.
         P_band_all = P[band_mask]
-        mel_filter = None
         snr_gate = None
         snr_mode = None
         gain_dbg: Dict[str, Any] = {}
 
         if disable_suppression:
             noise_psd = np.zeros_like(P, dtype=work_dtype)
-            N_band_all = noise_psd[band_mask]
-            N_band_eff = N_band_all
+            N_band_eff = noise_psd[band_mask]
             ratio_med_t = np.zeros(T, dtype=work_dtype)
             G = np.ones_like(P)
             G_band = np.ones_like(P_band_all)
@@ -968,7 +1006,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             gain_dbg["suppression_disabled"] = True
         else:
             noise_psd = self._estimate_noise_psd_fft(P, freqs, is_rain_for_psd, sr=sr)
-            mel_filter = None
 
             # 4) Gain computation (confidence-weighted)
             N_band_all = noise_psd[band_mask]

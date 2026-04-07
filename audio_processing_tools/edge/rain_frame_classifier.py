@@ -117,6 +117,8 @@ def extract_td_features_inline(
     hop: int,
     operating_band: Tuple[float, float],
     mode_bands: Optional[Tuple[Tuple[float, float], ...]],
+    td_input_mode: str,
+    td_input_band: Optional[Tuple[float, float]],
     time_flux_band: Optional[Tuple[float, float]],
     bp_order: int,
     subframe_len: int,
@@ -186,12 +188,14 @@ def extract_td_features_inline(
         times = (starts / float(fs)).astype(dtype, copy=False)
         return energy, times
 
-    def _subframe_peak_shape_features(sub_vals: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _subframe_peak_shape_features(
+        sub_vals: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         env = np.asarray(sub_vals, dtype=dtype).reshape(-1)
         N = env.size
         if N == 0:
             z = np.zeros(0, dtype=dtype)
-            return z, z, z, z, z, np.zeros(0, dtype=bool)
+            return z, z, z, z, z, z, np.zeros(0, dtype=bool)
 
         if N >= 3:
             kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
@@ -278,13 +282,28 @@ def extract_td_features_inline(
             out[t] = float(v0 + v1)
         return out
 
-    x_bp = _mode_band_comb(x)
+    td_mode = str(td_input_mode).lower()
+    if td_mode == "default":
+        # Use the caller-provided waveform as-is. When the caller passes x_proc,
+        # this becomes the default operating-band TD frontend.
+        x_td = x.copy()
+    elif td_mode == "comb_filter":
+        x_td = _mode_band_comb(x)
+    elif td_mode == "bandpass":
+        band = td_input_band if td_input_band is not None else operating_band
+        x_td = _bandpass(x, band)
+    else:
+        raise ValueError(
+            f"Unsupported td_input_mode={td_input_mode!r}. "
+            "Expected one of {'default', 'comb_filter', 'bandpass'}."
+        )
+
     if time_flux_band is not None:
         x_flux = _bandpass(x, time_flux_band)
     else:
-        x_flux = x_bp.copy()
-
-    frames = _frame_view(x_bp)
+        x_flux = x_td.copy()
+    
+    frames = _frame_view(x_td)
     Tloc = frames.shape[0]
     frame_times = (np.arange(Tloc, dtype=dtype) * hop) / float(fs)
     sub_energy, sub_times = _subframe_energy(x_flux)
@@ -525,6 +544,10 @@ class RainFrameClassifierMixin:
             )
         td_soft_subframe_len = int(self._dget("td_soft_subframe_len", 128))
         td_soft_subframe_hop = int(self._dget("td_soft_subframe_hop", 128))
+        td_input_mode = str(self._dget("td_input_mode", "default")).lower()
+        td_input_band = self._dget("td_input_band", None)
+        if td_input_band is not None:
+            td_input_band = (float(td_input_band[0]), float(td_input_band[1]))
         td_soft_baseline_win_sec = float(self._dget("td_soft_baseline_win_sec", 0.5))
         td_soft_baseline_q = float(self._dget("td_soft_baseline_q", 20.0))
         td_soft_baseline_min_hist_sec = float(self._dget("td_soft_baseline_min_hist_sec", 0.25))
@@ -593,6 +616,8 @@ class RainFrameClassifierMixin:
                     hop=int(self._dget("hop", 128)),
                     operating_band=(op_lo, op_hi),
                     mode_bands=tuple((float(a), float(b)) for (a, b) in mode_bands),
+                    td_input_mode=td_input_mode,
+                    td_input_band=td_input_band,
                     time_flux_band=td_soft_time_flux_band,
                     bp_order=td_soft_bp_order,
                     subframe_len=td_soft_subframe_len,
@@ -975,8 +1000,8 @@ class RainFrameClassifierMixin:
         frame_class[(noise_conf >= noise_hi) & weak_mode_flux & (~is_rain)] = FrameClass.NOISE
         frame_class[is_rain] = FrameClass.RAIN
 
-        # PSD update gating is intentionally not decided here.
-        # Downstream suppressor should derive it from FrameClass.
+        # PSD update gating is not decided here.
+        # Downstream suppressor logic may optionally use FrameClass, depending on configuration.
 
         det_debug = {
             # Core detector features / outputs still relevant to the current rule
@@ -1012,18 +1037,14 @@ class RainFrameClassifierMixin:
         feature_dump: Dict[str, Any] = {}
 
         if feature_dump_level > 0:
-            # Level 1: minimal raw features needed to replay the current TD+FD
-            # decision logic offline.
+            # Level 1: compact feature set for offline analysis and replay of the
+            # current TD+FD decision logic, plus a few closely related TD shape features.
             feature_dump = {
                 "frame_times": detector_frame_times,
                 "mode_flux_score": mode_flux_score,
                 "td_time_flux_score": td_time_flux_score,
                 "td_crest_factor": td_crest_factor,
                 "td_kurtosis": td_kurtosis,
-                "td_rise_time_sec": td_rise_time_sec,
-                "td_fall_time_sec": td_fall_time_sec,
-                "td_rise_slope": td_rise_slope,
-                "td_fall_slope": td_fall_slope,
             }
             if feature_dump_level == 1:
                 feature_dump.update({
@@ -1031,6 +1052,10 @@ class RainFrameClassifierMixin:
                     "frame_class": frame_class,
                     "td_soft_label": td_soft_label.astype(np.int8),
                     "peak_ratio": peak_ratio,
+                    "td_rise_time_sec": td_rise_time_sec,
+                    "td_fall_time_sec": td_fall_time_sec,
+                    "td_rise_slope": td_rise_slope,
+                    "td_fall_slope": td_fall_slope,
                     })
 
             if feature_dump_level > 1:
@@ -1038,7 +1063,6 @@ class RainFrameClassifierMixin:
                 feature_dump.update({
                     "peak_ratio": peak_ratio,
                     "flux_primary": flux_primary,
-                    "peak_ratio": peak_ratio,
                     "peak_gate_score": peak_gate_score,
                     "peak_gate": peak_gate.astype(np.int8),
                     "peak_valid_count": peak_valid_count,
@@ -1048,10 +1072,6 @@ class RainFrameClassifierMixin:
                     "td_soft_label": td_soft_label.astype(np.int8),
                     "td_vote_count": td_vote_count,
                     "td_soft_score": td_soft_score,
-                    "td_rise_time_sec": td_rise_time_sec,
-                    "td_fall_time_sec": td_fall_time_sec,
-                    "td_rise_slope": td_rise_slope,
-                    "td_fall_slope": td_fall_slope,
                     "td_energy_envelope": td_energy_envelope,
                     "td_peak_energy": td_peak_energy,
                 })
