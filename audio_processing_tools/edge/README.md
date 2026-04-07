@@ -55,9 +55,8 @@ The system consists of two tightly coupled components:
    - Applies adaptive spectral suppression
 
 The detector and suppressor are interdependent:
-This coupling enables the system to continuously adapt to changing noise conditions while preserving rain signatures.
-- Detector decisions control noise PSD updates
-- Noise PSD stabilizes detector inputs
+- The suppressor provides a time-lagged noise estimate used to normalize detector inputs
+- Detector and suppressor operate on the same frame-level spectral representation
 
 ⸻
 
@@ -160,20 +159,18 @@ Detection ∝ P(t) / N(t-1)
 
 Effect:
 	•	Wind bursts → suppressed
-	•	Mechanical noise → normalized out
+	•	Mechanical noise → reduced when it behaves like slowly varying background energy
 	•	Rain impulses → preserved
 
 ⸻
 
-2. Classifier-Gated PSD Update
+2. Stable Noise PSD Estimation
 
-Noise PSD is updated only on non-rain frames:
-
-update PSD only if frame_class == NOISE
+Noise PSD is estimated using a causal low-quantile style tracker on the spectral power, without relying on detector frame decisions in the current configuration.
 
 Effect:
-	•	Rain energy does NOT corrupt noise estimate
-	•	PSD tracks true background noise
+	•	Avoids feedback from detector errors into the PSD estimate
+	•	Provides a stable background-noise estimate for normalization and suppression
 
 ⸻
 
@@ -233,34 +230,19 @@ while tracking slow background noise (wind/mechanical)
 - Strong impulsive mechanical noise:
   - Can resemble rain in TD features
 
-- Rapidly changing noise:
-  - PSD estimate may lag temporarily
-
-- Misclassification feedback:
-  - Incorrect frame labels can bias PSD tracking and affect suppression
+- Frame misclassification: Incorrect rain/noise labels can affect clip-level decisions and suppression behavior
 
 ⸻
 
 🆚 Why This Works Better in Noisy Environments
 
-Challenge	Typical System	This Design
-Wind bursts	Misclassified as rain	Normalized out
-Mechanical vibration	Strong false positives	Filtered by TD + normalization
-Non-stationary noise	PSD drift	Quantile + gating
-Rain + noise overlap	Suppressed	Preserved via confidence + SNR
+| Challenge             | Typical System               | This Design                              |
+|----------------------|------------------------------|------------------------------------------|
+| Wind bursts          | Misclassified as rain        | Normalized out                           |
+| Mechanical vibration | Strong false positives       | Filtered by TD + normalization           |
+| Non-stationary noise | PSD drift or slow adaptation | Quantile tracking + lagged normalization |
+| Rain + noise overlap | Suppressed                   | Preserved via confidence + SNR           |
 
-
-⸻
-
-🧠 Key Insight (Updated)
-
-This system separates signal vs noise in the relative domain
-instead of absolute energy
-
-That is the fundamental reason it works well in:
-	•	Windy conditions
-	•	Pivot environments
-	•	Mixed noise scenarios
 
 ⸻
 
@@ -354,7 +336,7 @@ ema_up / ema_down
 Properties
 	•	Causal
 	•	Handles non-stationary noise
-	•	Classifier-gated updates
+	•	Independent of detector decisions in current configuration
 
 ⸻
 
@@ -492,7 +474,7 @@ disable_suppression	Detector only
 ⚠️ Limitations
 	•	FD features are highly correlated
 	•	Threshold-based decision logic
-	•	PSD depends on classifier → feedback loop risk
+	•	PSD tracking may lag under rapidly changing noise conditions
 	•	Potential overfitting on small datasets
 
 ⸻
@@ -514,40 +496,9 @@ System
 
 ⸻
 
-🧠 Key Insight
-
-The system is a closed-loop adaptive system
-
-	•	Detector → controls PSD update
-	•	PSD → stabilizes detector
-	•	Gain → preserves rain
-
-This coupling is both:
-	•	Strength (robustness)
-	•	Risk (error propagation)
-
-⸻
-
 📌 Summary
 
-This pipeline provides a robust baseline for rain detection in noisy environments, combining:
+This pipeline provides a robust baseline for rain detection in wind-affected and slowly varying noisy environments, combining:
 	•	Spectral + temporal features
 	•	Adaptive noise modeling
 	•	Confidence-aware suppression
-
-⸻
-
-Final Review Verdict
-
-Overall: Strong design (8.5 / 10)
-
-Excellent
-	•	Detector–suppressor integration
-	•	Noise-normalized detection
-	•	Gain stabilization
-
-Needs Attention
-	•	Threshold sensitivity
-	•	PSD drift edge cases
-	•	Generalization across datasets
-
