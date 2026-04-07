@@ -1,359 +1,553 @@
+📄 Noise Suppressor & Rain Detector
+
+Overview
+This system enables accurate rain detection and measurement in environments where acoustic signals are heavily contaminated by wind and slowly varying background noise.
+This module implements a real-time rain detection and spectral noise suppression pipeline for acoustic disdrometer signals (Fs ≈ 11.16 kHz).
+
+It is designed for noisy outdoor environments, particularly where signals are affected by wind and slowly varying background noise.
+
+The system is intended to be robust to:
+	•	Wind-induced noise
+	•	Slowly varying environmental and structural noise
 
-# 🌧️ CM7 Rain Detection Algorithm
+Note:
+	This design has not been exhaustively validated across all possible deployment conditions. Performance may vary in environments with strong mechanical or highly structured vibrations.
 
-## Overview
+⸻
 
-The **CM7 Rain Detection Algorithm** is a real-time acoustic signal processing pipeline designed to:
+🧱 Architecture
 
-- Detect rain events from audio signals
-- Suppress environmental noise (wind, mechanical, pivot noise)
-- Provide stable rain/noise classification for downstream measurement
+Input Audio
+   │
+   ▼
+[Pre-filter]
+   │
+   ▼
+[STFT → Power Spectrum]
+   │
+   ├── Detector Path
+   │     ├── FD features (mode flux)
+   │     ├── TD features (crest, kurtosis)
+   │     ├── Noise-normalized spectrum (optional)
+   │     └── Frame classification
+   │
+   └── Suppressor Path
+         ├── Noise PSD estimation (causal)
+         ├── Adaptive gain computation
+         ├── Spectral suppression
+         └── ISTFT (optional)
+   │
+   ▼
+[Clip Aggregation]
+   │
+   ▼
+Outputs (metrics + state)
 
-The system operates on audio sampled at **11,162 Hz** and is optimized for **Cortex-M7 (CM7)** deployment.
 
----
+The system consists of two tightly coupled components:
 
-## 🧠 High-Level Architecture (Corrected Flow)
+1. Detector Path
+   - Extracts FD + TD features
+   - Classifies frames as rain or noise
 
-Raw Audio Input
-│
-▼
-[ Preprocessing ]
-│
-├───────────────► [ Time-Domain Detector ]
-│                         │
-│                         ▼
-│                  (Impulse Features)
-│
-▼
-[ STFT → Spectrum S(f,t) ]
-│
-▼
-[ Noise Estimation N(f,t) ]
-│
-▼
-[ Spectral Noise Suppression / Normalization ]
-│
-▼
-[ Noise-Suppressed Spectrum Ŝ(f,t) ]
-│
-▼
-[ Spectral Feature Extraction ]
-│
-▼
-[ Rain Frame Classifier (Fusion) ]
-│
-▼
-Final Rain Decision
+2. Suppressor Path
+   - Estimates noise PSD
+   - Applies adaptive spectral suppression
 
----
+The detector and suppressor are interdependent:
+This coupling enables the system to continuously adapt to changing noise conditions while preserving rain signatures.
+- Detector decisions control noise PSD updates
+- Noise PSD stabilizes detector inputs
 
-## ⚠️ Critical Design Insight
+⸻
 
-> **All spectral rain detection features are computed on the noise-suppressed (or noise-normalized) spectrum, NOT on the raw spectrum.**
+🎯 Design Goals
 
-This is essential because:
+Robust Detection
+	•	Detect impulsive rain signatures
+	•	Reject wind / mechanical noise
 
-- Raw spectrum is dominated by wind/mechanical noise
-- Rain signatures become separable only after noise compensation
-- Prevents systematic false positives during noisy periods
+Noise-Robust Measurement
+	•	Suppress non-rain energy
+	•	Preserve rain spectral structure
 
----
+Edge Deployment
+	•	Causal / low latency
+	•	Float32 support
+	•	Configurable + modular
 
-## ⚙️ Processing Pipeline
+⸻
+🧠 Core Design Principles
 
----
+1. Frame-Level Causal Processing
 
-### 1. Preprocessing
+The pipeline operates in a frame-causal manner (with small optional latency depending on STFT configuration):
+	•	Frame decisions depend only on:
+	•	Current frame t
+	•	Past frames ≤ t
+	•	No future information is used in:
+	•	Noise PSD estimation
+	•	Gain computation
+	•	Frame classification
 
-- High-pass filtering (~350 Hz) to remove low-frequency noise
-- Frame segmentation:
-  - Frame length: `512 samples` (~46 ms)
-  - Sub-frame: ~11–12 ms
+This ensures:
+	•	✅ Real-time deployability (CM4 / CM7)
+	•	✅ Stable behavior in streaming conditions
+	•	✅ No look-ahead bias
 
----
+⚠️ Note:
+	•	STFT with center=True introduces symmetric latency
+	•	Setting center=False enables strictly causal execution for firmware deployment
 
-### 2. Time-Domain Detector
+⸻
 
-Detects impulsive rain signatures directly from waveform.
+2. Time-Lagged Noise Estimate (Key Innovation)
 
-#### Features
+A critical design feature is the use of lagged noise PSD:
 
-- Sub-frame energy
-- Time flux (rapid rise detection)
-- Crest factor (`peak / RMS`)
-- Kurtosis (impulsiveness)
+N_lag(t) = N(t-1)
 
-#### Output
+This is used in two places:
 
-- `time_flux_score`
-- `crest_factor`
-- `kurtosis`
-- `td_soft_label`
+A. Detector input normalization
 
----
+log(P(t)) - log(N_lag(t))
 
-### 3. Spectral Representation
+B. Gain computation
 
-- Compute STFT:
+G(t) uses N_lag(t) instead of N(t)
 
-S(f,t)
 
-- Focus on rain-sensitive bands:
-- 400–700 Hz (primary resonance)
-- Harmonics (800 Hz, 1.6 kHz, etc.)
+⸻
 
----
+🎯 Why Lagged PSD Matters
 
-### 4. Noise Estimation
+Problem (without lag)
 
-Tracks background noise in frequency domain.
+If current frame PSD is used:
+	•	Rain energy leaks into noise estimate
+	•	Suppression becomes self-referential
+	•	Detector sees distorted spectrum
 
-#### Method
+⸻
 
-- Slow adaptive tracking:
-- Quantile-based OR EMA
-- Updated only using **non-rain frames**
+Solution (with lag)
 
-#### Output
+Using N(t-1) ensures:
+	•	✅ No leakage of current frame signal into noise estimate
+	•	✅ Stable normalization (true “above-noise” signal)
+	•	✅ Cleaner separation between:
+	•	rain transients
+	•	slowly varying noise floor
 
-N(f,t)
+💡 This effectively converts the system into a causal, frame-level SNR estimator
 
----
+⸻
 
-### 5. Spectral Noise Suppression / Normalization
+🌧️ Handling Noisy Conditions (Key Strength)
 
-Transforms raw spectrum into a **rain-relevant representation**.
+This design is explicitly optimized for non-stationary, real-world noise.
 
-#### Gain Function
+⸻
 
-G(f,t) = max(gain_floor, (S(f,t) - N(f,t)) / S(f,t))
+1. Noise-Normalized Detection
 
-#### Suppressed Spectrum
+Instead of absolute energy:
 
-Ŝ(f,t) = G(f,t) * S(f,t)
+Detection ∝ P(t) / N(t-1)
 
----
+➡ Rain is detected as energy above noise baseline, not raw amplitude.
 
-### 🔑 Interpretation
+Effect:
+	•	Wind bursts → suppressed
+	•	Mechanical noise → normalized out
+	•	Rain impulses → preserved
 
-This stage effectively computes:
+⸻
 
-- Signal above noise floor
-- Noise-normalized energy
-- Improves rain vs noise separability
+2. Classifier-Gated PSD Update
 
----
+Noise PSD is updated only on non-rain frames:
 
-### 6. Spectral Feature Extraction (ON Ŝ, NOT S)
+update PSD only if frame_class == NOISE
 
-All spectral features are computed on:
+Effect:
+	•	Rain energy does NOT corrupt noise estimate
+	•	PSD tracks true background noise
 
-Ŝ(f,t)
+⸻
 
-#### Features
+3. Adaptive Suppression via Confidence
 
-- `z_primary` → normalized band energy
-- `flux_primary` → spectral flux
-- `z_modes`, `flux_modes`
-- SNR-like ratios
+oversub ∝ noise_conf
 
----
+	•	Rain-like frames → low suppression
+	•	Noise-like frames → strong suppression
 
-### 7. Rain Frame Classifier (Fusion Logic)
+Effect:
+	•	Preserves rain structure
+	•	Aggressively removes noise
 
-Combines:
+⸻
 
-#### Time-Domain Features
+4. SNR-Based Protection Layer
 
-- `time_flux_score`
-- `crest_factor`
-- `kurtosis`
+Optional gating:
 
-#### Spectral Features (from Ŝ)
+High SNR → reduce suppression
 
-- `z_primary`, `z_modes`
-- `flux_primary`, `flux_modes`
-- Band energy ratios
+Effect:
+	•	Strong rain impulses are protected
+	•	Prevents over-suppression
 
----
+⸻
 
-### Decision Logic (Simplified)
+5. Asymmetric PSD Tracking
 
-Rain = (Time-domain impulse detected)
-AND
-(Spectral energy consistent with rain AFTER noise suppression)
+ema_up  (fast)
+ema_down (slow)
 
----
+Effect:
+	•	Quickly adapts to increasing noise
+	•	Slowly decays → avoids instability
 
-### Soft Labelling
+⸻
 
-- Combines features into:
+📌 Combined Effect
 
-soft_score ∈ [0, 1]
+These mechanisms together create:
 
-- Used for:
-- Threshold tuning
-- Visualization
-- Continuous confidence
+A system that detects relative energy changes (rain)
+while tracking slow background noise (wind/mechanical)
 
----
+⸻
 
-## 📊 Outputs
+⚠️ Known Failure Modes (Important for Deployment)
 
-Per frame:
+- Rapidly changing noise:
+  - Noise PSD may lag, causing temporary under- or over-suppression
 
-- `is_rain`
-- `rain_conf`, `noise_conf`
-- `soft_score`
-- `noise_psd`
-- `gain G(f,t)`
-- Debug features:
-- `flux_primary`
-- `z_modes`
-- `crest_factor`
-- `kurtosis`
+- Very low rain intensity:
+  - May fall below noise floor and be missed
 
----
+- Strong impulsive mechanical noise:
+  - Can resemble rain in TD features
 
-## 🧩 Key Design Principles
+- Rapidly changing noise:
+  - PSD estimate may lag temporarily
 
----
+- Misclassification feedback:
+  - Incorrect frame labels can bias PSD tracking and affect suppression
 
-### 1. Detection on Noise-Suppressed Domain
+⸻
 
-> Spectral detection operates on **Ŝ(f,t)**, not raw **S(f,t)**
+🆚 Why This Works Better in Noisy Environments
 
----
+Challenge	Typical System	This Design
+Wind bursts	Misclassified as rain	Normalized out
+Mechanical vibration	Strong false positives	Filtered by TD + normalization
+Non-stationary noise	PSD drift	Quantile + gating
+Rain + noise overlap	Suppressed	Preserved via confidence + SNR
 
-### 2. Separation of Roles
 
-| Component | Role |
-|----------|------|
-| Time-domain detector | Impulse detection |
-| Noise estimator | Background tracking |
-| Suppressor | Signal conditioning |
-| Spectral features | Rain validation |
-| Classifier | Decision fusion |
+⸻
 
----
+🧠 Key Insight (Updated)
 
-### 3. Robustness to Real-World Noise
+This system separates signal vs noise in the relative domain
+instead of absolute energy
 
-Handles:
+That is the fundamental reason it works well in:
+	•	Windy conditions
+	•	Pivot environments
+	•	Mixed noise scenarios
 
-- Wind
-- Pivot noise
-- Mechanical vibrations
+⸻
 
-Through:
+✅ Suggested One-Line Summary (for slides / exec)
 
-- Band-limited processing
-- Noise tracking
-- Multi-feature fusion
+“Rain is detected as energy above a continuously learned noise baseline, enabling robust performance in highly noisy environments.”
 
----
+⸻
 
-### 4. Real-Time Embedded Design
 
-- Frame-based processing
-- Low memory footprint
-- Optimized for CM7
+🔊 Processing Pipeline
 
----
+1. Pre-filter
 
-## 🔧 Key Parameters
+pre_filter_mode = "highpass" | "bandpass" | "none"
 
-### Time-Domain
+	•	High-pass → removes structural noise
+	•	Band-pass → restricts to operating band (400–3500 Hz)
 
-| Parameter | Typical Value |
-|----------|--------------|
-| `crest_factor_min` | ~4 |
-| `kurtosis_min` | ~6 |
-| `time_flux_score_min` | tuned |
+⸻
 
----
 
-### Spectral
+2. STFT
 
-| Parameter | Description |
-|----------|------------|
-| `band_hz` | (400–700 Hz) |
-| `z_primary` | normalized energy (post suppression) |
-| `flux_primary` | spectral change |
+n_fft = 256
+hop = 128
+window = "hann"
 
----
+Outputs:
+	•	S → complex spectrum
+	•	P = |S|² → power
 
-### Noise Estimation
+⸻
 
-| Parameter | Description |
-|----------|------------|
-| `n_hist` | history length |
-| `q` | quantile |
-| `alpha` | smoothing |
+3. Rain Detection
 
----
+Implemented via RainFrameClassifierMixin.
 
-## 📈 Debug & Visualization
+Input Modes
+	•	Absolute spectrum (dB)
+	•	Noise-normalized spectrum:
 
-Recommended plots:
+log(P) - log(N_lag)
 
-- Waveform + rain decisions
-- Time flux vs threshold
-- Crest factor vs threshold
-- Kurtosis vs threshold
-- Soft score vs decision
-- Spectrogram:
-- Raw `S(f,t)`
-- Suppressed `Ŝ(f,t)`
+➡ Acts like instantaneous SNR
 
----
+⸻
 
-## ⚠️ Known Challenges
+3.1 Features
 
-- Noise modulation artifacts
-- Threshold tuning across devices
-- Over-suppression risk
-- Sensitivity to extreme wind
+Frequency-domain
+	•	Mode bands (e.g. 450–650 Hz, etc.)
+	•	Mode flux score (primary feature)
+	•	Optional peak features
 
----
+Time-domain
+	•	Crest factor (strong)
+	•	Kurtosis (very strong)
+	•	Time flux (observed to be less discriminative in current datasets)	
 
-## 🚀 Future Improvements
+⸻
 
-- Adaptive thresholds
-- Multi-band fusion
-- Better noise normalization (local vs global)
-- Kalman-based noise tracking
-- Temporal smoothing
+3.2 Classification
 
----
+Outputs:
 
-## 📝 Summary
+frame_class ∈ {RAIN, NOISE}
+rain_conf ∈ [0,1]
+noise_conf = 1 - rain_conf
 
-The CM7 rain detection system is a:
 
-> **Noise-aware, hybrid time-domain + spectral detection pipeline**
+⸻
 
-that:
+🌊 Noise PSD Estimation
 
-- Detects impulsive rain signatures
-- Suppresses noise BEFORE spectral decision-making
-- Extracts features from noise-conditioned spectrum
-- Produces robust rain detection in noisy environments
+Method: Causal Quantile Tracking
 
----
+Tracks low quantile of power spectrum:
 
-## 📂 Related Modules
+if P > tracker:
+    increase slowly
+else:
+    decrease faster
 
-- `time_domain_detector.py`
-- `rain_frame_classifier.py`
-- `spectral_noise_processor.py`
-- `rain_detector.py`
+Key Parameters
 
----
+q = 0.25
+win_sec = 0.5
+ema_up / ema_down
 
-## 👨‍🔬 Author Notes
+Properties
+	•	Causal
+	•	Handles non-stationary noise
+	•	Classifier-gated updates
 
-Designed for **acoustic disdrometers in agricultural environments**, where noise is highly dynamic and device-specific.
+⸻
 
----
+🔉 Gain Computation
+
+Adaptive Oversubtraction
+
+oversub = base + noise_conf * (max - base)
+
+Typical:
+	•	base = 1.0
+	•	max = 3.0
+
+⸻
+
+Gain Modes
+
+sqrt subtraction (default)
+
+G = 1 - α * sqrt(N / P)
+
+Wiener
+
+G = max(P - αN, 0) / P
+
+
+⸻
+
+Stabilization
+	•	Frequency smoothing → reduces musical noise
+	•	Temporal smoothing → disabled for rain frames
+
+⸻
+
+SNR Gating (Optional)
+
+Reduces suppression when SNR is high:
+
+if SNR high → reduce suppression
+
+
+⸻
+
+🔁 Suppression
+
+S_hat = G * S
+
+Optional:
+
+y = ISTFT(S_hat)
+
+
+⸻
+
+📊 Clip-Level Aggregation
+
+Clip-level aggregation is used to improve robustness by requiring consistent evidence of rain across multiple frames, rather than relying on isolated detections.
+
+Rain Decision
+
+clip_is_rain = rain_frame_count >= clip_rain_min_frames
+
+This ensures that short-duration noise bursts or isolated misclassifications do not trigger rain detection at the clip level.
+
+⸻
+
+Confidence
+
+median_conf = median(rain_conf on rain frames)
+abundance_conf = rain_frame_count / (2 * min_frames)
+
+clip_rain_conf = max(median_conf, abundance_conf)
+
+
+⸻
+
+📦 Outputs
+
+Metrics
+
+{
+  "clip_is_rain": bool,
+  "clip_rain_conf": float,
+  "rain_frame_count": int,
+  "clip_rain_fraction": float,
+  "mean_noise_floor_db": float,
+}
+
+State
+
+{
+  "frame_class": [...],
+  "rain_conf": [...],
+  "noise_conf": [...],
+  "features": {...},
+  "debug": {...},
+}
+
+
+⸻
+
+⚙️ Configuration
+
+{
+  "suppressor": {...},
+  "detector": {...}
+}
+
+Precedence:
+
+flat params > nested params > defaults
+
+
+⸻
+
+🧪 Modes
+
+Mode	Description
+Full	Detection + suppression
+classifier_only_mode	Feature extraction only
+disable_suppression	Detector only
+
+
+⸻
+
+✅ Strengths
+	•	Noise-normalized detection (core differentiator)
+	•	Strong TD features (crest, kurtosis)
+	•	Confidence-driven suppression
+	•	Modular design (detector vs suppressor)
+	•	Edge-friendly implementation
+
+⸻
+
+⚠️ Limitations
+	•	FD features are highly correlated
+	•	Threshold-based decision logic
+	•	PSD depends on classifier → feedback loop risk
+	•	Potential overfitting on small datasets
+
+⸻
+
+🔧 Improvement Opportunities
+
+Detector
+	•	Replace thresholds with learned model
+	•	Feature decorrelation
+
+Suppressor
+	•	Multi-timescale PSD tracking
+	•	Band-wise adaptive suppression
+
+System
+	•	Secondary microphone (noise reference)
+	•	Event-level detection
+	•	Distance-aware modeling
+
+⸻
+
+🧠 Key Insight
+
+The system is a closed-loop adaptive system
+
+	•	Detector → controls PSD update
+	•	PSD → stabilizes detector
+	•	Gain → preserves rain
+
+This coupling is both:
+	•	Strength (robustness)
+	•	Risk (error propagation)
+
+⸻
+
+📌 Summary
+
+This pipeline provides a robust baseline for rain detection in noisy environments, combining:
+	•	Spectral + temporal features
+	•	Adaptive noise modeling
+	•	Confidence-aware suppression
+
+⸻
+
+Final Review Verdict
+
+Overall: Strong design (8.5 / 10)
+
+Excellent
+	•	Detector–suppressor integration
+	•	Noise-normalized detection
+	•	Gain stabilization
+
+Needs Attention
+	•	Threshold sensitivity
+	•	PSD drift edge cases
+	•	Generalization across datasets
+
