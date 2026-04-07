@@ -1,4 +1,4 @@
-# edge/spectral_noise_processor.py
+# edge/rain_signal_processor.py
 
 
 
