@@ -8,7 +8,7 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
-from .edge.spectral_noise_processor import SpectralNoiseProcessor, build_noise_config
+from audio_processing_tools.edge.rain_signal_processor import SpectralNoiseProcessor, build_noise_config
 from .processors import BaseProcessor
 
 
