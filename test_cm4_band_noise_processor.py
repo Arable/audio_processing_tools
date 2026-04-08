@@ -7,7 +7,7 @@
 # ver 3 code
 # %%
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -110,18 +110,41 @@ DEBUG_PARAMS: Dict[str, Any] = {
 # -------------------------
 # Inputs
 # -------------------------
-INPUT_TYPE = "LocalPath"  # "RemotePath" or "LocalPath"
+INPUT_TYPE = "LocalPath" #"RemotePath" or "LocalPath"
 
-#TEST_VECTOR_PATH = "/Users/vikrantoak/Downloads/tv_sets/balanced_rain_test_vectors"
-TEST_VECTOR_PATH = "/home/santhosh/Mark3/Doc/Rain/noise_cancel/test_vector/raw_audio/D009920"
-LOCAL_AUDIO_CACHE = "/home/santhosh/Mark3/Doc/Rain/noise_cancel/audio_header_cache"
-M3CLI_PATH = "/home/santhosh/repo/mark3-firmware-trunk/Utilities/M3cli/m3cli"
+
+#TEST_VECTOR_PATH = "/Users/santhoshp/mark3/rain/test_vector"
+#TEST_VECTOR_PATH = "/Users/santhoshp/mark3/rain/test_vector"
+TEST_VECTOR_PATH = "/Users/santhoshp/mark3/rain/audio_header_cache"
+LOCAL_AUDIO_CACHE = "/Users/santhoshp/mark3/rain/audio_header_cache"
+M3CLI_PATH = "/Users/santhoshp/repo/mark3-firmware-trunk/Utilities/M3cli/m3cli"
 M3CLI_DIR  = str(Path(M3CLI_PATH).parent)
+
+# =============================================================================
+# >>>  TOGGLE THESE TO SELECT THE COMPARISON MODE  <<<
+#
+#   COMPARE_C_VS_DEVICE = True
+#       Runs BOTH the PC C-library AND the Mark3 device (m3cli), then compares
+#       the two against each other.
+#       C-library output → NOS_BAND_C_<stem>.TXT   ("py" side in charts)
+#       Device output    → NOS_BAND_<stem>.TXT      ("nb" side in charts)
+#       (USE_LOCAL_LIB is ignored in this mode)
+#
+#   COMPARE_C_VS_DEVICE = False, USE_LOCAL_LIB = True
+#       Compare Python reference vs PC C-library.
+#
+#   COMPARE_C_VS_DEVICE = False, USE_LOCAL_LIB = False
+#       Compare Python reference vs Mark3 device (m3cli).
+# =============================================================================
+COMPARE_C_VS_DEVICE = True   # True → C-lib vs device;  False → Python vs one side
+USE_LOCAL_LIB       = True    # (only used when COMPARE_C_VS_DEVICE = False)
 
 ENABLE_COMBINED_PLOT = True   # combined scatter + confusion matrix (all files)
 ENABLE_OTHER_PLOTS   = False  # per-file band-noise state plots
 
-N = 100
+MAX_FILES = 10   # max number of files to process (None = all files)
+
+N = 10
 QUERY = f"""
     (
         SELECT *
@@ -530,7 +553,7 @@ from pathlib import Path
 
 # Band-noise estimator (same module used for CM4 comparison throughout this repo)
 sys.path.insert(0, str(Path(__file__).parent.parent / "mark3-firmware-trunk"))
-from band_noise_estimator import BandNoiseEstimator, BandNoiseEstimatorConfig
+from audio_processing_tools.edge.band_noise_estimator import BandNoiseEstimator, BandNoiseEstimatorConfig
 
 # Audio parser from this repo — handles PCM (version=0) and ALAC (version>=1)
 from audio_processing_tools.parse import parse_mark_audio_file
@@ -639,9 +662,92 @@ def dump_eband_mband(audio_path: str,
     return n_frames
 
 
-# ---------------------------------------------------------------------------
-# m3cli integration helpers
-# ---------------------------------------------------------------------------
+# =============================================================================
+# CODE PATH A – C shared library via ctypes  (USE_LOCAL_LIB = True)
+# =============================================================================
+#
+# Build the library first:
+#   cd /Users/santhoshp/repo/mark3-firmware-trunk/Utilities/band_noise_pylib
+#   cmake -B build -DCMSISDSP_LIB=/path/to/libCMSISDSP.a
+#   cmake --build build
+#
+# Then either:
+#   • pass --lib /path/to/libband_noise_pylib.dylib on the command line, or
+#   • set the BAND_NOISE_LIB environment variable.
+
+import ctypes as _ctypes
+
+# Default search locations for the shared library
+_BAND_NOISE_LIB_CANDIDATES = [
+    str(Path(__file__).parent.parent /
+        "mark3-firmware-trunk/Utilities/band_noise_pylib/build/libband_noise_pylib.dylib"),
+    str(Path(__file__).parent.parent /
+        "mark3-firmware-trunk/Utilities/band_noise_pylib/build/libband_noise_pylib.so"),
+]
+
+
+def _load_c_lib(lib_path=None):
+    """Load and configure libband_noise_pylib; return ctypes handle."""
+    if lib_path is None:
+        lib_path = os.environ.get("BAND_NOISE_LIB")
+    if lib_path is None:
+        for c in _BAND_NOISE_LIB_CANDIDATES:
+            if os.path.exists(c):
+                lib_path = c
+                break
+    if lib_path is None:
+        raise FileNotFoundError(
+            "Cannot find libband_noise_pylib.\n"
+            "Pass --lib /path/to/libband_noise_pylib.dylib "
+            "or set BAND_NOISE_LIB environment variable."
+        )
+    lib = _ctypes.CDLL(lib_path)
+    # int band_noise_process_nos_aud_file(const char*, const char*)
+    lib.band_noise_process_nos_aud_file.restype  = _ctypes.c_int
+    lib.band_noise_process_nos_aud_file.argtypes = [_ctypes.c_char_p, _ctypes.c_char_p]
+    # void bn_reset()
+    lib.bn_reset.restype  = None
+    lib.bn_reset.argtypes = []
+    print(f"Loaded C library: {lib_path}")
+    return lib
+
+
+def run_c_lib_nos_aud(audio_path: str,
+                      output_path: str,
+                      lib_path: str = None) -> str:
+    """
+    Run band_noise_process_nos_aud_file() from the C shared library.
+
+    Reads a Mark3 raw-PCM nos_aud.bin (40-byte header + int16 frames),
+    runs the CM4 algorithm, and writes per-frame results to output_path:
+        <frame_idx> <E_band> <M_band> <M_clean>
+
+    Parameters
+    ----------
+    audio_path  : path to the Mark3 .bin audio file
+    output_path : where to write the output text file
+    lib_path    : path to libband_noise_pylib.dylib/.so (None = auto-detect)
+
+    Returns
+    -------
+    str : output_path
+    """
+    lib = _load_c_lib(lib_path)
+    print(f"\nrun_c_lib_nos_aud: {audio_path}")
+    print(f"  output: {output_path}")
+    rc = lib.band_noise_process_nos_aud_file(
+        audio_path.encode(), output_path.encode()
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"band_noise_process_nos_aud_file() returned {rc} for {audio_path!r}"
+        )
+    return output_path
+
+
+# =============================================================================
+# CODE PATH B – Mark3 device via m3cli subprocess  (USE_LOCAL_LIB = False)
+# =============================================================================
 
 # m3cli binary and working directory — set via macros at the top of this file
 _M3CLI_DEFAULT = M3CLI_PATH
@@ -650,8 +756,8 @@ _M3CLI_DIR     = M3CLI_DIR
 
 def run_m3cli_nos_aud(audio_path: str,
                       m3cli_path: str = _M3CLI_DEFAULT,
-                      nb_out_path: str | None = None,
-                      timeout: int = 120) -> str:
+                      nb_out_path: Optional[str] = None,
+                      timeout: int = 300) -> str:
     """
     Run ``./m3cli 'nos_aud <audio_path>'``, wait for completion, and return
     the local path to the downloaded NOS_BAND.TXT.
@@ -677,15 +783,29 @@ def run_m3cli_nos_aud(audio_path: str,
     print(f"\nrun_m3cli_nos_aud: {' '.join(repr(c) for c in cmd)}")
     print(f"  working dir : {m3cli_dir}")
 
+    # Remove any stale NOS_BAND.TXT so we can tell if this run produced a fresh one.
+    if os.path.isfile(nb_default):
+        os.remove(nb_default)
+
     result = subprocess.run(
         cmd,
         cwd=m3cli_dir,
         timeout=timeout,
-        capture_output=False,   # let stdout/stderr stream to the terminal
+        capture_output=True,    # capture so we can inspect output on failure
+        text=True,
     )
 
+    # Always echo captured output so the run is visible in the test log.
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+
     if result.returncode != 0:
-        raise RuntimeError(f"m3cli exited with code {result.returncode}")
+        raise RuntimeError(
+            f"m3cli exited with code {result.returncode} "
+            f"while processing {audio_path!r}"
+        )
 
     if not os.path.isfile(nb_default):
         raise FileNotFoundError(
@@ -742,11 +862,20 @@ def compare_m_clean(py_out_path: str,
     py_frames = py_data[:, 0].astype(int)
     nb_frames = nb_data[:, 0].astype(int)
 
+    # Deduplicate frame indices (keep first occurrence) so that isin-based
+    # alignment always yields arrays of equal length.
+    _, py_first = np.unique(py_frames, return_index=True)
+    _, nb_first = np.unique(nb_frames, return_index=True)
+    py_data = py_data[np.sort(py_first)]
+    nb_data = nb_data[np.sort(nb_first)]
+    py_frames = py_data[:, 0].astype(int)
+    nb_frames = nb_data[:, 0].astype(int)
+
     # --- align on frame index (intersection) ---
     common = np.intersect1d(py_frames, nb_frames)
     if len(common) == 0:
         print("compare_m_clean: no common frame indices — cannot compare")
-        return False
+        return False, np.array([]), np.array([])
 
     py_mc = py_data[np.isin(py_frames, common), 1]
     nb_mc = nb_data[np.isin(nb_frames, common), 1]
@@ -821,12 +950,25 @@ def plot_combined_charts(all_py_mc: np.ndarray,
     """
     import matplotlib.pyplot as plt
 
+    if len(all_py_mc) != len(all_nb_mc):
+        raise ValueError(
+            f"plot_combined_charts: array size mismatch — "
+            f"all_py_mc has {len(all_py_mc)} elements but "
+            f"all_nb_mc has {len(all_nb_mc)} elements"
+        )
+
+    all_py_mc = np.asarray(all_py_mc)
+    all_nb_mc = np.asarray(all_nb_mc)
+
     diff     = all_py_mc - all_nb_mc
     abs_diff = np.abs(diff)
-    within   = abs_diff < abs_tol
+    within   = np.asarray(abs_diff < abs_tol)
     n        = len(all_py_mc)
     n_pass   = int(np.sum(within))
     n_fail   = n - n_pass
+
+    pass_idx = np.where(within)[0]
+    fail_idx = np.where(~within)[0]
 
     mae      = float(np.mean(abs_diff))
     rmse     = float(np.sqrt(np.mean(diff ** 2)))
@@ -853,10 +995,10 @@ def plot_combined_charts(all_py_mc: np.ndarray,
     #  Scatter plot                                                        #
     # ------------------------------------------------------------------ #
     ax = axes[0]
-    ax.scatter(all_nb_mc[within], all_py_mc[within],
+    ax.scatter(all_nb_mc[pass_idx], all_py_mc[pass_idx],
                s=8, alpha=0.5, color="steelblue", label=f"PASS ({n_pass})")
-    if (~within).any():
-        ax.scatter(all_nb_mc[~within], all_py_mc[~within],
+    if n_fail > 0:
+        ax.scatter(all_nb_mc[fail_idx], all_py_mc[fail_idx],
                    s=15, alpha=0.85, color="crimson", label=f"FAIL ({n_fail})")
     lo = min(all_nb_mc.min(), all_py_mc.min())
     hi = max(all_nb_mc.max(), all_py_mc.max())
@@ -914,25 +1056,42 @@ def plot_combined_charts(all_py_mc: np.ndarray,
 if __name__ == "__main__":
     import argparse as _argparse
 
+    if COMPARE_C_VS_DEVICE:
+        _mode_desc = "C-library vs device (m3cli)"
+    elif USE_LOCAL_LIB:
+        _mode_desc = "Python vs C-library"
+    else:
+        _mode_desc = "Python vs device (m3cli)"
+
     _ap = _argparse.ArgumentParser(
         description=(
-            "Run Python BandNoiseEstimator and compare M_clean with device output via m3cli.\n"
+            f"Compare M_clean outputs — active mode: {_mode_desc}\n"
+            f"  COMPARE_C_VS_DEVICE={COMPARE_C_VS_DEVICE}  USE_LOCAL_LIB={USE_LOCAL_LIB}\n"
             "With no positional argument: processes every .bin file under TEST_VECTOR_PATH.\n"
             "With a positional argument: processes that single file only."
         )
     )
     _ap.add_argument("audio", nargs="?", default=None,
                      help="Mark3 audio .bin file to process (omit to run all files in TEST_VECTOR_PATH)")
-    _ap.add_argument("--nb-out", default=None,
-                     help="Path for NOS_BAND.TXT copy (default: leave in m3cli dir)")
-    _ap.add_argument("--m3cli", default=_M3CLI_DEFAULT,
-                     help=f"Path to m3cli binary (default: {_M3CLI_DEFAULT})")
-    _ap.add_argument("--skip-m3cli", action="store_true",
-                     help="Skip m3cli call; compare against existing NOS_BAND.TXT instead")
-    _ap.add_argument("--existing-nb-out", default=None,
-                     help="Path to an existing NOS_BAND.TXT to use when --skip-m3cli is set")
     _ap.add_argument("--abs-tol", type=float, default=1e-3,
-                     help="Absolute tolerance for M_clean comparison — diff < abs_tol is a pass (default: 1e-3)")
+                     help="Absolute tolerance for M_clean comparison (default: 1e-3)")
+    _ap.add_argument("--limit", type=int, default=MAX_FILES,
+                     help=f"Max number of files to process (default: MAX_FILES={MAX_FILES})")
+
+    # C-library args — needed for COMPARE_C_VS_DEVICE or USE_LOCAL_LIB
+    if COMPARE_C_VS_DEVICE or USE_LOCAL_LIB:
+        _ap.add_argument("--lib", default=None,
+                         help="Path to libband_noise_pylib.dylib/.so (default: auto-detect)")
+
+    # m3cli args — needed for COMPARE_C_VS_DEVICE or not USE_LOCAL_LIB
+    if COMPARE_C_VS_DEVICE or not USE_LOCAL_LIB:
+        _ap.add_argument("--m3cli", default=_M3CLI_DEFAULT,
+                         help=f"Path to m3cli binary (default: {_M3CLI_DEFAULT})")
+        _ap.add_argument("--skip-m3cli", action="store_true",
+                         help="Skip m3cli call; use cached NOS_BAND.TXT instead")
+        _ap.add_argument("--existing-nb-out", default=None,
+                         help="Path to existing NOS_BAND.TXT (used with --skip-m3cli)")
+
     _args = _ap.parse_args()
 
     # Build list of files to process
@@ -943,59 +1102,132 @@ if __name__ == "__main__":
         if not _files:
             print(f"No .bin files found under TEST_VECTOR_PATH={TEST_VECTOR_PATH!r}")
             sys.exit(1)
-        print(f"Found {len(_files)} .bin file(s) under {TEST_VECTOR_PATH}")
+        _total = len(_files)
+        if _args.limit is not None:
+            _files = _files[:_args.limit]
+        print(f"Found {_total} .bin file(s) under {TEST_VECTOR_PATH}" +
+              (f"; processing first {len(_files)}" if _args.limit is not None else ""))
 
     _results   = []   # list of (filename, passed)
-    _all_py_mc = []   # accumulated Python M_clean across all files
-    _all_nb_mc = []   # accumulated Device M_clean across all files
+    _all_py_mc = []   # list of (audio_path, py_mc array) per file
+    _all_nb_mc = []   # list of (audio_path, nb_mc array) per file
 
-    for _audio in _files:
+    _results_dir = Path(__file__).parent / "results"
+    _results_dir.mkdir(exist_ok=True)
+
+    for _file_idx, _audio in enumerate(_files, 1):
         _audio = str(_audio)
         _stem  = Path(_audio).stem
-        _py_out = f"py_out_{_stem}.txt"
+        _py_out = str(_results_dir / f"py_out_{_stem}.txt")
 
         print(f"\n{'='*72}")
-        print(f"  File: {_audio}")
+        print(f"  File [{_file_idx}/{len(_files)}]: {_audio}")
+        print(f"  Mode: {_mode_desc}")
         print(f"{'='*72}")
 
         try:
-            # --- 1. Python side ---
-            dump_eband_mband(_audio, _py_out)
+            _nb_cache   = str(_results_dir / f"NOS_BAND_{_stem}.TXT")
+            _nb_c_cache = str(_results_dir / f"NOS_BAND_C_{_stem}.TXT")
 
-            # --- 2. Device side (m3cli) ---
-            # Per-file cached copy of NOS_BAND.TXT — reuse on subsequent runs
-            _nb_cache = f"NOS_BAND_{_stem}.TXT"
+            if COMPARE_C_VS_DEVICE:
+                # -----------------------------------------------------------
+                # MODE: C-library (PC) vs Mark3 device (m3cli)
+                # "py" side = C-library output  → NOS_BAND_C_<stem>.TXT
+                # "nb" side = device output     → NOS_BAND_<stem>.TXT
+                # -----------------------------------------------------------
+                _c_out = run_c_lib_nos_aud(_audio, _nb_c_cache,
+                                           lib_path=getattr(_args, "lib", None))
 
-            if _args.skip_m3cli:
-                _nb = _args.existing_nb_out or os.path.join(_M3CLI_DIR, "NOS_BAND.TXT")
-                print(f"\nSkipping m3cli — using existing NOS_BAND.TXT: {_nb}")
-            elif os.path.isfile(_nb_cache):
-                _nb = _nb_cache
-                print(f"\n  [CACHE] Reusing {_nb_cache} — skipping m3cli")
+                if _args.skip_m3cli:
+                    _nb = _args.existing_nb_out or os.path.join(_M3CLI_DIR, "NOS_BAND.TXT")
+                    print(f"  Skipping m3cli — using existing NOS_BAND.TXT: {_nb}")
+                elif os.path.isfile(_nb_cache):
+                    _nb = _nb_cache
+                    print(f"  [CACHE] Reusing {_nb_cache} — skipping m3cli")
+                else:
+                    _nb = run_m3cli_nos_aud(_audio, _args.m3cli, _nb_cache)
+                    print(f"  [CACHE] Saved → {_nb_cache}")
+
+                # Compare: C-library (as "py") vs device (as "nb")
+                _passed, _py_mc, _nb_mc = compare_m_clean(_c_out, _nb,
+                                                           abs_tol=_args.abs_tol)
+
+            elif USE_LOCAL_LIB:
+                # -----------------------------------------------------------
+                # MODE: Python reference vs PC C-library
+                # -----------------------------------------------------------
+                dump_eband_mband(_audio, _py_out)
+                _nb = run_c_lib_nos_aud(_audio, _nb_cache,
+                                        lib_path=getattr(_args, "lib", None))
+                _passed, _py_mc, _nb_mc = compare_m_clean(_py_out, _nb,
+                                                           abs_tol=_args.abs_tol)
+
             else:
-                _nb = run_m3cli_nos_aud(_audio, _args.m3cli, _nb_cache)
-                print(f"  [CACHE] Saved → {_nb_cache}")
+                # -----------------------------------------------------------
+                # MODE: Python reference vs Mark3 device (m3cli)
+                # -----------------------------------------------------------
+                dump_eband_mband(_audio, _py_out)
 
-            # --- 3. Compare M_clean (per-file stats + console table) ---
-            _passed, _py_mc, _nb_mc = compare_m_clean(_py_out, _nb,
-                                                       abs_tol=_args.abs_tol)
+                if _args.skip_m3cli:
+                    _nb = _args.existing_nb_out or os.path.join(_M3CLI_DIR, "NOS_BAND.TXT")
+                    print(f"  Skipping m3cli — using existing NOS_BAND.TXT: {_nb}")
+                elif os.path.isfile(_nb_cache):
+                    _nb = _nb_cache
+                    print(f"  [CACHE] Reusing {_nb_cache} — skipping m3cli")
+                else:
+                    _nb = run_m3cli_nos_aud(_audio, _args.m3cli, _nb_cache)
+                    print(f"  [CACHE] Saved → {_nb_cache}")
+
+                _passed, _py_mc, _nb_mc = compare_m_clean(_py_out, _nb,
+                                                           abs_tol=_args.abs_tol)
             _results.append((_audio, _passed))
-            _all_py_mc.append(_py_mc)
-            _all_nb_mc.append(_nb_mc)
+            print(f"  x (nb_mc): size={len(_nb_mc)}  {_nb_mc}")
+            print(f"  y (py_mc): size={len(_py_mc)}  {_py_mc}")
+            if len(_nb_mc) != 2616 or len(_py_mc) != 2616:
+                print(f"  [STOP] unexpected size (expected 2616) for {_audio} — stopping loop")
+                break
+            if len(_py_mc) != len(_nb_mc):
+                print(f"  [SKIP combined plot] py/nb size mismatch for "
+                      f"{_audio}: py={len(_py_mc)}, nb={len(_nb_mc)}")
+            elif len(_py_mc) > 0:
+                _all_py_mc.append((_audio, _py_mc))
+                _all_nb_mc.append((_audio, _nb_mc))
 
-        except FileNotFoundError as _e:
-            print(f"\n  [SKIP] FileNotFoundError: {_e}")
-            print(f"  Skipping: {_audio}")
+        except (FileNotFoundError, RuntimeError) as _e:
+            print(f"\n  [FAIL] {type(_e).__name__}: {_e}")
+            print(f"  Treating as failed: {_audio}")
             _results.append((_audio, None))
 
     # --- Combined scatter + confusion matrix across all files ---
     if ENABLE_COMBINED_PLOT and _all_py_mc:
-        _combined_py = np.concatenate(_all_py_mc)
-        _combined_nb = np.concatenate(_all_nb_mc)
+        # Find the most common frame count and skip files that differ
+        from collections import Counter as _Counter
+        _frame_counts = [len(py) for _, py in _all_py_mc]
+        _expected_len = _Counter(_frame_counts).most_common(1)[0][0]
+
+        _py_filtered, _nb_filtered = [], []
+        for (_aud_py, _py_arr), (_aud_nb, _nb_arr) in zip(_all_py_mc, _all_nb_mc):
+            if len(_py_arr) != _expected_len:
+                print(f"  [SKIP combined plot] frame count {len(_py_arr)} "
+                      f"!= expected {_expected_len}: {_aud_py}")
+            else:
+                _py_filtered.append(_py_arr)
+                _nb_filtered.append(_nb_arr)
+
+        _py_label = "C-lib" if COMPARE_C_VS_DEVICE else "Python"
+        _nb_label = "device" if (COMPARE_C_VS_DEVICE or not USE_LOCAL_LIB) else "C-lib"
+        print(f"\n  Combined plot ({_py_label} vs {_nb_label}): "
+              f"{len(_py_filtered)} / {len(_all_py_mc)} files "
+              f"with {_expected_len} frames each")
+        print(f"  combined {_py_label} size: {sum(len(a) for a in _py_filtered)}, "
+              f"combined {_nb_label} size: {sum(len(a) for a in _nb_filtered)}")
+
+        _combined_py = np.concatenate(_py_filtered)
+        _combined_nb = np.concatenate(_nb_filtered)
         plot_combined_charts(
             _combined_py, _combined_nb,
             abs_tol=_args.abs_tol,
-            title_prefix=f"{len(_files)} file(s)",
+            title_prefix=f"{len(_py_filtered)} file(s)",
         )
 
     # --- Summary across all files ---

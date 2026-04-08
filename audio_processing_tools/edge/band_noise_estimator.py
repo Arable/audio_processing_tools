@@ -475,7 +475,7 @@ class BandNoiseEstimator:
         if vals.size == 0:
             return 0.0
 
-        qv = float(np.quantile(vals, self.cfg.q))
+        qv = float(np.quantile(vals, self.cfg.q, method='lower'))
         a = float(self.cfg.ema_alpha)
         self.noise_ema = (1.0 - a) * self.noise_ema + a * qv
         return float(self.noise_ema)
