@@ -1,13 +1,17 @@
 import os
 import csv
 import math
+import copy
 
 import numpy as np
 from scipy.signal import get_window
 from scipy.fftpack import fft
 from matplotlib import pyplot as plt
 import librosa
-import copy
+
+HEADER_SIZE = 40
+DEFAULT_BYTES_PER_SAMPLE = 2
+ENABLE_PLOT_DATA = False
 
 class DsdProcessingEmualtor:
     def __init__(
@@ -67,7 +71,7 @@ class DsdProcessingEmualtor:
             int(self.hwin_start // self.dF) + int(self.fft_bins // 2) - 1
         )
         # raw file header size
-        self.hdr_size = 38
+        self.hdr_size = HEADER_SIZE
 
         # state variables of the class
         self.ts_start = 0
@@ -126,7 +130,7 @@ class DsdProcessingEmualtor:
         frame = audio_data[: self.frame_length]
         # calculate frequency spectrum
         if self.apply_window:
-            window = get_window("hanning", self.frame_length)
+            window = get_window("hann", self.frame_length)
             frame = frame * window
             
         spectrum = np.abs(fft(frame))
@@ -309,37 +313,39 @@ class DsdProcessingEmualtor:
 
         return output
 
-
-def read_audio_file(audio_file, read_size, read_offset):
+def read_audio_file(audio_file, read_size, read_offset, header_size=HEADER_SIZE, bytes_per_sample=DEFAULT_BYTES_PER_SAMPLE):
     if audio_file.lower().endswith(".wav"):
+        # WAV: decoded audio, so read_offset is in samples
         audio_data_in, sr_ref = librosa.load(audio_file, sr=11162)
-        # audio_data_in = audio_data_in[read_offset:read_offset+read_size];
-
+        sample_offset = read_offset
     else:
         with open(audio_file, "rb") as file:
-            # skip the audio file header
-            file.seek(HEADER_SIZE),
-            #read the file in to an ndarray
+            # skip the raw audio file header in bytes
+            file.seek(header_size)
+            # read the file into an ndarray
             audio_data_in = file.read()
-            # scale it to float values between -1.0 to 1.0
+            # assume 16-bit PCM input for raw files
             scale_factor = 1 << (bytes_per_sample * 8 - 1)
             audio_data_in = np.frombuffer(audio_data_in, dtype=np.int16) / scale_factor
+        # RAW: after header removal, read_offset is in samples
+        sample_offset = read_offset
 
-    audio_data_in = audio_data_in[read_offset : read_offset + read_size]
+    audio_data_in = audio_data_in[sample_offset : sample_offset + read_size]
 
     return audio_data_in
 
-
-def plot_data(sp_rows, sp_cols, sp_idx, ax1, val, duration, title):
+def plot_data(sp_rows, sp_cols, sp_idx, ax1, val, duration, title, enable_plot_data=ENABLE_PLOT_DATA):
     # ax = plt.subplot(sp_rows, sp_cols, sp_idx, sharex=ax1)
     ###
     # fig, ax1 = plt.subplots(sp_rows, sp_cols, figsize=(10, 10))
-    if enable_plot_data == True:
+    if enable_plot_data:
         if sp_idx == 0:
             fig = plt.figure(figsize=(10, 15))
             fig.suptitle(title)
             gs = fig.add_gridspec(sp_rows)
             ax1 = gs.subplots(sharex=True)
+            if sp_rows == 1:
+                ax1 = np.array([ax1])
 
             # fig, ax1 = plt.subplots(sp_rows, sp_cols, figsize=(10, 8), sharex=True)
             time = np.arange(len(val)) * duration / len(val)
@@ -362,7 +368,7 @@ def plot_data(sp_rows, sp_cols, sp_idx, ax1, val, duration, title):
 
 
 def write_results(csv_file_name, csv_columns, data):
-    with open(csv_filename, mode="w", newline="") as csv_file:
+    with open(csv_file_name, mode="w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=csv_columns)
         writer.writeheader()
         for row in data:
@@ -381,15 +387,14 @@ if __name__ == "__main__":
         (1, "634D15FC.RAW"),
     ]
 
-    HEADER_SIZE = 38
-    enable_plot_data = False
+    enable_plot_data = ENABLE_PLOT_DATA
     max_rows = 1
     Fs, bytes_per_sample, frame_size, duration = 11162, 2, 512, 120
     n_frames = int(duration * Fs / frame_size)
 
     # read audio data
     read_size = int(frame_size * n_frames)
-    read_offset = HEADER_SIZE
+    read_offset = 0
 
     for x in list1:
         category = x[0]
@@ -400,7 +405,7 @@ if __name__ == "__main__":
         print(f"file={filename}, {len(audio_data_in)}. {n_frames}")
         if enable_plot_data == True:
             title = filename + " waveform"
-            # fig, ax1 = plot_data (max_rows, 1, sp_idx, 0, audio_data_in, duration, title)
+            # fig, ax1 = plot_data(max_rows, 1, sp_idx, 0, audio_data_in, duration, title, enable_plot_data=enable_plot_data)
             duration = len(audio_data_in) / Fs
             time = np.arange(len(audio_data_in)) * duration / len(audio_data_in)
             plt.rcParams["figure.figsize"] = (10, 4)
