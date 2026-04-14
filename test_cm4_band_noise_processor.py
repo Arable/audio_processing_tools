@@ -136,15 +136,15 @@ M3CLI_DIR  = str(Path(M3CLI_PATH).parent)
 #   COMPARE_C_VS_DEVICE = False, USE_LOCAL_LIB = False
 #       Compare Python reference vs Mark3 device (m3cli).
 # =============================================================================
-COMPARE_C_VS_DEVICE = True   # True → C-lib vs device;  False → Python vs one side
+COMPARE_C_VS_DEVICE = False   # True → C-lib vs device;  False → Python vs one side
 USE_LOCAL_LIB       = True    # (only used when COMPARE_C_VS_DEVICE = False)
 
 ENABLE_COMBINED_PLOT = True   # combined scatter + confusion matrix (all files)
 ENABLE_OTHER_PLOTS   = False  # per-file band-noise state plots
 
-MAX_FILES = 10   # max number of files to process (None = all files)
+MAX_FILES = 1000   # max number of files to process (None = all files)
 
-N = 10
+N = 1000
 QUERY = f"""
     (
         SELECT *

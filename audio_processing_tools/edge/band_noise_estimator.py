@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 import scipy.signal as spsig
 
-EPS = 1e-12
+EPS = np.float32(1e-7)   # float32-safe small constant (float32 eps ≈ 1.19e-7)
 
 # -----------------------------------------------------------------------------
 # Scaling Note:
@@ -30,9 +30,9 @@ def db_to_ratio(db: float) -> float:
 
 
 def _frame_view(sig: np.ndarray, frame_len: int, hop: int) -> np.ndarray:
-    sig = np.asarray(sig, dtype=np.float64).reshape(-1)
+    sig = np.asarray(sig, dtype=np.float32).reshape(-1)
     if sig.size < frame_len:
-        return np.empty((0, frame_len), dtype=np.float64)
+        return np.empty((0, frame_len), dtype=np.float32)
     T = 1 + (sig.size - frame_len) // hop
     stride = sig.strides[0]
     return np.lib.stride_tricks.as_strided(
@@ -179,12 +179,12 @@ class NoiseFrameDetector:
           2) optional Δ(Eb)/Ehpf metric (scale-dependent, off by default)
           3) optional legacy Eb jump in dB ratio (use_D_trigger)
         """
-        subE = np.asarray(subE, dtype=np.float64).reshape(-1)
+        subE = np.asarray(subE, dtype=np.float32).reshape(-1)
         if subE.size != self.S:
             raise ValueError(f"subE must have shape ({self.S},), got {subE.shape}")
 
         if subEhpf is not None:
-            subEhpf = np.asarray(subEhpf, dtype=np.float64).reshape(-1)
+            subEhpf = np.asarray(subEhpf, dtype=np.float32).reshape(-1)
             if subEhpf.size != self.S:
                 raise ValueError(f"subEhpf must have shape ({self.S},), got {subEhpf.shape}")
 
@@ -332,7 +332,7 @@ class BandNoiseEstimatorConfig:
     # Suppression (Wiener-like)
     beta: float = 1.0
     gain_floor: float = 0.10
-    eps: float = 1e-12
+    eps: float = 1e-7   # float32-safe floor
 
     # Optional extra smoothing on final noise estimate (frame-level)
     # Use different "attack" (rise) speeds depending on whether we think it's raining.
@@ -406,20 +406,20 @@ class BandNoiseEstimator:
 
         self._need_zi_seed = True
 
-        self.N_E_smooth = 0.0
+        self.N_E_smooth = np.float32(0.0)
 
         # Detector
         self.det = NoiseFrameDetector(cfg.det, subframes_per_frame=self.S)
 
         # Noise buffer: single continuous subframe stream
         self.W = int(cfg.W)  # now interpreted as "number of subframes in window"
-        self.buf = np.zeros(self.W, dtype=np.float64)
+        self.buf = np.zeros(self.W, dtype=np.float32)
         self.valid = np.zeros(self.W, dtype=bool)
         self.wr = 0
         self.count_valid = 0
 
         # EMA state for scalar noise estimate (per-subframe)
-        self.noise_ema = 0.0
+        self.noise_ema = np.float32(0.0)
 
     @staticmethod
     def _design_hpf(cfg: BandNoiseEstimatorConfig) -> Optional[np.ndarray]:
@@ -427,7 +427,7 @@ class BandNoiseEstimator:
             return None
         nyq = 0.5 * cfg.fs
         w = np.clip(cfg.hp_cutoff_hz / nyq, 1e-6, 0.999)
-        return spsig.butter(cfg.hp_order, w, btype="highpass", output="sos")
+        return spsig.butter(cfg.hp_order, w, btype="highpass", output="sos").astype(np.float32)
 
     @staticmethod
     def _design_bpf(cfg: BandNoiseEstimatorConfig) -> np.ndarray:
@@ -437,7 +437,7 @@ class BandNoiseEstimator:
         w2 = np.clip(hi / nyq, 1e-6, 0.999)
         if w2 <= w1:
             w2 = min(0.999, w1 + 1e-3)
-        return spsig.butter(cfg.bpf_order, [w1, w2], btype="bandpass", output="sos")
+        return spsig.butter(cfg.bpf_order, [w1, w2], btype="bandpass", output="sos").astype(np.float32)
 
     def reset(self) -> None:
         self.hpf_zi = None
@@ -449,8 +449,8 @@ class BandNoiseEstimator:
         self.valid[:] = False
         self.wr = 0
         self.count_valid = 0
-        self.noise_ema = 0.0
-        self.N_E_smooth = 0.0
+        self.noise_ema = np.float32(0.0)
+        self.N_E_smooth = np.float32(0.0)
 
         # reset detector state
         self.det.reset()
@@ -485,7 +485,7 @@ class BandNoiseEstimator:
         Process a single frame and return band noise estimation and diagnostics.
         """
         cfg = self.cfg
-        x = np.asarray(frame, dtype=np.float64)
+        x = np.asarray(frame, dtype=np.float32)
         if x.ndim != 1 or x.size != self.N:
             raise ValueError(f"frame must be 1-D length {self.N}")
 
@@ -493,8 +493,8 @@ class BandNoiseEstimator:
         if self._need_zi_seed:
             x0 = float(x[0]) if x.size else 0.0
             if self.hpf_sos is not None:
-                self.hpf_zi = spsig.sosfilt_zi(self.hpf_sos).astype(np.float64) * x0
-            self.bpf_zi = spsig.sosfilt_zi(self.bpf_sos).astype(np.float64) * x0
+                self.hpf_zi = spsig.sosfilt_zi(self.hpf_sos).astype(np.float32) * x0
+            self.bpf_zi = spsig.sosfilt_zi(self.bpf_sos).astype(np.float32) * x0
             self._need_zi_seed = False
 
         # HPF
@@ -508,10 +508,10 @@ class BandNoiseEstimator:
         # HPF subframe energies (Ehpf per subframe)
         subs_hpf = _frame_view(x, self.sub_len, self.subhop)
         if subs_hpf.shape[0] == 0:
-            subEhpf = np.asarray([float(np.sum(x * x))], dtype=np.float64)
+            subEhpf = np.asarray([float(np.sum(x * x))], dtype=np.float32)
             subEhpf = np.pad(subEhpf, (0, self.S - subEhpf.size), mode="edge")
         else:
-            subEhpf = np.sum(subs_hpf * subs_hpf, axis=1).astype(np.float64)
+            subEhpf = np.sum(subs_hpf * subs_hpf, axis=1).astype(np.float32)
             if subEhpf.size != self.S:
                 subEhpf = np.resize(subEhpf, self.S)
 
@@ -538,10 +538,10 @@ class BandNoiseEstimator:
         # BPF subframe energies (subE)
         subs = _frame_view(x_bp, self.sub_len, self.subhop)
         if subs.shape[0] == 0:
-            subE = np.asarray([float(np.sum(x_bp * x_bp))], dtype=np.float64)
+            subE = np.asarray([float(np.sum(x_bp * x_bp))], dtype=np.float32)
             subE = np.pad(subE, (0, self.S - subE.size), mode="edge")
         else:
-            subE = np.sum(subs * subs, axis=1).astype(np.float64)
+            subE = np.sum(subs * subs, axis=1).astype(np.float32)
             if subE.size != self.S:
                 subE = np.resize(subE, self.S)
 
@@ -562,7 +562,7 @@ class BandNoiseEstimator:
                 self._push_stream(float(max(subE[s], cfg.eps)))
 
         N_sub_scalar = self._estimate_noise_scalar()  # noise per-subframe energy
-        N_sub = np.full(self.S, N_sub_scalar, dtype=np.float64)
+        N_sub = np.full(self.S, N_sub_scalar, dtype=np.float32)
         N_E_raw = float(self.S * N_sub_scalar)
 
         # Optional: outer smoothing on total noise (asymmetric EMA)
