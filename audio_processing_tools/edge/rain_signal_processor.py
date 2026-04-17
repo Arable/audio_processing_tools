@@ -971,6 +971,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 result["debug"] = debug
             if keep_filtered_audio:
                 result["x_filt"] = x_proc
+                # In classifier-only mode the returned audio is the prefiltered signal.
                 result["y"] = x_proc
             if keep_spectra:
                 result["S"] = S
@@ -1185,20 +1186,13 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 class RainDetectorProcessor(BaseProcessor):
     """
     Framework-facing processor for rain-frame detection.
-
-    This is a thin adapter over SpectralNoiseProcessor so the orchestrator can
-    call a single processor that owns:
-      - frequency-domain feature extraction
-      - time-domain feature extraction / soft labels
-      - noise PSD estimation
-      - optional suppression / reconstruction
-      - rain frame detection
-
-    The core algorithm remains inside SpectralNoiseProcessor.
+    ...
     """
 
     def __init__(self, name: str = "rain_detector"):
         self.name = name
+        # Cache configured processor instances by full parameter dict so repeated
+        # batch runs with identical settings reuse setup/validation work.
         self._proc_cache: Dict[str, SpectralNoiseProcessor] = {}
 
     def _params_cache_key(self, params: Dict[str, Any]) -> str:
@@ -1230,15 +1224,15 @@ class RainDetectorProcessor(BaseProcessor):
         out, latency = self._with_timing(proc.process, audio_data, sr=sample_rate)
 
         frame_class = np.asarray(out.get("frame_class", []), dtype=np.int8)
-        is_rain = frame_class == FrameClass.RAIN
+        frame_is_rain = frame_class == FrameClass.RAIN
         clip_rain_min_frames = int(params_local.get("clip_rain_min_frames", 1))
         clip_rain_min_frames = max(1, clip_rain_min_frames)
-        rain_frame_count = int(np.sum(is_rain))
-        clip_rain_fraction = float(np.mean(is_rain)) if is_rain.size else 0.0
+        rain_frame_count = int(np.sum(frame_is_rain))
+        clip_rain_fraction = float(np.mean(frame_is_rain)) if frame_is_rain.size else 0.0
         clip_is_rain = bool(rain_frame_count >= clip_rain_min_frames)
         rain_conf_arr = np.asarray(out.get("rain_conf", []), dtype=np.float32).reshape(-1)
-        if rain_frame_count > 0 and rain_conf_arr.size == is_rain.size:
-            median_rain_conf = float(np.median(rain_conf_arr[is_rain]))
+        if rain_frame_count > 0 and rain_conf_arr.size == frame_is_rain.size:
+            median_rain_conf = float(np.median(rain_conf_arr[frame_is_rain]))
         else:
             median_rain_conf = 0.0
 

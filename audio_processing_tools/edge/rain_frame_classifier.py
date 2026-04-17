@@ -123,6 +123,7 @@ def extract_td_features_inline(
     bp_order: int,
     subframe_len: int,
     subframe_hop: int,
+    envelope_features_enable: bool,
     baseline_win_sec: float,
     baseline_min_hist_sec: float,
     baseline_q: float,
@@ -190,12 +191,18 @@ def extract_td_features_inline(
 
     def _subframe_peak_shape_features(
         sub_vals: np.ndarray,
+        *,
+        enable_envelope_features: bool,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         env = np.asarray(sub_vals, dtype=dtype).reshape(-1)
         N = env.size
         if N == 0:
             z = np.zeros(0, dtype=dtype)
             return z, z, z, z, z, z, np.zeros(0, dtype=bool)
+
+        if not enable_envelope_features:
+            z = np.zeros(N, dtype=dtype)
+            return z, z, z, z, z, z, np.zeros(N, dtype=bool)
 
         if N >= 3:
             kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
@@ -307,7 +314,10 @@ def extract_td_features_inline(
     Tloc = frames.shape[0]
     frame_times = (np.arange(Tloc, dtype=dtype) * hop) / float(fs)
     sub_energy, sub_times = _subframe_energy(x_flux)
-    sub_envelope, sub_rise_time, sub_fall_time, sub_rise_slope, sub_fall_slope, sub_peak_level, sub_peak_mask = _subframe_peak_shape_features(sub_energy)
+    sub_envelope, sub_rise_time, sub_fall_time, sub_rise_slope, sub_fall_slope, sub_peak_level, sub_peak_mask = _subframe_peak_shape_features(
+        sub_energy,
+        enable_envelope_features=bool(envelope_features_enable),
+    )
     sub_baseline, sub_warm_ok = causal_stochastic_low_quantile_baseline(
         sub_energy,
         q_percent=float(baseline_q),
@@ -383,7 +393,6 @@ class RainFrameClassifierMixin:
     # Required detector fields
     REQUIRED_CFG_FIELDS = (
         "mode_bands",
-        "primary_mode_idx",
     )
 
     # ------------------------------------------------------------
@@ -468,29 +477,64 @@ class RainFrameClassifierMixin:
     def _rain_frame_decision(
         self,
         *,
-        td_crest_factor: np.ndarray,
-        td_kurtosis: np.ndarray,
-        mode_flux_score: np.ndarray,
-        c_thr: float,
-        k_thr: float,
-        m_thr: float,
+        primary_mode_flux: np.ndarray,
+        support_mode_flux_1: np.ndarray,
+        support_mode_flux_2: np.ndarray,
+        support_mode_flux_3: np.ndarray,
+        primary_flux_min: float,
+        mode12_flux_min: float,
+        mode3_flux_min: float,
+        min_support_count: int,
         eps: float,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Frame-level TD+FD rain decision and confidence."""
-        td_crest_factor = np.asarray(td_crest_factor)
-        td_kurtosis = np.asarray(td_kurtosis)
-        mode_flux_score = np.asarray(mode_flux_score)
+        """
+        Frame-level fixed-band FD rain decision and confidence using per-mode normalized flux.
+        Primary band is intentionally fixed to mode 0 and support bands to modes 1, 2, and 3.
 
-        is_rain = (
-            (td_crest_factor > float(c_thr))
-            & (td_kurtosis > float(k_thr))
-            & (mode_flux_score >= float(m_thr))
+        Rule (log scale):
+            f0 = log1p(primary_mode_flux)
+            f1 = log1p(support_mode_flux_1)
+            f2 = log1p(support_mode_flux_2)
+            f3 = log1p(support_mode_flux_3)
+            support_hits = (f1 >= mode12_flux_min) + (f2 >= mode12_flux_min) + (f3 >= mode3_flux_min)
+            is_rain = (f0 >= primary_flux_min) & (support_hits >= min_support_count)
+
+        Confidence is derived from how strongly the frame satisfies the primary-band
+        gate and the required support-band thresholds.
+        """
+        f0 = np.log1p(np.clip(np.asarray(primary_mode_flux), 0.0, None))
+        f1 = np.log1p(np.clip(np.asarray(support_mode_flux_1), 0.0, None))
+        f2 = np.log1p(np.clip(np.asarray(support_mode_flux_2), 0.0, None))
+        f3 = np.log1p(np.clip(np.asarray(support_mode_flux_3), 0.0, None))
+
+        primary_flux_min = float(primary_flux_min)
+        mode12_flux_min = float(mode12_flux_min)
+        mode3_flux_min = float(mode3_flux_min)
+        min_support_count = int(max(1, min_support_count))
+
+        support_hits = (
+            (f1 >= mode12_flux_min).astype(np.int32)
+            + (f2 >= mode12_flux_min).astype(np.int32)
+            + (f3 >= mode3_flux_min).astype(np.int32)
         )
 
-        crest_conf = td_crest_factor / max(float(c_thr), float(eps))
-        kurt_conf = td_kurtosis / max(float(k_thr), float(eps))
-        mode_conf = mode_flux_score / max(float(m_thr), float(eps))
-        rain_conf = np.clip(np.minimum(np.minimum(crest_conf, kurt_conf), mode_conf), 0.0, 1.0)
+        is_rain = (f0 >= primary_flux_min) & (support_hits >= min_support_count)
+
+        primary_conf = np.clip(f0 / max(primary_flux_min, float(eps)), 0.0, 1.0)
+        support_margin_1 = np.clip(f1 / max(mode12_flux_min, float(eps)), 0.0, None)
+        support_margin_2 = np.clip(f2 / max(mode12_flux_min, float(eps)), 0.0, None)
+        support_margin_3 = np.clip(f3 / max(mode3_flux_min, float(eps)), 0.0, None)
+
+        support_stack = np.stack([support_margin_1, support_margin_2, support_margin_3], axis=0)
+        support_stack_sorted = np.sort(support_stack, axis=0)[::-1]
+        support_rank_idx = min(min_support_count - 1, support_stack_sorted.shape[0] - 1)
+        support_conf = np.clip(support_stack_sorted[support_rank_idx], 0.0, 1.0)
+
+        rain_conf = np.where(
+            is_rain,
+            np.minimum(primary_conf, support_conf),
+            0.0,
+        ).astype(np.float32, copy=False)
 
         return is_rain, rain_conf
     # ------------------------------------------------------------
@@ -532,8 +576,13 @@ class RainFrameClassifierMixin:
             raise AttributeError("Missing required detector param: mode_bands")
 
         mode_bands = tuple((float(a), float(b)) for (a, b) in mode_bands)
+        if len(mode_bands) < 4:
+            raise ValueError(
+                "Fixed-band rain decision requires at least 4 mode bands: "
+                "mode 0 as primary and modes 1, 2, 3 as support"
+            )
 
-        # Optional time-domain soft-labeller configuration.
+        # TD features are always extracted when input_audio is available; soft labels remain optional.
         td_soft_enable = bool(self._dget("td_soft_enable", False))
         td_soft_bp_order = int(self._dget("td_soft_bp_order", 4))
         td_soft_time_flux_band = self._dget("td_soft_time_flux_band", None)
@@ -556,25 +605,13 @@ class RainFrameClassifierMixin:
         td_soft_crest_factor_min = float(self._dget("td_soft_crest_factor_min", 4.0))
         td_soft_kurtosis_min = float(self._dget("td_soft_kurtosis_min", 6.0))
         td_soft_min_positive_votes = int(self._dget("td_soft_min_positive_votes", 2))
-
-        primary_mode_idx = int(self._dget("primary_mode_idx", 0))
-        if primary_mode_idx < 0 or primary_mode_idx >= len(mode_bands):
-            raise ValueError(
-                f"primary_mode_idx ({primary_mode_idx}) out of range for "
-                f"mode_bands length ({len(mode_bands)})"
-            )
+        td_envelope_features_enable = bool(self._dget("td_envelope_features_enable", False))
 
         # noise_hi remains part of NOISE frame assignment.
         noise_hi = float(self._dget("noise_hi", 0.80))
 
-        # Flux-based detector controls.
-        # mode_flux_rain_min: main novelty threshold in the mode bands.
-        # mode_flux_noise_max: frames below this are eligible for NOISE when rain evidence is weak.
-        # The detector score is normalized excess-over-baseline novelty; rain_conf
-        # is derived from the active TD+FD rule rather than from a separate arbitrary scale.
-        mode_flux_rain_min = float(self._dget("mode_flux_rain_min", 4.0))
+        # mode_flux_score is still used only for weak/noise assignment below.
         mode_flux_noise_max = float(self._dget("mode_flux_noise_max", 1.5))
-        mode_flux_rain_min = max(mode_flux_rain_min, 0.0)
         mode_flux_noise_max = max(mode_flux_noise_max, 0.0)
 
         # Local noise-level normalization for mode flux.
@@ -606,7 +643,7 @@ class RainFrameClassifierMixin:
         # Precompute masks once; these do not change across frames.
         F, T = P.shape
         td_soft_debug: Dict[str, Any] = {}
-        if td_soft_enable and input_audio is not None:
+        if input_audio is not None:
             try:
                 x_in = np.asarray(input_audio, dtype=dtype).reshape(-1)
                 td_soft_debug = extract_td_features_inline(
@@ -622,6 +659,7 @@ class RainFrameClassifierMixin:
                     bp_order=td_soft_bp_order,
                     subframe_len=td_soft_subframe_len,
                     subframe_hop=td_soft_subframe_hop,
+                    envelope_features_enable=td_envelope_features_enable,
                     baseline_win_sec=td_soft_baseline_win_sec,
                     baseline_min_hist_sec=td_soft_baseline_min_hist_sec,
                     baseline_q=td_soft_baseline_q,
@@ -669,57 +707,60 @@ class RainFrameClassifierMixin:
                 dtype=dtype,
                 fill_value=0,
             )
-            td_rise_time_sec = self._align_feature_to_frames(
-                td_soft_debug.get("rise_time_sec"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            td_fall_time_sec = self._align_feature_to_frames(
-                td_soft_debug.get("fall_time_sec"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            td_rise_slope = self._align_feature_to_frames(
-                td_soft_debug.get("rise_slope"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            td_fall_slope = self._align_feature_to_frames(
-                td_soft_debug.get("fall_slope"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            td_energy_envelope = self._align_feature_to_frames(
-                td_soft_debug.get("energy_envelope"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            td_peak_energy = self._align_feature_to_frames(
-                td_soft_debug.get("peak_energy"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
 
-            td_label_out = assign_td_soft_label(
-                td_time_flux_score=td_time_flux_score,
-                td_crest_factor=td_crest_factor,
-                td_kurtosis=td_kurtosis,
-                time_flux_thr=td_soft_time_flux_score_min,
-                crest_thr=td_soft_crest_factor_min,
-                kurt_thr=td_soft_kurtosis_min,
-                min_positive_votes=td_soft_min_positive_votes,
-                eps=eps,
-            )
+            if td_envelope_features_enable:
+                td_rise_time_sec = self._align_feature_to_frames(
+                    td_soft_debug.get("rise_time_sec"),
+                    n_frames=T,
+                    dtype=dtype,
+                    fill_value=0,
+                )
+                td_fall_time_sec = self._align_feature_to_frames(
+                    td_soft_debug.get("fall_time_sec"),
+                    n_frames=T,
+                    dtype=dtype,
+                    fill_value=0,
+                )
+                td_rise_slope = self._align_feature_to_frames(
+                    td_soft_debug.get("rise_slope"),
+                    n_frames=T,
+                    dtype=dtype,
+                    fill_value=0,
+                )
+                td_fall_slope = self._align_feature_to_frames(
+                    td_soft_debug.get("fall_slope"),
+                    n_frames=T,
+                    dtype=dtype,
+                    fill_value=0,
+                )
+                td_energy_envelope = self._align_feature_to_frames(
+                    td_soft_debug.get("energy_envelope"),
+                    n_frames=T,
+                    dtype=dtype,
+                    fill_value=0,
+                )
+                td_peak_energy = self._align_feature_to_frames(
+                    td_soft_debug.get("peak_energy"),
+                    n_frames=T,
+                    dtype=dtype,
+                    fill_value=0,
+                )
 
-            td_vote_count = td_label_out["td_vote_count"]
-            td_soft_score = td_label_out["td_soft_score"]
-            td_soft_label = td_label_out["td_soft_label"]
+            if td_soft_enable:
+                td_label_out = assign_td_soft_label(
+                    td_time_flux_score=td_time_flux_score,
+                    td_crest_factor=td_crest_factor,
+                    td_kurtosis=td_kurtosis,
+                    time_flux_thr=td_soft_time_flux_score_min,
+                    crest_thr=td_soft_crest_factor_min,
+                    kurt_thr=td_soft_kurtosis_min,
+                    min_positive_votes=td_soft_min_positive_votes,
+                    eps=eps,
+                )
+
+                td_vote_count = td_label_out["td_vote_count"]
+                td_soft_score = td_label_out["td_soft_score"]
+                td_soft_label = td_label_out["td_soft_label"]
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
 
         if P.shape[0] != freqs.shape[0]:
@@ -734,7 +775,7 @@ class RainFrameClassifierMixin:
         P_band = P[band_mask, :]
         freqs_band = freqs[band_mask]
 
-        primary_lo, primary_hi = mode_bands[primary_mode_idx]
+        primary_lo, primary_hi = mode_bands[0]
         primary_mask = (freqs_band >= primary_lo) & (freqs_band <= primary_hi)
         if not np.any(primary_mask):
             raise ValueError(
@@ -966,27 +1007,35 @@ class RainFrameClassifierMixin:
                 neginf=0.0,
             )
 
-        # Peak-structure diagnostics are still computed and exported, although the
-        # current simple TD+FD decision rule below does not directly use them.
         peak_gate = peak_gate_score >= 1.0
 
-        # Simple TD+FD decision logic.
+        # Fixed-band FD rain decision.
+        # Primary rain band is intentionally fixed to mode 0.
+        # Support bands are intentionally fixed to modes 1, 2, and 3.
         mode_flux_score = np.nan_to_num(mode_flux_score, nan=0.0, posinf=0.0, neginf=0.0)
         td_crest_factor = np.nan_to_num(td_crest_factor, nan=0.0, posinf=0.0, neginf=0.0)
         td_kurtosis = np.nan_to_num(td_kurtosis, nan=0.0, posinf=0.0, neginf=0.0)
         td_soft_score = np.nan_to_num(td_soft_score, nan=0.0, posinf=0.0, neginf=0.0)
 
-        c_thr = float(td_soft_crest_factor_min)
-        k_thr = float(td_soft_kurtosis_min)
-        m_thr = float(mode_flux_rain_min)
+        primary_flux_min = float(self._dget("new_rain_primary_flux_min", 1.8))
+        mode12_flux_min = float(self._dget("new_rain_mode12_flux_min", 2.6))
+        mode3_flux_min = float(self._dget("new_rain_mode3_flux_min", 3.0))
+        min_support_count = int(self._dget("new_rain_min_support_count", 2))
+
+        primary_mode_flux = np.nan_to_num(normalized_mode_flux_by_mode[0], nan=0.0, posinf=0.0, neginf=0.0)
+        support_mode_flux_1 = np.nan_to_num(normalized_mode_flux_by_mode[1], nan=0.0, posinf=0.0, neginf=0.0)
+        support_mode_flux_2 = np.nan_to_num(normalized_mode_flux_by_mode[2], nan=0.0, posinf=0.0, neginf=0.0)
+        support_mode_flux_3 = np.nan_to_num(normalized_mode_flux_by_mode[3], nan=0.0, posinf=0.0, neginf=0.0)
 
         is_rain, rain_conf = self._rain_frame_decision(
-            td_crest_factor=td_crest_factor,
-            td_kurtosis=td_kurtosis,
-            mode_flux_score=mode_flux_score,
-            c_thr=c_thr,
-            k_thr=k_thr,
-            m_thr=m_thr,
+            primary_mode_flux=primary_mode_flux,
+            support_mode_flux_1=support_mode_flux_1,
+            support_mode_flux_2=support_mode_flux_2,
+            support_mode_flux_3=support_mode_flux_3,
+            primary_flux_min=primary_flux_min,
+            mode12_flux_min=mode12_flux_min,
+            mode3_flux_min=mode3_flux_min,
+            min_support_count=min_support_count,
             eps=eps,
         )
 
@@ -1000,31 +1049,36 @@ class RainFrameClassifierMixin:
         frame_class[(noise_conf >= noise_hi) & weak_mode_flux & (~is_rain)] = FrameClass.NOISE
         frame_class[is_rain] = FrameClass.RAIN
 
-        # PSD update gating is not decided here.
-        # Downstream suppressor logic may optionally use FrameClass, depending on configuration.
+        # FrameClass is produced here; downstream suppressor logic may use it for later decisions.
 
         det_debug = {
-            # Core detector features / outputs still relevant to the current rule
             "mode_flux_score": mode_flux_score,
+            "primary_mode_flux": primary_mode_flux,
+            "support_mode_flux_1": support_mode_flux_1,
+            "support_mode_flux_2": support_mode_flux_2,
+            "support_mode_flux_3": support_mode_flux_3,
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
             "frame_class": frame_class,
             "peak_valid_count": peak_valid_count,
             "peak_count_by_mode": peak_count_by_mode,
-            # TD first-class features and derived TD labels
             "td_soft_label": td_soft_label,
             "td_time_flux_score": td_time_flux_score,
             "td_crest_factor": td_crest_factor,
             "td_kurtosis": td_kurtosis,
-            "td_rise_time_sec": td_rise_time_sec,
-            "td_fall_time_sec": td_fall_time_sec,
-            "td_rise_slope": td_rise_slope,
-            "td_fall_slope": td_fall_slope,
-            "td_energy_envelope": td_energy_envelope,
-            "td_peak_energy": td_peak_energy,
             "td_vote_count": td_vote_count,
             "td_soft_score": td_soft_score,
         }
+
+        if td_envelope_features_enable:
+            det_debug.update({
+                "td_rise_time_sec": td_rise_time_sec,
+                "td_fall_time_sec": td_fall_time_sec,
+                "td_rise_slope": td_rise_slope,
+                "td_fall_slope": td_fall_slope,
+                "td_energy_envelope": td_energy_envelope,
+                "td_peak_energy": td_peak_energy,
+            })
 
         if include_peak_payload:
             det_debug.update({
@@ -1038,10 +1092,14 @@ class RainFrameClassifierMixin:
 
         if feature_dump_level > 0:
             # Level 1: compact feature set for offline analysis and replay of the
-            # current TD+FD decision logic, plus a few closely related TD shape features.
+            # current fixed-band FD decision logic, plus selected TD shape features.
             feature_dump = {
                 "frame_times": detector_frame_times,
                 "mode_flux_score": mode_flux_score,
+                "primary_mode_flux": primary_mode_flux,
+                "support_mode_flux_1": support_mode_flux_1,
+                "support_mode_flux_2": support_mode_flux_2,
+                "support_mode_flux_3": support_mode_flux_3,
                 "td_time_flux_score": td_time_flux_score,
                 "td_crest_factor": td_crest_factor,
                 "td_kurtosis": td_kurtosis,
@@ -1052,11 +1110,15 @@ class RainFrameClassifierMixin:
                     "frame_class": frame_class,
                     "td_soft_label": td_soft_label.astype(np.int8),
                     "peak_ratio": peak_ratio,
+                })
+
+            if feature_dump_level == 1 and td_envelope_features_enable:
+                feature_dump.update({
                     "td_rise_time_sec": td_rise_time_sec,
                     "td_fall_time_sec": td_fall_time_sec,
                     "td_rise_slope": td_rise_slope,
                     "td_fall_slope": td_fall_slope,
-                    })
+                })
 
             if feature_dump_level > 1:
                 # Level 2: richer diagnostics and detector outputs for analysis.
@@ -1072,9 +1134,13 @@ class RainFrameClassifierMixin:
                     "td_soft_label": td_soft_label.astype(np.int8),
                     "td_vote_count": td_vote_count,
                     "td_soft_score": td_soft_score,
-                    "td_energy_envelope": td_energy_envelope,
-                    "td_peak_energy": td_peak_energy,
                 })
+
+                if td_envelope_features_enable:
+                    feature_dump.update({
+                        "td_energy_envelope": td_energy_envelope,
+                        "td_peak_energy": td_peak_energy,
+                    })
 
                 if include_peak_payload:
                     feature_dump.update({
