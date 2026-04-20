@@ -171,6 +171,16 @@ class NoiseProcessorConfig:
     # Only reconstruct time-domain output audio when explicitly requested.
     compute_output_audio: bool = False
 
+    # Output retention flags. These control which optional payloads are
+    # returned to the framework/state independently from debug_enable.
+    # debug_enable can still act as an umbrella for verbose diagnostics,
+    # but callers may request individual payloads without enabling it.
+    return_filtered_audio: bool = False
+    return_debug: bool = False
+    return_detector_debug: bool = False
+    return_spectra: bool = False
+    return_noise_psd: bool = False
+
     # -----------------------------------------------------------
     # Nested detector configuration (framework-friendly)
     # -----------------------------------------------------------
@@ -926,12 +936,19 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 step=feature_step,
             )
 
-        # Keep large tensors and verbose debug only when explicitly requested.
-        keep_debug = bool(getattr(cfg, "debug_enable", False))
-        keep_detector_debug = keep_debug
-        keep_spectra = keep_debug
-        keep_noise_psd = bool(getattr(cfg, "keep_noise_psd", False))
-        keep_filtered_audio = keep_debug
+        # Optional output payloads are controlled by dedicated return_* flags.
+        # debug_enable remains an umbrella for verbose diagnostics and logging,
+        # but it should not implicitly force unrelated payloads like spectra,
+        # audio, or noise PSD into the returned result.
+        debug_enable = bool(getattr(cfg, "debug_enable", False))
+        keep_debug = bool(getattr(cfg, "return_debug", False)) or debug_enable
+        keep_detector_debug = bool(getattr(cfg, "return_detector_debug", False)) or debug_enable
+        keep_spectra = bool(getattr(cfg, "return_spectra", False))
+        keep_noise_psd = bool(getattr(cfg, "return_noise_psd", False))
+        keep_filtered_audio = (
+            bool(getattr(cfg, "return_filtered_audio", False))
+            or bool(compute_output_audio)
+        )
         keep_gain_debug = keep_debug
 
         if classifier_only_mode:
@@ -977,8 +994,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             if keep_spectra:
                 result["S"] = S
                 result["S_hat"] = S
-            if keep_noise_psd:
-                result["noise_psd"] = np.zeros_like(P, dtype=work_dtype)
 
             return result
 
@@ -1213,7 +1228,16 @@ class RainDetectorProcessor(BaseProcessor):
 
         params_local = dict(params)
         keep_state_audio = bool(params_local.get("keep_state_audio", False))
+        keep_state_spectra = bool(params_local.get("keep_state_spectra", False))
+        keep_state_debug = bool(params_local.get("keep_state_debug", False))
+        keep_state_features = bool(params_local.get("keep_state_features", True))
+
         params_local.setdefault("compute_output_audio", keep_state_audio)
+        params_local.setdefault("return_filtered_audio", keep_state_audio)
+        params_local.setdefault("return_spectra", keep_state_spectra)
+        params_local.setdefault("return_debug", keep_state_debug)
+        params_local.setdefault("return_detector_debug", keep_state_debug)
+        params_local.setdefault("return_noise_psd", keep_state_debug)
 
         sample_rate = int(params_local.get("sample_rate", 11162))
         cache_key = self._params_cache_key(params_local)
@@ -1271,10 +1295,7 @@ class RainDetectorProcessor(BaseProcessor):
                 metrics["mean_noise_floor_db"] = float(np.mean(noise_db))
                 metrics["median_noise_floor_db"] = float(np.median(noise_db))
 
-        keep_state_spectra = bool(params_local.get("keep_state_spectra", False))
-        keep_state_debug = bool(params_local.get("keep_state_debug", False))
         keep_state_config = bool(params_local.get("keep_state_config", False))
-        keep_state_features = bool(params_local.get("keep_state_features", True))
 
         state: Dict[str, Any] = {
             "frame_class": out.get("frame_class"),
@@ -1295,10 +1316,14 @@ class RainDetectorProcessor(BaseProcessor):
             state["features"] = out.get("features")
 
         if keep_state_debug:
-            state["debug"] = out.get("debug")
-            state["det_debug"] = out.get("det_debug")
-            state["freqs"] = out.get("freqs")
-            state["noise_psd"] = out.get("noise_psd")
+            if "debug" in out:
+                state["debug"] = out.get("debug")
+            if "det_debug" in out:
+                state["det_debug"] = out.get("det_debug")
+            if "freqs" in out:
+                state["freqs"] = out.get("freqs")
+            if "noise_psd" in out:
+                state["noise_psd"] = out.get("noise_psd")
 
         if keep_state_spectra:
             state["S"] = out.get("S")
@@ -1306,8 +1331,10 @@ class RainDetectorProcessor(BaseProcessor):
 
         if keep_state_audio:
             state["input_audio"] = audio_data
-            state["filtered_audio"] = out.get("x_filt")
-            state["output_audio"] = out.get("y")
+            if "x_filt" in out:
+                state["filtered_audio"] = out.get("x_filt")
+            if "y" in out:
+                state["output_audio"] = out.get("y")
 
         if keep_state_config:
             state["config"] = cfg
