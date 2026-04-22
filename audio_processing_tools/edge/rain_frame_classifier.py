@@ -49,7 +49,7 @@ def causal_stochastic_low_quantile_baseline(
     min_hist = max(1, int(round(float(min_hist_sec) * samples_per_sec)))
     scale_alpha = float(np.clip(1.0 - eta, 0.0, 0.9999))
 
-    baseline = float(max(x[0], floor))
+    baseline = float(max(x[0], floor))  
     scale = float(max(abs(x[0]), floor))
     out = np.empty(T, dtype=dtype)
     warm_ok = np.zeros(T, dtype=bool)
@@ -488,20 +488,23 @@ class RainFrameClassifierMixin:
         eps: float,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Frame-level fixed-band FD rain decision and confidence using per-mode normalized flux.
-        Primary band is intentionally fixed to mode 0 and support bands to modes 1, 2, and 3.
+        Frame-level fixed-band FD rain decision using the gated normalized per-mode flux.
 
-        Rule (log scale):
-            f0 = log1p(primary_mode_flux)
-            f1 = log1p(support_mode_flux_1)
-            f2 = log1p(support_mode_flux_2)
-            f3 = log1p(support_mode_flux_3)
-            support_hits = (f1 >= mode12_flux_min) + (f2 >= mode12_flux_min) + (f3 >= mode3_flux_min)
-            is_rain = (f0 >= primary_flux_min) & (support_hits >= min_support_count)
+        Thresholds are applied to log1p-transformed gated mode-flux values so runtime
+        matches the offline threshold search used during tuning.
 
-        Confidence is derived from how strongly the frame satisfies the primary-band
-        gate and the required support-band thresholds.
+        Rule:
+            primary_ok = primary_mode_flux >= primary_flux_min
+            support_hits = (support_mode_flux_1 >= mode12_flux_min)
+                         + (support_mode_flux_2 >= mode12_flux_min)
+                         + (support_mode_flux_3 >= mode3_flux_min)
+            is_rain = primary_ok & (support_hits >= min_support_count)
+
+        This intentionally matches the offline replay logic used for clip counts.
+        rain_conf is returned as a binary float so downstream frame-count aggregation
+        remains aligned with the hard frame decision.
         """
+        # Apply clip + log1p in one step (matches offline threshold search space)
         f0 = np.log1p(np.clip(np.asarray(primary_mode_flux), 0.0, None))
         f1 = np.log1p(np.clip(np.asarray(support_mode_flux_1), 0.0, None))
         f2 = np.log1p(np.clip(np.asarray(support_mode_flux_2), 0.0, None))
@@ -512,29 +515,15 @@ class RainFrameClassifierMixin:
         mode3_flux_min = float(mode3_flux_min)
         min_support_count = int(max(1, min_support_count))
 
+        primary_ok = f0 >= primary_flux_min
         support_hits = (
             (f1 >= mode12_flux_min).astype(np.int32)
             + (f2 >= mode12_flux_min).astype(np.int32)
             + (f3 >= mode3_flux_min).astype(np.int32)
         )
 
-        is_rain = (f0 >= primary_flux_min) & (support_hits >= min_support_count)
-
-        primary_conf = np.clip(f0 / max(primary_flux_min, float(eps)), 0.0, 1.0)
-        support_margin_1 = np.clip(f1 / max(mode12_flux_min, float(eps)), 0.0, None)
-        support_margin_2 = np.clip(f2 / max(mode12_flux_min, float(eps)), 0.0, None)
-        support_margin_3 = np.clip(f3 / max(mode3_flux_min, float(eps)), 0.0, None)
-
-        support_stack = np.stack([support_margin_1, support_margin_2, support_margin_3], axis=0)
-        support_stack_sorted = np.sort(support_stack, axis=0)[::-1]
-        support_rank_idx = min(min_support_count - 1, support_stack_sorted.shape[0] - 1)
-        support_conf = np.clip(support_stack_sorted[support_rank_idx], 0.0, 1.0)
-
-        rain_conf = np.where(
-            is_rain,
-            np.minimum(primary_conf, support_conf),
-            0.0,
-        ).astype(np.float32, copy=False)
+        is_rain = primary_ok & (support_hits >= min_support_count)
+        rain_conf = is_rain.astype(np.float32, copy=False)
 
         return is_rain, rain_conf
     # ------------------------------------------------------------
@@ -567,6 +556,7 @@ class RainFrameClassifierMixin:
         dtype = resolve_np_dtype(self._dget("process_dtype", "float32"))
 
         include_peak_payload = bool(self._dget("feature_dump_include_peak_payload", False))
+        feature_dump_include_frame_class = bool(self._dget("feature_dump_include_frame_class", True))
 
         op_band = self._dget("operating_band", (400.0, 3500.0))
         op_lo, op_hi = float(op_band[0]), float(op_band[1])
@@ -1027,11 +1017,34 @@ class RainFrameClassifierMixin:
         support_mode_flux_2 = np.nan_to_num(normalized_mode_flux_by_mode[2], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_3 = np.nan_to_num(normalized_mode_flux_by_mode[3], nan=0.0, posinf=0.0, neginf=0.0)
 
+        # TD gate: require minimum crest factor and optionally reject overly spiky
+        # frames using an upper threshold on kurtosis.
+        td_gate_threshold = float(self._dget("td_gate_threshold", 2.5))
+        td_kurtosis_upper_threshold = self._dget("td_kurtosis_upper_threshold", None)
+        td_gate_value = td_crest_factor
+        td_gate_mask = td_gate_value > td_gate_threshold
+        if td_kurtosis_upper_threshold is not None:
+            td_kurtosis_upper_threshold = float(td_kurtosis_upper_threshold)
+            td_gate_mask = td_gate_mask & (td_kurtosis <= td_kurtosis_upper_threshold)
+        gate_scale = td_gate_mask.astype(dtype)
+
+        primary_mode_flux_gated = primary_mode_flux * gate_scale
+        support_mode_flux_1_gated = support_mode_flux_1 * gate_scale
+        support_mode_flux_2_gated = support_mode_flux_2 * gate_scale
+        support_mode_flux_3_gated = support_mode_flux_3 * gate_scale
+
+        # Keep explicit log1p-transformed gated features in debug / feature dump so
+        # offline inspection can verify the exact values used by the hard decision.
+        primary_mode_flux_log_gated = np.log1p(np.clip(primary_mode_flux_gated, 0.0, None))
+        support_mode_flux_1_log_gated = np.log1p(np.clip(support_mode_flux_1_gated, 0.0, None))
+        support_mode_flux_2_log_gated = np.log1p(np.clip(support_mode_flux_2_gated, 0.0, None))
+        support_mode_flux_3_log_gated = np.log1p(np.clip(support_mode_flux_3_gated, 0.0, None))
+
         is_rain, rain_conf = self._rain_frame_decision(
-            primary_mode_flux=primary_mode_flux,
-            support_mode_flux_1=support_mode_flux_1,
-            support_mode_flux_2=support_mode_flux_2,
-            support_mode_flux_3=support_mode_flux_3,
+            primary_mode_flux=primary_mode_flux_gated,
+            support_mode_flux_1=support_mode_flux_1_gated,
+            support_mode_flux_2=support_mode_flux_2_gated,
+            support_mode_flux_3=support_mode_flux_3_gated,
             primary_flux_min=primary_flux_min,
             mode12_flux_min=mode12_flux_min,
             mode3_flux_min=mode3_flux_min,
@@ -1042,7 +1055,8 @@ class RainFrameClassifierMixin:
         # Noise confidence is the complement of rain confidence, with weak mode flux
         # still used to assign explicit NOISE labels.
         noise_conf = np.clip(1.0 - rain_conf, 0.0, 1.0)
-        weak_mode_flux = mode_flux_score <= mode_flux_noise_max
+        mode_flux_score_gated = mode_flux_score * gate_scale
+        weak_mode_flux = mode_flux_score_gated <= mode_flux_noise_max
 
         # FrameClass is the canonical raw detector output.
         frame_class = np.full(T, FrameClass.UNCERTAIN, dtype=np.int8)
@@ -1053,10 +1067,19 @@ class RainFrameClassifierMixin:
 
         det_debug = {
             "mode_flux_score": mode_flux_score,
+            "mode_flux_score_gated": mode_flux_score_gated,
             "primary_mode_flux": primary_mode_flux,
             "support_mode_flux_1": support_mode_flux_1,
             "support_mode_flux_2": support_mode_flux_2,
             "support_mode_flux_3": support_mode_flux_3,
+            "primary_mode_flux_gated": primary_mode_flux_gated,
+            "support_mode_flux_1_gated": support_mode_flux_1_gated,
+            "support_mode_flux_2_gated": support_mode_flux_2_gated,
+            "support_mode_flux_3_gated": support_mode_flux_3_gated,
+            "primary_mode_flux_log_gated": primary_mode_flux_log_gated,
+            "support_mode_flux_1_log_gated": support_mode_flux_1_log_gated,
+            "support_mode_flux_2_log_gated": support_mode_flux_2_log_gated,
+            "support_mode_flux_3_log_gated": support_mode_flux_3_log_gated,
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
             "frame_class": frame_class,
@@ -1066,6 +1089,9 @@ class RainFrameClassifierMixin:
             "td_time_flux_score": td_time_flux_score,
             "td_crest_factor": td_crest_factor,
             "td_kurtosis": td_kurtosis,
+            "td_gate_threshold": td_gate_threshold,
+            "td_kurtosis_upper_threshold": td_kurtosis_upper_threshold,
+            "td_gate_mask": td_gate_mask,
             "td_vote_count": td_vote_count,
             "td_soft_score": td_soft_score,
         }
@@ -1091,29 +1117,51 @@ class RainFrameClassifierMixin:
         feature_dump: Dict[str, Any] = {}
 
         if feature_dump_level > 0:
-            # Level 1: compact feature set for offline analysis and replay of the
-            # current fixed-band FD decision logic, plus selected TD shape features.
-            feature_dump = {
-                "frame_times": detector_frame_times,
+            # Feature dump contains only feature arrays used for tuning / replay.
+            # Keep settings / thresholds / decisions in det_debug so the saved
+            # feature payload stays compact and focused on primary + derived features.
+            fd_primary = {
                 "mode_flux_score": mode_flux_score,
                 "primary_mode_flux": primary_mode_flux,
                 "support_mode_flux_1": support_mode_flux_1,
                 "support_mode_flux_2": support_mode_flux_2,
                 "support_mode_flux_3": support_mode_flux_3,
+            }
+            fd_gated = {
+                "mode_flux_score_gated": mode_flux_score_gated,
+                "primary_mode_flux_gated": primary_mode_flux_gated,
+                "support_mode_flux_1_gated": support_mode_flux_1_gated,
+                "support_mode_flux_2_gated": support_mode_flux_2_gated,
+                "support_mode_flux_3_gated": support_mode_flux_3_gated,
+            }
+            fd_log_gated = {
+                "primary_mode_flux_log_gated": primary_mode_flux_log_gated,
+                "support_mode_flux_1_log_gated": support_mode_flux_1_log_gated,
+                "support_mode_flux_2_log_gated": support_mode_flux_2_log_gated,
+                "support_mode_flux_3_log_gated": support_mode_flux_3_log_gated,
+            }
+            fd_td = {
                 "td_time_flux_score": td_time_flux_score,
                 "td_crest_factor": td_crest_factor,
                 "td_kurtosis": td_kurtosis,
+                "td_gate_mask": td_gate_mask,
             }
-            if feature_dump_level == 1:
-                feature_dump.update({
-                    "normalized_mode_flux_by_mode": normalized_mode_flux_by_mode,
-                    "frame_class": frame_class,
-                    "td_soft_label": td_soft_label.astype(np.int8),
-                    "peak_ratio": peak_ratio,
-                })
 
-            if feature_dump_level == 1 and td_envelope_features_enable:
+            feature_dump = {
+                "frame_times": detector_frame_times,
+                **fd_primary,
+                # **fd_gated,
+                # **fd_log_gated,
+                **fd_td,
+            }
+
+            if feature_dump_include_frame_class:
+                feature_dump["frame_class"] = frame_class
+
+            if td_envelope_features_enable:
                 feature_dump.update({
+                    "td_energy_envelope": td_energy_envelope,
+                    "td_peak_energy": td_peak_energy,
                     "td_rise_time_sec": td_rise_time_sec,
                     "td_fall_time_sec": td_fall_time_sec,
                     "td_rise_slope": td_rise_slope,
@@ -1121,32 +1169,21 @@ class RainFrameClassifierMixin:
                 })
 
             if feature_dump_level > 1:
-                # Level 2: richer diagnostics and detector outputs for analysis.
                 feature_dump.update({
-                    "peak_ratio": peak_ratio,
                     "flux_primary": flux_primary,
+                    "peak_ratio": peak_ratio,
                     "peak_gate_score": peak_gate_score,
-                    "peak_gate": peak_gate.astype(np.int8),
-                    "peak_valid_count": peak_valid_count,
-                    "peak_count_by_mode": peak_count_by_mode,
-                    "rain_conf": rain_conf,
-                    "noise_conf": noise_conf,
-                    "td_soft_label": td_soft_label.astype(np.int8),
-                    "td_vote_count": td_vote_count,
+                    "peak_valid_count": peak_valid_count.astype(dtype, copy=False),
+                    "peak_count_by_mode": peak_count_by_mode.astype(dtype, copy=False),
                     "td_soft_score": td_soft_score,
+                    "td_vote_count": td_vote_count.astype(dtype, copy=False),
                 })
 
-                if td_envelope_features_enable:
-                    feature_dump.update({
-                        "td_energy_envelope": td_energy_envelope,
-                        "td_peak_energy": td_peak_energy,
-                    })
-
-                if include_peak_payload:
-                    feature_dump.update({
-                        "peak_valid_freqs_hz": peak_valid_freqs_hz,
-                        "peak_valid_prominences_db": peak_valid_prominences_db,
-                        "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
-                    })
+            if feature_dump_level > 1 and include_peak_payload:
+                feature_dump.update({
+                    "peak_valid_freqs_hz": peak_valid_freqs_hz,
+                    "peak_valid_prominences_db": peak_valid_prominences_db,
+                    "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
+                })
 
         return frame_class, rain_conf, det_debug, feature_dump

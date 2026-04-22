@@ -2574,108 +2574,28 @@ def rain_detection_algo (
     
     return rain_drop_count, frain_mean, algo_state_all
 
-
-# --- New helper functions for original clip-level result ---
-
-def original_clip_is_rain_from_count(rain_drop_count_mod: float, params: dict) -> bool:
-    """
-    Convert the original algorithm's modified rain-drop count into the final
-    clip-level rain / no-rain decision used in batch evaluation.
-
-    Parameters:
-    - rain_drop_count_mod (float): Final modified rain-drop count from the
-      original algorithm.
-    - params (dict): Algorithm parameter dictionary. Must contain
-      `rain_drop_min_thr`.
-
-    Returns:
-    - bool: Clip-level rain decision.
-    """
-    return bool(rain_drop_count_mod > params["rain_drop_min_thr"])
-
-
-def original_clip_decision_from_audio(
-    audio_signal: np.ndarray,
-    params: dict,
-    ref_file=None,
-    stft_precomputed=None,
-    return_algo_state: bool = False,
-):
-    """
-    Run the existing/original rain algorithm on an in-memory audio signal and
-    return a clean clip-level result dictionary.
-
-    Notes:
-    - The current original algorithm uses both raw audio and internally computed
-      STFT/time-domain features. Therefore `stft_precomputed` is accepted only
-      for API compatibility and is not consumed by the current implementation.
-    - This helper is intended for clean apples-to-apples comparison against new
-      clip-level rules.
-
-    Parameters:
-    - audio_signal (np.ndarray): Audio samples for one clip.
-    - params (dict): Algorithm parameter dictionary.
-    - ref_file: Optional reference file forwarded to the wrapper if needed in
-      future. Currently not used by the standard path.
-    - stft_precomputed: Optional precomputed STFT. Accepted but ignored by the
-      current implementation.
-    - return_algo_state (bool): If True, include `algo_state` in the returned
-      dictionary.
-
-    Returns:
-    - dict: Clip-level result with original algorithm outputs.
-    """
-    if stft_precomputed is not None:
-        # Kept for future extension. The current original implementation
-        # computes STFT/features internally from audio.
-        pass
-
-    rain_drop_count_mod, frain_mean, offset, algo_state_all = analyse_raw_audio_wrapper(
-        audio_signal,
-        params,
-        ref_file=ref_file,
-    )
-
-    rain_drop_count = algo_state_all.get("rain_drop_count", rain_drop_count_mod)
-    rain_peaks_count = algo_state_all.get("rain_peaks_count", rain_drop_count_mod)
-    clip_is_rain = original_clip_is_rain_from_count(rain_drop_count_mod, params)
-
-    result = {
-        "clip_is_rain": clip_is_rain,
-        "rain_drop_count": rain_drop_count,
-        "rain_drop_count_mod": rain_drop_count_mod,
-        "rain_peaks_count": rain_peaks_count,
-        "frain_mean": frain_mean,
-        "offset": offset,
-    }
-
-    if return_algo_state:
-        result["algo_state"] = algo_state_all
-
-    return result
-
 def python_classifier_boolean_wrapper(
     audio_signal: np.ndarray, **kwargs
 ):
     """
-    Evaluates whether an audio signal contains rain using the original clip-level
-    decision path.
+    Evaluates whether an audio signal contains rain.
 
     Parameters:
     - audio_signal (np.ndarray): The audio signal to evaluate.
     - **kwargs (Any): Additional keyword arguments passed to the rain detection algorithm.
 
     Returns:
-    - Union[bool, float]: Returns True if rain is detected, False if not,
-      and np.nan if the clip-level result is unavailable.
+    - Union[bool, float]: Returns True if rain is detected above the threshold, False if below or equal to the threshold,
+      and np.nan if the rain drop count is negative.
     """
 
-    result = original_clip_decision_from_audio(audio_signal, kwargs)
-    clip_is_rain = result.get("clip_is_rain")
-
-    if clip_is_rain is None:
+    rain_drop_count, frain_mean,algo_state_all = rain_detection_algo (audio_signal, **kwargs)
+    if rain_drop_count > 0:
+        return True
+    elif rain_drop_count == 0:
+        return False
+    else:
         return np.nan
-    return bool(clip_is_rain)
         
 
 MAX_DURATION_FW = 2
