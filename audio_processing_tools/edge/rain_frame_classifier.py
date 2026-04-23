@@ -555,7 +555,10 @@ class RainFrameClassifierMixin:
         eps = float(self._dget("eps", 1e-9))
         dtype = resolve_np_dtype(self._dget("process_dtype", "float32"))
 
-        include_peak_payload = bool(self._dget("feature_dump_include_peak_payload", False))
+        peak_features_enable = bool(self._dget("peak_features_enable", False))
+        include_peak_payload = peak_features_enable and bool(
+            self._dget("feature_dump_include_peak_payload", False)
+        )
         feature_dump_include_frame_class = bool(self._dget("feature_dump_include_frame_class", True))
 
         op_band = self._dget("operating_band", (400.0, 3500.0))
@@ -780,18 +783,19 @@ class RainFrameClassifierMixin:
         if not any(np.any(m) for m in mode_masks):
             raise ValueError("No mode band overlaps the operating band")
 
-        peak_top_p = int(self._dget("peak_top_p", 6))
-        primary_top_m = int(self._dget("primary_top_m", 3))
-        peak_prominence_db = float(self._dget("peak_prominence_db", 3.0))
-        peak_min_db_above_floor = float(self._dget("peak_min_db_above_floor", 6.0))
-        peak_ratio_min = float(self._dget("peak_ratio_min", 0.50))
-        peak_valid_prom_min_db = float(self._dget("peak_valid_prom_min_db", 3.0))
-        peak_valid_prom_max_db = float(self._dget("peak_valid_prom_max_db", 6.0))
+        if peak_features_enable:
+            peak_top_p = int(self._dget("peak_top_p", 6))
+            primary_top_m = int(self._dget("primary_top_m", 3))
+            peak_prominence_db = float(self._dget("peak_prominence_db", 3.0))
+            peak_min_db_above_floor = float(self._dget("peak_min_db_above_floor", 6.0))
+            peak_ratio_min = float(self._dget("peak_ratio_min", 0.50))
+            peak_valid_prom_min_db = float(self._dget("peak_valid_prom_min_db", 3.0))
+            peak_valid_prom_max_db = float(self._dget("peak_valid_prom_max_db", 6.0))
 
-        peak_top_p = max(1, peak_top_p)
-        primary_top_m = max(1, primary_top_m)
-        peak_ratio_min = float(np.clip(peak_ratio_min, 0.0, 1.0))
-        peak_valid_prom_max_db = max(peak_valid_prom_min_db, peak_valid_prom_max_db)
+            peak_top_p = max(1, peak_top_p)
+            primary_top_m = max(1, primary_top_m)
+            peak_ratio_min = float(np.clip(peak_ratio_min, 0.0, 1.0))
+            peak_valid_prom_max_db = max(peak_valid_prom_min_db, peak_valid_prom_max_db)
 
         flux_primary = np.full(T, np.nan, dtype=dtype)
         flux_modes = np.full(T, np.nan, dtype=dtype)
@@ -868,84 +872,85 @@ class RainFrameClassifierMixin:
 
             flux_modes[t] = total_flux_modes
 
-            # --- Peak structure: among the strongest peaks, require primary-band presence
-            #     near the top and enough overall concentration inside the expected mode bands. ---
-            spec_db = frame
-            floor_db = float(np.median(spec_db))
-            height_thresh = floor_db + peak_min_db_above_floor
+            if peak_features_enable:
+                # --- Peak structure: among the strongest peaks, require primary-band presence
+                #     near the top and enough overall concentration inside the expected mode bands. ---
+                spec_db = frame
+                floor_db = float(np.median(spec_db))
+                height_thresh = floor_db + peak_min_db_above_floor
 
-            peaks, props = spsig.find_peaks(
-                spec_db,
-                prominence=peak_prominence_db,
-                height=height_thresh,
-            )
-            if peaks.size == 0:
-                peak_ratio[t] = 0.0
-                peak_gate_score[t] = 0.0
-                peak_valid_count[t] = 0
-                peak_count_by_mode[:, t] = 0
-            else:
-                # Valid peaks are those satisfying the requested prominence range.
-                pk_h = np.asarray(props.get("peak_heights", spec_db[peaks]), dtype=dtype)
-                pk_prom = np.asarray(props.get("prominences", np.zeros(peaks.size)), dtype=dtype)
-                widths_bins, *_ = peak_widths(spec_db, peaks, rel_height=0.5)
-                df_hz = float(freqs_band[1] - freqs_band[0]) if freqs_band.size > 1 else 0.0
-                pk_bw_hz = np.asarray(widths_bins, dtype=dtype) * df_hz
-
-                valid_prom_mask = (
-                    (pk_prom >= peak_valid_prom_min_db)
-                    & (pk_prom <= peak_valid_prom_max_db)
+                peaks, props = spsig.find_peaks(
+                    spec_db,
+                    prominence=peak_prominence_db,
+                    height=height_thresh,
                 )
-                peaks_valid = peaks[valid_prom_mask]
-                pk_h_valid = pk_h[valid_prom_mask]
-                pk_prom_valid = pk_prom[valid_prom_mask]
-                pk_bw_hz_valid = pk_bw_hz[valid_prom_mask]
-                peak_valid_count[t] = int(peaks_valid.size)
-
-                for i, m_mask in enumerate(mode_masks):
-                    if peaks_valid.size > 0:
-                        in_mode_valid = m_mask[peaks_valid]
-                        peak_count_by_mode[i, t] = int(np.sum(in_mode_valid))
-                    else:
-                        peak_count_by_mode[i, t] = 0
-
-                # Optional per-mode representative peak payload.
-                for i, m_mask in enumerate(mode_masks):
-                    if peaks_valid.size == 0:
-                        continue
-
-                    in_mode_valid = m_mask[peaks_valid]
-                    if include_peak_payload and np.any(in_mode_valid):
-                        mode_freqs = freqs_band[peaks_valid[in_mode_valid]].astype(dtype)
-                        mode_prom = pk_prom_valid[in_mode_valid].astype(dtype)
-                        mode_bw = pk_bw_hz_valid[in_mode_valid].astype(dtype)
-                        mode_heights = pk_h_valid[in_mode_valid].astype(dtype)
-
-                        best_idx = int(np.argmax(mode_heights))
-                        peak_valid_freqs_hz[i, t] = np.asarray([mode_freqs[best_idx]], dtype=dtype)
-                        peak_valid_prominences_db[i, t] = np.asarray([mode_prom[best_idx]], dtype=dtype)
-                        peak_valid_bandwidths_hz[i, t] = np.asarray([mode_bw[best_idx]], dtype=dtype)
-
-                if peaks_valid.size == 0:
+                if peaks.size == 0:
                     peak_ratio[t] = 0.0
                     peak_gate_score[t] = 0.0
+                    peak_valid_count[t] = 0
+                    peak_count_by_mode[:, t] = 0
                 else:
-                    # Strongest top-P valid peaks for gate computation.
-                    order = np.argsort(pk_h_valid)[::-1]
-                    sel = peaks_valid[order[:peak_top_p]]
-                    in_primary = primary_mask[sel]
-                    in_any_mode = np.zeros(sel.size, dtype=bool)
-                    for m_mask in mode_masks:
-                        in_any_mode |= m_mask[sel]
+                    # Valid peaks are those satisfying the requested prominence range.
+                    pk_h = np.asarray(props.get("peak_heights", spec_db[peaks]), dtype=dtype)
+                    pk_prom = np.asarray(props.get("prominences", np.zeros(peaks.size)), dtype=dtype)
+                    widths_bins, *_ = peak_widths(spec_db, peaks, rel_height=0.5)
+                    df_hz = float(freqs_band[1] - freqs_band[0]) if freqs_band.size > 1 else 0.0
+                    pk_bw_hz = np.asarray(widths_bins, dtype=dtype) * df_hz
 
-                    top_m = min(primary_top_m, sel.size)
-                    ratio = float(np.sum(in_any_mode)) / float(max(1, sel.size))
+                    valid_prom_mask = (
+                        (pk_prom >= peak_valid_prom_min_db)
+                        & (pk_prom <= peak_valid_prom_max_db)
+                    )
+                    peaks_valid = peaks[valid_prom_mask]
+                    pk_h_valid = pk_h[valid_prom_mask]
+                    pk_prom_valid = pk_prom[valid_prom_mask]
+                    pk_bw_hz_valid = pk_bw_hz[valid_prom_mask]
+                    peak_valid_count[t] = int(peaks_valid.size)
 
-                    primary_ok = float(np.any(in_primary[:top_m]))
-                    mode_ok = float(ratio >= peak_ratio_min)
+                    for i, m_mask in enumerate(mode_masks):
+                        if peaks_valid.size > 0:
+                            in_mode_valid = m_mask[peaks_valid]
+                            peak_count_by_mode[i, t] = int(np.sum(in_mode_valid))
+                        else:
+                            peak_count_by_mode[i, t] = 0
 
-                    peak_ratio[t] = ratio
-                    peak_gate_score[t] = min(primary_ok, mode_ok)
+                    # Optional per-mode representative peak payload.
+                    for i, m_mask in enumerate(mode_masks):
+                        if peaks_valid.size == 0:
+                            continue
+
+                        in_mode_valid = m_mask[peaks_valid]
+                        if include_peak_payload and np.any(in_mode_valid):
+                            mode_freqs = freqs_band[peaks_valid[in_mode_valid]].astype(dtype)
+                            mode_prom = pk_prom_valid[in_mode_valid].astype(dtype)
+                            mode_bw = pk_bw_hz_valid[in_mode_valid].astype(dtype)
+                            mode_heights = pk_h_valid[in_mode_valid].astype(dtype)
+
+                            best_idx = int(np.argmax(mode_heights))
+                            peak_valid_freqs_hz[i, t] = np.asarray([mode_freqs[best_idx]], dtype=dtype)
+                            peak_valid_prominences_db[i, t] = np.asarray([mode_prom[best_idx]], dtype=dtype)
+                            peak_valid_bandwidths_hz[i, t] = np.asarray([mode_bw[best_idx]], dtype=dtype)
+
+                    if peaks_valid.size == 0:
+                        peak_ratio[t] = 0.0
+                        peak_gate_score[t] = 0.0
+                    else:
+                        # Strongest top-P valid peaks for gate computation.
+                        order = np.argsort(pk_h_valid)[::-1]
+                        sel = peaks_valid[order[:peak_top_p]]
+                        in_primary = primary_mask[sel]
+                        in_any_mode = np.zeros(sel.size, dtype=bool)
+                        for m_mask in mode_masks:
+                            in_any_mode |= m_mask[sel]
+
+                        top_m = min(primary_top_m, sel.size)
+                        ratio = float(np.sum(in_any_mode)) / float(max(1, sel.size))
+
+                        primary_ok = float(np.any(in_primary[:top_m]))
+                        mode_ok = float(ratio >= peak_ratio_min)
+
+                        peak_ratio[t] = ratio
+                        peak_gate_score[t] = min(primary_ok, mode_ok)
 
         def rolling_low_quantile_baseline(x: np.ndarray) -> np.ndarray:
             """Causal stochastic low-quantile baseline for sparse impulsive flux signals."""
@@ -1083,8 +1088,6 @@ class RainFrameClassifierMixin:
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
             "frame_class": frame_class,
-            "peak_valid_count": peak_valid_count,
-            "peak_count_by_mode": peak_count_by_mode,
             "td_soft_label": td_soft_label,
             "td_time_flux_score": td_time_flux_score,
             "td_crest_factor": td_crest_factor,
@@ -1104,6 +1107,14 @@ class RainFrameClassifierMixin:
                 "td_fall_slope": td_fall_slope,
                 "td_energy_envelope": td_energy_envelope,
                 "td_peak_energy": td_peak_energy,
+            })
+
+        if peak_features_enable:
+            det_debug.update({
+                "peak_ratio": peak_ratio,
+                "peak_gate_score": peak_gate_score,
+                "peak_valid_count": peak_valid_count,
+                "peak_count_by_mode": peak_count_by_mode,
             })
 
         if include_peak_payload:
@@ -1171,13 +1182,16 @@ class RainFrameClassifierMixin:
             if feature_dump_level > 1:
                 feature_dump.update({
                     "flux_primary": flux_primary,
-                    "peak_ratio": peak_ratio,
-                    "peak_gate_score": peak_gate_score,
-                    "peak_valid_count": peak_valid_count.astype(dtype, copy=False),
-                    "peak_count_by_mode": peak_count_by_mode.astype(dtype, copy=False),
                     "td_soft_score": td_soft_score,
                     "td_vote_count": td_vote_count.astype(dtype, copy=False),
                 })
+                if peak_features_enable:
+                    feature_dump.update({
+                        "peak_ratio": peak_ratio,
+                        "peak_gate_score": peak_gate_score,
+                        "peak_valid_count": peak_valid_count.astype(dtype, copy=False),
+                        "peak_count_by_mode": peak_count_by_mode.astype(dtype, copy=False),
+                    })
 
             if feature_dump_level > 1 and include_peak_payload:
                 feature_dump.update({
@@ -1186,4 +1200,5 @@ class RainFrameClassifierMixin:
                     "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
                 })
 
+        det_debug["peak_features_enable"] = peak_features_enable
         return frame_class, rain_conf, det_debug, feature_dump
