@@ -10,9 +10,17 @@ EPS = 1e-12
 
 # -----------------------------------------------------------------------------
 # Scaling Note:
-#   E_band and N_E are both computed as time-domain bandpass energies (sum of squares).
-#   This means they are directly comparable for suppression and diagnostics.
-#   FFT-domain metrics (Mb_fft, Eb_fft) are provided as diagnostics only and are not
+#   E_band and N_E are both computed as time-domain bandpass energies (sum of squares)
+#   over the configured primary band (`band_hz`). This makes them directly comparable
+#   for suppression.
+#
+#   M_band is an amplitude-like metric derived from the same primary-band energy:
+#       M_band = sqrt(E_band)
+#
+#   M_clean is the noise-suppressed primary-band amplitude-like output:
+#       M_clean = M_band * G_mag
+#
+#   FFT-domain metrics (M_band_fft, E_band_fft) are diagnostics only and are not
 #   directly comparable to time-domain energies without Parseval normalization.
 # -----------------------------------------------------------------------------
 
@@ -21,7 +29,7 @@ EPS = 1e-12
 # helpers
 # ----------------------------
 def hz_to_bin(f_hz: float, fs: float, n_fft: int) -> int:
-    return int(np.round(f_hz * n_fft / fs))
+    return int(np.clip(np.round(f_hz * n_fft / fs), 0, n_fft // 2))
 
 
 def db_to_ratio(db: float) -> float:
@@ -30,9 +38,9 @@ def db_to_ratio(db: float) -> float:
 
 
 def _frame_view(sig: np.ndarray, frame_len: int, hop: int) -> np.ndarray:
-    sig = np.asarray(sig, dtype=np.float64).reshape(-1)
+    sig = np.asarray(sig).reshape(-1)
     if sig.size < frame_len:
-        return np.empty((0, frame_len), dtype=np.float64)
+        return np.empty((0, frame_len), dtype=sig.dtype)
     T = 1 + (sig.size - frame_len) // hop
     stride = sig.strides[0]
     return np.lib.stride_tricks.as_strided(
@@ -41,7 +49,7 @@ def _frame_view(sig: np.ndarray, frame_len: int, hop: int) -> np.ndarray:
         strides=(hop * stride, stride),
         writeable=False,
     )
-
+    
 @dataclass
 class NoiseFrameDetectorConfig:
     fs: int = 11162
@@ -143,9 +151,14 @@ class NoiseFrameDetector:
             return 0.0
         return float(np.sum(P[b0:b1 + 1]))
 
-    def fft_rain(self, x: np.ndarray) -> bool:
-        X = np.fft.rfft(x, n=self.cfg.n_fft)
-        P = (X.real * X.real + X.imag * X.imag)
+    def fft_rain_from_power(self, P: np.ndarray) -> bool:
+        """
+        FFT-domain rain decision from an rFFT power spectrum.
+
+        This is used to decide whether the current frame should be treated as rain
+        and excluded from noise learning. It is not just a diagnostic path.
+        """
+        P = np.asarray(P).reshape(-1)
 
         rain_sum = 0.0
         for (b0, b1) in self._rain_bins:
@@ -164,6 +177,11 @@ class NoiseFrameDetector:
         self._prev_rain_sum = rain_sum
         self._prev_primary = primary
         return bool(cond1 and cond2)
+
+    def fft_rain(self, x: np.ndarray) -> bool:
+        X = np.fft.rfft(x, n=self.cfg.n_fft)
+        P = (X.real * X.real + X.imag * X.imag)
+        return self.fft_rain_from_power(P)
 
     def time_rain_mask_from_subE(
         self,
@@ -259,12 +277,17 @@ class NoiseFrameDetector:
         subE: np.ndarray,
         *,
         subEhpf: Optional[np.ndarray] = None,
+        fft_power: Optional[np.ndarray] = None,
     ) -> tuple[bool, np.ndarray]:
         """
         Returns:
           fft_rain_frame, rain_submask(S)
         """
-        fft_rain_frame = self.fft_rain(x)
+        if fft_power is not None:
+            fft_rain_frame = self.fft_rain_from_power(fft_power)
+        else:
+            fft_rain_frame = self.fft_rain(x)
+
         time_mask = self.time_rain_mask_from_subE(subE, subEhpf=subEhpf)
 
         if fft_rain_frame:
@@ -283,6 +306,7 @@ class NoiseFrameDetector:
         self._prev_Lb = None
         self._prev_Lh = None
 
+
 @dataclass
 class BandNoiseFrameOut:
     M_band: float
@@ -295,15 +319,69 @@ class BandNoiseFrameOut:
     subE: np.ndarray  # shape (S,)
     # rain mask used for estimator (True = rain => excluded from noise learning)
     rain_submask: np.ndarray  # shape (S,)
-    # gain + cleaned magnitude
+    # Gain and noise-suppressed amplitude-like output for the configured primary band.
     G_mag: float
     M_clean: float
-    # diagnostics
+    # Detector / diagnostic outputs.
     fft_rain_frame: bool
     # --- Optional diagnostics (added for debugging/analysis, default to 0.0 for backward compatibility)
     M_band_fft: float = 0.0
     E_band_fft: float = 0.0
     E_hpf: float = 0.0
+
+    # --- Rolling stats snapshot since last read/reset
+    noise_energy_sum: float = 0.0
+    rain_energy_sum: float = 0.0
+    total_energy_sum: float = 0.0
+    noise_frame_count: int = 0
+    rain_frame_count: int = 0
+    total_frame_count: int = 0
+
+
+# New dataclass for telemetry energy stats
+@dataclass
+class BandNoiseEnergyStats:
+    """
+    Accumulated energy statistics since the last reset/read.
+
+    Intended for minute-level telemetry on sensor/edge:
+      - total_energy_sum: total inbound band energy observed
+      - rain_energy_sum: band energy from frames/subframes classified as rain
+      - noise_energy_sum: estimated inbound noise energy from non-rain frames/subframes
+
+    `read_and_reset_energy_stats()` returns these values and clears the accumulator.
+    """
+    noise_energy_sum: float = 0.0
+    rain_energy_sum: float = 0.0
+    total_energy_sum: float = 0.0
+    noise_frame_count: int = 0
+    rain_frame_count: int = 0
+    total_frame_count: int = 0
+
+    @property
+    def noise_energy_mean(self) -> float:
+        return self.noise_energy_sum / max(1, self.noise_frame_count)
+
+    @property
+    def rain_energy_mean(self) -> float:
+        return self.rain_energy_sum / max(1, self.rain_frame_count)
+
+    @property
+    def total_energy_mean(self) -> float:
+        return self.total_energy_sum / max(1, self.total_frame_count)
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "noise_energy_sum": float(self.noise_energy_sum),
+            "rain_energy_sum": float(self.rain_energy_sum),
+            "total_energy_sum": float(self.total_energy_sum),
+            "noise_frame_count": int(self.noise_frame_count),
+            "rain_frame_count": int(self.rain_frame_count),
+            "total_frame_count": int(self.total_frame_count),
+            "noise_energy_mean": float(self.noise_energy_mean),
+            "rain_energy_mean": float(self.rain_energy_mean),
+            "total_energy_mean": float(self.total_energy_mean),
+        }
 
 
 @dataclass
@@ -311,11 +389,15 @@ class BandNoiseEstimatorConfig:
     fs: int = 11162
     frame_len: int = 512
 
+    # Internal numeric dtype. Use np.float32 on edge for lower memory/CPU cost,
+    # or np.float64 for offline analysis/debugging.
+    dtype: type = np.float64
+
     # Optional HPF
     hp_cutoff_hz: float = 350.0
     hp_order: int = 4
 
-    # Band used for BPF energy + suppression metric
+    # Primary band used for BPF energy, noise estimation, and M_clean suppression output.
     band_hz: Tuple[float, float] = (400.0, 700.0)
     bpf_order: int = 4
 
@@ -324,8 +406,8 @@ class BandNoiseEstimatorConfig:
     subhop: int = 128
 
     # Noise estimation
-    W: int = 30           # quantile window length (per-subframe lane) (~342 ms @ 11.4 ms/subframe)
-    W_min: int = 10       # warmup valid samples required (per lane) 114 msec
+    W: int = 30           # quantile window length over recent non-rain subframes
+    W_min: int = 10       # warmup valid non-rain subframes required
     q: float = 0.3       # quantile
     ema_alpha: float = 1  # smoothing on quantile result
 
@@ -350,6 +432,10 @@ class BandNoiseEstimatorConfig:
     det: NoiseFrameDetectorConfig = field(default_factory=NoiseFrameDetectorConfig)
     def validate(self) -> None:
         # Validate quantile
+        if self.dtype not in (np.float32, np.float64):
+            raise ValueError("dtype must be np.float32 or np.float64")
+        if int(self.det.n_fft) != int(self.frame_len):
+            raise ValueError("det.n_fft must match frame_len so FFT diagnostics and FFT rain detection use the same spectrum")
         if self.frame_len % self.subframe_len != 0:
             raise ValueError("subframe_len must divide frame_len")
         if not (0.0 < self.q < 1.0):
@@ -375,17 +461,19 @@ class BandNoiseEstimatorConfig:
 # ----------------------------
 class BandNoiseEstimator:
     """
-    - Computes band metrics (FFT magnitude sum and power sum in band_hz)
-    - Computes BPF subframe energies
-    - Uses detector to decide which subframes are rain (exclude from noise learning)
-    - Keeps per-lane ring buffers of length W for noise-only subframe energies
-    - After W_min valid samples per lane, outputs quantile+EMA noise estimate per lane
-    - Noise per frame = sum of lane noise estimates
-    - Wiener-like gain computed from E_band and N_E
+    - Computes primary-band time-domain energy using a BPF over `band_hz`
+    - Computes primary-band subframe energies for causal noise learning
+    - Uses detector to decide which subframes are rain and excludes them from normal noise learning
+    - Keeps a ring buffer of recent non-rain subframe energies of length W
+    - After W_min valid samples, outputs a quantile+EMA noise estimate per subframe
+    - Noise per frame = estimated subframe noise energy * number of subframes
+    - Computes Wiener-like gain from E_band and N_E
+    - Always returns M_clean, the noise-suppressed amplitude-like output for the configured primary band
     """
     def __init__(self, cfg: BandNoiseEstimatorConfig):
         cfg.validate()
         self.cfg = cfg
+        self.dtype = cfg.dtype
         self.N = int(cfg.frame_len)
         self.sub_len = int(cfg.subframe_len)
         self.subhop = int(cfg.subhop)
@@ -393,7 +481,7 @@ class BandNoiseEstimator:
         self.S = 1 + (self.N - self.sub_len) // self.subhop
 
         # FFT band mask (for M_band/E_band diagnostics)
-        freqs = np.fft.rfftfreq(self.N, d=1.0 / cfg.fs)
+        freqs = np.fft.rfftfreq(self.N, d=1.0 / cfg.fs).astype(self.dtype, copy=False)
         lo, hi = cfg.band_hz
         self.band_mask = (freqs >= lo) & (freqs <= hi)
 
@@ -413,7 +501,7 @@ class BandNoiseEstimator:
 
         # Noise buffer: single continuous subframe stream
         self.W = int(cfg.W)  # now interpreted as "number of subframes in window"
-        self.buf = np.zeros(self.W, dtype=np.float64)
+        self.buf = np.zeros(self.W, dtype=self.dtype)
         self.valid = np.zeros(self.W, dtype=bool)
         self.wr = 0
         self.count_valid = 0
@@ -421,13 +509,17 @@ class BandNoiseEstimator:
         # EMA state for scalar noise estimate (per-subframe)
         self.noise_ema = 0.0
 
+        # Rolling telemetry accumulator. This is intended to be read once per
+        # rain-report interval, then reset via read_and_reset_energy_stats().
+        self.energy_stats = BandNoiseEnergyStats()
+
     @staticmethod
     def _design_hpf(cfg: BandNoiseEstimatorConfig) -> Optional[np.ndarray]:
         if cfg.hp_cutoff_hz <= 0:
             return None
         nyq = 0.5 * cfg.fs
         w = np.clip(cfg.hp_cutoff_hz / nyq, 1e-6, 0.999)
-        return spsig.butter(cfg.hp_order, w, btype="highpass", output="sos")
+        return spsig.butter(cfg.hp_order, w, btype="highpass", output="sos").astype(cfg.dtype, copy=False)
 
     @staticmethod
     def _design_bpf(cfg: BandNoiseEstimatorConfig) -> np.ndarray:
@@ -437,14 +529,27 @@ class BandNoiseEstimator:
         w2 = np.clip(hi / nyq, 1e-6, 0.999)
         if w2 <= w1:
             w2 = min(0.999, w1 + 1e-3)
-        return spsig.butter(cfg.bpf_order, [w1, w2], btype="bandpass", output="sos")
+        return spsig.butter(cfg.bpf_order, [w1, w2], btype="bandpass", output="sos").astype(cfg.dtype, copy=False)
 
     def reset(self) -> None:
+        # full reset for new stream/file
         self.hpf_zi = None
         self.bpf_zi = None
         self._need_zi_seed = True
 
-        # reset noise buffers
+        self.reset_noise_estimator()
+        self.reset_energy_stats()
+        self.det.reset()
+
+
+    def reset_noise_estimator(self) -> None:
+        """
+        Reset only the noise-estimator state.
+
+        This intentionally does not reset filter state or detector state, so it can
+        be used during a continuous stream when the noise estimate is judged to have
+        drifted too far from its recent baseline.
+        """
         self.buf[:] = 0.0
         self.valid[:] = False
         self.wr = 0
@@ -452,8 +557,6 @@ class BandNoiseEstimator:
         self.noise_ema = 0.0
         self.N_E_smooth = 0.0
 
-        # reset detector state
-        self.det.reset()
 
     def _push_stream(self, v: float) -> None:
         j = int(self.wr)
@@ -466,7 +569,7 @@ class BandNoiseEstimator:
             self.count_valid += 1
 
         self.wr = (j + 1) % self.W
-    
+
     def _estimate_noise_scalar(self) -> float:
         if int(self.count_valid) < int(self.cfg.W_min):
             return 0.0
@@ -480,12 +583,79 @@ class BandNoiseEstimator:
         self.noise_ema = (1.0 - a) * self.noise_ema + a * qv
         return float(self.noise_ema)
 
+    def reset_energy_stats(self) -> None:
+        """Clear accumulated telemetry energy statistics."""
+        self.energy_stats = BandNoiseEnergyStats()
+
+    def get_energy_stats(self) -> BandNoiseEnergyStats:
+        """Return a snapshot of accumulated telemetry energy statistics without resetting."""
+        return BandNoiseEnergyStats(
+            noise_energy_sum=float(self.energy_stats.noise_energy_sum),
+            rain_energy_sum=float(self.energy_stats.rain_energy_sum),
+            total_energy_sum=float(self.energy_stats.total_energy_sum),
+            noise_frame_count=int(self.energy_stats.noise_frame_count),
+            rain_frame_count=int(self.energy_stats.rain_frame_count),
+            total_frame_count=int(self.energy_stats.total_frame_count),
+        )
+
+    def read_and_reset_energy_stats(self) -> BandNoiseEnergyStats:
+        """
+        Return accumulated telemetry energy statistics and reset the accumulator.
+
+        Use this at the rain-report boundary, for example once per minute after
+        the sensor has prepared its outbound rain-data payload.
+        """
+        stats = self.get_energy_stats()
+        self.reset_energy_stats()
+        return stats
+
+    def _update_energy_stats(
+        self,
+        *,
+        subE: np.ndarray,
+        rain_submask: np.ndarray,
+        total_energy: float,
+        noise_energy_est: float,
+    ) -> None:
+        """
+        Update rolling telemetry stats for one processed frame.
+
+        `subE` is the inbound band energy per subframe.
+        `rain_submask=True` means the subframe was classified as rain and excluded
+        from normal noise learning.
+        `noise_energy_est` is the estimator's current total noise estimate for the frame.
+        """
+        rain_submask = np.asarray(rain_submask, dtype=bool).reshape(-1)
+        subE = np.asarray(subE, dtype=self.dtype).reshape(-1)
+
+        if subE.size != rain_submask.size:
+            raise ValueError(f"subE and rain_submask must have the same size, got {subE.size} and {rain_submask.size}")
+
+        rain_energy = float(np.sum(subE[rain_submask])) if np.any(rain_submask) else 0.0
+        non_rain_energy = float(np.sum(subE[~rain_submask])) if np.any(~rain_submask) else 0.0
+
+        # For noise, report the smaller of observed non-rain band energy and the
+        # current noise estimate. This avoids reporting more inbound noise energy
+        # than was observed in non-rain subframes while still tying the value to
+        # the estimator state used for suppression.
+        noise_energy = float(min(max(noise_energy_est, 0.0), max(non_rain_energy, 0.0)))
+
+        self.energy_stats.total_energy_sum += float(max(total_energy, 0.0))
+        self.energy_stats.rain_energy_sum += rain_energy
+        self.energy_stats.noise_energy_sum += noise_energy
+        self.energy_stats.total_frame_count += 1
+
+        if bool(np.any(rain_submask)):
+            self.energy_stats.rain_frame_count += 1
+        else:
+            self.energy_stats.noise_frame_count += 1
+
     def process_frame(self, frame: np.ndarray) -> BandNoiseFrameOut:
         """
         Process a single frame and return band noise estimation and diagnostics.
         """
         cfg = self.cfg
-        x = np.asarray(frame, dtype=np.float64)
+        x = np.asarray(frame, dtype=self.dtype)
         if x.ndim != 1 or x.size != self.N:
             raise ValueError(f"frame must be 1-D length {self.N}")
 
@@ -493,14 +663,16 @@ class BandNoiseEstimator:
         if self._need_zi_seed:
             x0 = float(x[0]) if x.size else 0.0
             if self.hpf_sos is not None:
-                self.hpf_zi = spsig.sosfilt_zi(self.hpf_sos).astype(np.float64) * x0
-            self.bpf_zi = spsig.sosfilt_zi(self.bpf_sos).astype(np.float64) * x0
+                self.hpf_zi = spsig.sosfilt_zi(self.hpf_sos).astype(self.dtype, copy=False) * self.dtype(x0)
+            self.bpf_zi = spsig.sosfilt_zi(self.bpf_sos).astype(self.dtype, copy=False) * self.dtype(x0)
             self._need_zi_seed = False
 
         # HPF
         if self.hpf_sos is not None:
             assert self.hpf_zi is not None
             x, self.hpf_zi = spsig.sosfilt(self.hpf_sos, x, zi=self.hpf_zi)
+            x = np.asarray(x, dtype=self.dtype)
+            self.hpf_zi = np.asarray(self.hpf_zi, dtype=self.dtype)
 
         # HPF frame energy (diagnostic)
         E_hpf_frame = float(np.sum(x * x))
@@ -508,45 +680,63 @@ class BandNoiseEstimator:
         # HPF subframe energies (Ehpf per subframe)
         subs_hpf = _frame_view(x, self.sub_len, self.subhop)
         if subs_hpf.shape[0] == 0:
-            subEhpf = np.asarray([float(np.sum(x * x))], dtype=np.float64)
+            subEhpf = np.asarray([float(np.sum(x * x))], dtype=self.dtype)
             subEhpf = np.pad(subEhpf, (0, self.S - subEhpf.size), mode="edge")
         else:
-            subEhpf = np.sum(subs_hpf * subs_hpf, axis=1).astype(np.float64)
-            if subEhpf.size != self.S:
-                subEhpf = np.resize(subEhpf, self.S)
+            subEhpf = np.sum(subs_hpf * subs_hpf, axis=1).astype(self.dtype)
+            if subEhpf.size < self.S:
+                subEhpf = np.pad(subEhpf, (0, self.S - subEhpf.size), mode="edge")
+            elif subEhpf.size > self.S:
+                subEhpf = subEhpf[:self.S]
 
-        # FFT band metrics (diagnostics only)
-        # NOTE: Not used for suppression because FFT-domain scaling is not directly
-        # comparable to time-domain (BPF) energy without careful Parseval normalization.
-        X = np.fft.rfft(x)
+        # FFT spectrum used for two purposes:
+        #   1) FFT-domain rain/noise-frame decision inside NoiseFrameDetector
+        #   2) FFT-domain diagnostics M_band_fft/E_band_fft
+        #
+        # The FFT decision is important for protecting the noise estimator: when it
+        # fires, the full frame is treated as rain and excluded from normal noise
+        # learning. The FFT diagnostic magnitudes below are not used for suppression
+        # because FFT-domain scaling is not directly comparable to time-domain BPF
+        # energy without careful Parseval normalization.
+        X = np.fft.rfft(x, n=cfg.det.n_fft)
+        P_fft = X.real * X.real + X.imag * X.imag
         mag = np.abs(X)
         Mb_fft = float(np.sum(mag[self.band_mask]))
-        Eb_fft = float(np.sum(mag[self.band_mask] ** 2))
+        Eb_fft = float(np.sum(P_fft[self.band_mask]))
 
         # BPF for time-domain band subframe energies (subE)
         assert self.bpf_zi is not None
         x_bp, self.bpf_zi = spsig.sosfilt(self.bpf_sos, x, zi=self.bpf_zi)
+        x_bp = np.asarray(x_bp, dtype=self.dtype)
+        self.bpf_zi = np.asarray(self.bpf_zi, dtype=self.dtype)
 
         # Time-domain band energy for this FFT frame (this is the scale used by subE/N_E)
         # This makes Eb directly comparable to N_E_raw (both are sum(x^2) energies).
         Eb = float(np.sum(x_bp * x_bp))
 
-        # A magnitude-like companion metric for reporting/cleaned magnitude.
-        # Keep it consistent with Eb's scale (avoid mixing FFT magnitude sums with time energy).
+        # Primary-band amplitude-like metric used for the cleaned output.
+        # Keep it consistent with Eb's time-domain scale; do not mix with FFT magnitude sums.
         Mb = float(np.sqrt(max(Eb, 0.0)))
 
         # BPF subframe energies (subE)
         subs = _frame_view(x_bp, self.sub_len, self.subhop)
         if subs.shape[0] == 0:
-            subE = np.asarray([float(np.sum(x_bp * x_bp))], dtype=np.float64)
+            subE = np.asarray([float(np.sum(x_bp * x_bp))], dtype=self.dtype)
             subE = np.pad(subE, (0, self.S - subE.size), mode="edge")
         else:
-            subE = np.sum(subs * subs, axis=1).astype(np.float64)
-            if subE.size != self.S:
-                subE = np.resize(subE, self.S)
+            subE = np.sum(subs * subs, axis=1).astype(self.dtype)
+            if subE.size < self.S:
+                subE = np.pad(subE, (0, self.S - subE.size), mode="edge")
+            elif subE.size > self.S:
+                subE = subE[:self.S]
 
         # detector (pass subEhpf for time-domain rain detection)
-        fft_rain_frame, rain_submask = self.det.process_frame(x, subE, subEhpf=subEhpf)
+        fft_rain_frame, rain_submask = self.det.process_frame(
+            x,
+            subE,
+            subEhpf=subEhpf,
+            fft_power=P_fft,
+        )
 
         # --- Learning logic (production): decide which subframes to use for noise learning
         # Learn noise only from non-rain subframes (default).
@@ -562,7 +752,7 @@ class BandNoiseEstimator:
                 self._push_stream(float(max(subE[s], cfg.eps)))
 
         N_sub_scalar = self._estimate_noise_scalar()  # noise per-subframe energy
-        N_sub = np.full(self.S, N_sub_scalar, dtype=np.float64)
+        N_sub = np.full(self.S, N_sub_scalar, dtype=self.dtype)
         N_E_raw = float(self.S * N_sub_scalar)
 
         # Optional: outer smoothing on total noise (asymmetric EMA)
@@ -584,7 +774,17 @@ class BandNoiseEstimator:
         else:
             N_E = N_E_raw
 
-        # Wiener-like gain (use band energy Eb and noise N_E)
+        # Update rolling telemetry stats after rain/noise classification and
+        # after the current frame's noise estimate has been produced.
+        self._update_energy_stats(
+            subE=subE,
+            rain_submask=rain_submask,
+            total_energy=Eb,
+            noise_energy_est=N_E,
+        )
+
+        # Wiener-like gain using primary-band energy Eb and estimated noise energy N_E.
+        # M_clean is the required noise-suppressed amplitude-like output for this band.
         num = max(Eb - cfg.beta * N_E, 0.0)
         den = Eb + cfg.eps
         G_pow = num / den
@@ -607,4 +807,10 @@ class BandNoiseEstimator:
             M_band_fft=Mb_fft,
             E_band_fft=Eb_fft,
             E_hpf=E_hpf_frame,
+            noise_energy_sum=float(self.energy_stats.noise_energy_sum),
+            rain_energy_sum=float(self.energy_stats.rain_energy_sum),
+            total_energy_sum=float(self.energy_stats.total_energy_sum),
+            noise_frame_count=int(self.energy_stats.noise_frame_count),
+            rain_frame_count=int(self.energy_stats.rain_frame_count),
+            total_frame_count=int(self.energy_stats.total_frame_count),
         )

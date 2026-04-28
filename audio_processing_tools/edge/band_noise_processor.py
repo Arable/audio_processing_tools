@@ -83,32 +83,12 @@ class BandNoiseEstimatorProcessor:
         params: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
-        x = np.asarray(audio_data, dtype=np.float64)
+        cfg = self._build_config(params)
+        dtype = cfg.dtype
+
+        x = np.asarray(audio_data, dtype=dtype)
         if x.ndim != 1 or x.size == 0:
             raise ValueError("audio_data must be non-empty mono ndarray")
-
-        cfg = self._build_config(params)
-
-        # Optional: print merged params once (per processor instance)
-        if bool(params.get("print_params_once", False)) and (not self._printed_params_once) and (not self.__class__._printed_params_global):
-            merged_view = dict(params)
-            merged_view["mode"] = self.mode  # keep visible for old harnesses
-            print("\n=====================================")
-            print(f"MERGED PARAMS (global overridden by proc) — {self.name}")
-            print("=====================================")
-            for k in sorted(merged_view.keys()):
-                print(f"{k}: {merged_view[k]}")
-            print("=====================================\n")
-            self._printed_params_once = True
-            self.__class__._printed_params_global = True
-
-        # NOTE: run() is called once per input vector (file/test-vector)
-        # so we must reset estimator state for each new stream.
-        est = BandNoiseEstimator(cfg)
-        if hasattr(est, "reset"):
-            est.reset()
-        elif hasattr(est, "reset_for_new_stream"):
-            est.reset_for_new_stream()
 
         fs = int(cfg.fs)
         N = int(cfg.frame_len)
@@ -117,6 +97,12 @@ class BandNoiseEstimatorProcessor:
         hop = int(params.get("hop", N))
         if hop <= 0:
             raise ValueError("hop must be positive")
+        if hop != N:
+            raise ValueError(
+                "BandNoiseEstimatorProcessor requires hop == frame_len because "
+                "BandNoiseEstimator keeps streaming IIR filter state across frames. "
+                f"Got hop={hop}, frame_len={N}."
+            )
 
         # Subframe count must match estimator logic: S = 1 + (N - sub_len)//subhop
         sub_len = int(cfg.subframe_len)
@@ -132,10 +118,6 @@ class BandNoiseEstimatorProcessor:
             )
         S = 1 + (N - sub_len) // subhop
 
-        # Optional runtime verbosity
-        verbose = bool(params.get("verbose", self.verbose))
-
-        # Determine full frames only (no padding). This matches typical embedded framing.
         n_frames = 1 + (len(x) - N) // hop if len(x) >= N else 0
         times_s = (np.arange(n_frames, dtype=np.float64) * hop) / fs
 
@@ -153,16 +135,16 @@ class BandNoiseEstimatorProcessor:
                 "processor": self.name,
                 "mode": self.mode,
                 "times_s": times_s,
-                "M_band": np.zeros(0, dtype=np.float64),
-                "E_band": np.zeros(0, dtype=np.float64),
-                "N_E": np.zeros(0, dtype=np.float64),
-                "N_E_raw": np.zeros(0, dtype=np.float64),
-                "subE": np.zeros((0, S), dtype=np.float64),
-                "N_sub": np.zeros((0, S), dtype=np.float64),
+                "M_band": np.zeros(0, dtype=dtype),
+                "E_band": np.zeros(0, dtype=dtype),
+                "N_E": np.zeros(0, dtype=dtype),
+                "N_E_raw": np.zeros(0, dtype=dtype),
+                "subE": np.zeros((0, S), dtype=dtype),
+                "N_sub": np.zeros((0, S), dtype=dtype),
                 "rain_submask": np.zeros((0, S), dtype=bool),
                 "fft_rain_frame": np.zeros(0, dtype=bool),
-                "G_mag": np.zeros(0, dtype=np.float64),
-                "M_clean": np.zeros(0, dtype=np.float64),
+                "G_mag": np.zeros(0, dtype=dtype),
+                "M_clean": np.zeros(0, dtype=dtype),
                 "config": cfg,
             }
             if bool(params.get("include_audio_in_state", False)):
@@ -170,19 +152,26 @@ class BandNoiseEstimatorProcessor:
             return results, state
 
         # Allocate outputs (new API)
-        M_band = np.zeros(n_frames, dtype=np.float64)
-        E_band = np.zeros(n_frames, dtype=np.float64)
-        subE = np.zeros((n_frames, S), dtype=np.float64)
-        N_E = np.zeros(n_frames, dtype=np.float64)
-        N_E_raw = np.zeros(n_frames, dtype=np.float64)
-        G_mag = np.zeros(n_frames, dtype=np.float64)
-        M_clean = np.zeros(n_frames, dtype=np.float64)
+        M_band = np.zeros(n_frames, dtype=dtype)
+        E_band = np.zeros(n_frames, dtype=dtype)
+        subE = np.zeros((n_frames, S), dtype=dtype)
+        N_E = np.zeros(n_frames, dtype=dtype)
+        N_E_raw = np.zeros(n_frames, dtype=dtype)
+        G_mag = np.zeros(n_frames, dtype=dtype)
+        M_clean = np.zeros(n_frames, dtype=dtype)
 
         fft_rain_frame = np.zeros(n_frames, dtype=bool)
+
         rain_submask = np.zeros((n_frames, S), dtype=bool)
-        N_sub = np.zeros((n_frames, S), dtype=np.float64)
+        N_sub = np.zeros((n_frames, S), dtype=dtype)
 
         # Streaming loop
+        est = BandNoiseEstimator(cfg)
+        if hasattr(est, "reset"):
+            est.reset()
+        elif hasattr(est, "reset_for_new_stream"):
+            est.reset_for_new_stream()
+
         for i in range(n_frames):
             frame = x[i * hop : i * hop + N]
 
@@ -217,6 +206,8 @@ class BandNoiseEstimatorProcessor:
                     cv_disp = cv
                 #print("band_noise debug:", {"i": i, "count_valid": cv_disp, "N_E_raw": float(out.N_E_raw)})
 
+        energy_stats = est.get_energy_stats().as_dict() if hasattr(est, "get_energy_stats") else {}
+
         # Summary (used by results_df)
         results = {
             "processor": self.name,
@@ -226,6 +217,7 @@ class BandNoiseEstimatorProcessor:
             "noise_E_med": float(np.median(N_E)) if n_frames else np.nan,
             "gain_med": float(np.median(G_mag)) if n_frames else np.nan,
             "fft_rain_frac": float(np.mean(fft_rain_frame)) if n_frames else np.nan,
+            **{f"energy_stats__{k}": v for k, v in energy_stats.items()},
         }
 
         # Full debug state (used by tuning / plots)
@@ -248,6 +240,7 @@ class BandNoiseEstimatorProcessor:
             "M_clean": M_clean,
 
             "config": cfg,
+            "energy_stats": energy_stats,
         }
 
         # Optional: include the (possibly truncated) input audio in state for plotting

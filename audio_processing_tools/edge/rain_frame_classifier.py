@@ -77,28 +77,23 @@ def causal_stochastic_low_quantile_baseline(
 
 def assign_td_soft_label(
     *,
-    td_time_flux_score: np.ndarray,
     td_crest_factor: np.ndarray,
     td_kurtosis: np.ndarray,
-    time_flux_thr: float,
     crest_thr: float,
     kurt_thr: float,
     min_positive_votes: int = 2,
-    eps: float = 1e-9,
 ) -> Dict[str, np.ndarray]:
-    """Assign TD soft label from TD features."""
-    td_time_flux_score = np.asarray(td_time_flux_score)
+    """Assign TD soft label from TD impulse features."""
     td_crest_factor = np.asarray(td_crest_factor)
     td_kurtosis = np.asarray(td_kurtosis)
 
-    T = td_time_flux_score.shape[0]
+    T = td_crest_factor.shape[0]
 
     vote_count = np.zeros(T, dtype=np.int32)
-    vote_count += (td_time_flux_score >= float(time_flux_thr)).astype(np.int32)
     vote_count += (td_crest_factor >= float(crest_thr)).astype(np.int32)
     vote_count += (td_kurtosis >= float(kurt_thr)).astype(np.int32)
 
-    soft_score = vote_count.astype(np.float32) / 3.0
+    soft_score = vote_count.astype(np.float32) / 2.0
     soft_label = vote_count >= int(min_positive_votes)
 
     return {
@@ -119,15 +114,10 @@ def extract_td_features_inline(
     mode_bands: Optional[Tuple[Tuple[float, float], ...]],
     td_input_mode: str,
     td_input_band: Optional[Tuple[float, float]],
-    time_flux_band: Optional[Tuple[float, float]],
     bp_order: int,
     subframe_len: int,
     subframe_hop: int,
     envelope_features_enable: bool,
-    baseline_win_sec: float,
-    baseline_min_hist_sec: float,
-    baseline_q: float,
-    baseline_floor: float,
     process_dtype: str = "float32",
     eps: float = 1e-9,
 ) -> Dict[str, np.ndarray]:
@@ -304,55 +294,23 @@ def extract_td_features_inline(
             f"Unsupported td_input_mode={td_input_mode!r}. "
             "Expected one of {'default', 'comb_filter', 'bandpass'}."
         )
-
-    if time_flux_band is not None:
-        x_flux = _bandpass(x, time_flux_band)
-    else:
-        x_flux = x_td.copy()
     
     frames = _frame_view(x_td)
     Tloc = frames.shape[0]
     frame_times = (np.arange(Tloc, dtype=dtype) * hop) / float(fs)
-    sub_energy, sub_times = _subframe_energy(x_flux)
-    sub_envelope, sub_rise_time, sub_fall_time, sub_rise_slope, sub_fall_slope, sub_peak_level, sub_peak_mask = _subframe_peak_shape_features(
+    sub_energy, _ = _subframe_energy(x_td)
+    sub_envelope, sub_rise_time, sub_fall_time, sub_rise_slope, sub_fall_slope, sub_peak_level, _ = _subframe_peak_shape_features(
         sub_energy,
         enable_envelope_features=bool(envelope_features_enable),
     )
-    sub_baseline, sub_warm_ok = causal_stochastic_low_quantile_baseline(
-        sub_energy,
-        q_percent=float(baseline_q),
-        samples_per_sec=float(fs) / max(float(subframe_hop), 1.0),
-        win_sec=float(baseline_win_sec),
-        min_hist_sec=float(baseline_min_hist_sec),
-        floor=float(baseline_floor),
-        dtype=dtype,
-    )
-    frame_energy = _frame_sum_from_subframes(sub_energy, Tloc)
     frame_envelope = _frame_sum_from_subframes(sub_envelope, Tloc)
     frame_rise_time = _frame_max_from_subframes(sub_rise_time, Tloc)
     frame_fall_time = _frame_max_from_subframes(sub_fall_time, Tloc)
     frame_rise_slope = _frame_max_from_subframes(sub_rise_slope, Tloc)
     frame_fall_slope = _frame_max_from_subframes(sub_fall_slope, Tloc)
     frame_peak_level = _frame_max_from_subframes(sub_peak_level, Tloc)
-    frame_baseline = _frame_sum_from_subframes(sub_baseline, Tloc)
-    frame_warm_ok = np.zeros(Tloc, dtype=bool)
-    if sub_warm_ok.size > 0:
-        for t in range(Tloc):
-            ok0 = bool(sub_warm_ok[t]) if t < sub_warm_ok.size else False
-            ok1 = bool(sub_warm_ok[t + 1]) if (t + 1) < sub_warm_ok.size else False
-            frame_warm_ok[t] = ok0 and ok1
-    baseline_ref = np.maximum(frame_baseline, float(baseline_floor))
-
-    frame_flux = np.zeros(Tloc, dtype=dtype)
-    td_time_flux_score = np.zeros(Tloc, dtype=dtype)
     td_crest_factor = np.zeros(Tloc, dtype=dtype)
     td_kurtosis = np.zeros(Tloc, dtype=dtype)
-
-    if Tloc > 2:
-        frame_flux[2:] = np.maximum(frame_energy[2:] - frame_energy[:-2], 0.0)
-
-    td_time_flux_score = frame_flux / baseline_ref
-    td_time_flux_score = np.where(frame_warm_ok, td_time_flux_score, 0.0)
 
     for t in range(Tloc):
         seg = np.asarray(frames[t], dtype=dtype)
@@ -367,7 +325,6 @@ def extract_td_features_inline(
 
     return {
         "frame_times": frame_times,
-        "time_flux_score": td_time_flux_score,
         "crest_factor": td_crest_factor,
         "kurtosis": td_kurtosis,
         "energy_envelope": frame_envelope,
@@ -482,7 +439,8 @@ class RainFrameClassifierMixin:
         support_mode_flux_2: np.ndarray,
         support_mode_flux_3: np.ndarray,
         primary_flux_min: float,
-        mode12_flux_min: float,
+        mode1_flux_min: float,
+        mode2_flux_min: float,
         mode3_flux_min: float,
         min_support_count: int,
         eps: float,
@@ -495,8 +453,8 @@ class RainFrameClassifierMixin:
 
         Rule:
             primary_ok = primary_mode_flux >= primary_flux_min
-            support_hits = (support_mode_flux_1 >= mode12_flux_min)
-                         + (support_mode_flux_2 >= mode12_flux_min)
+            support_hits = (support_mode_flux_1 >= mode1_flux_min)
+                         + (support_mode_flux_2 >= mode2_flux_min)
                          + (support_mode_flux_3 >= mode3_flux_min)
             is_rain = primary_ok & (support_hits >= min_support_count)
 
@@ -511,14 +469,15 @@ class RainFrameClassifierMixin:
         f3 = np.log1p(np.clip(np.asarray(support_mode_flux_3), 0.0, None))
 
         primary_flux_min = float(primary_flux_min)
-        mode12_flux_min = float(mode12_flux_min)
+        mode1_flux_min = float(mode1_flux_min)
+        mode2_flux_min = float(mode2_flux_min)
         mode3_flux_min = float(mode3_flux_min)
         min_support_count = int(max(1, min_support_count))
 
         primary_ok = f0 >= primary_flux_min
         support_hits = (
-            (f1 >= mode12_flux_min).astype(np.int32)
-            + (f2 >= mode12_flux_min).astype(np.int32)
+            (f1 >= mode1_flux_min).astype(np.int32)
+            + (f2 >= mode2_flux_min).astype(np.int32)
             + (f3 >= mode3_flux_min).astype(np.int32)
         )
 
@@ -578,23 +537,12 @@ class RainFrameClassifierMixin:
         # TD features are always extracted when input_audio is available; soft labels remain optional.
         td_soft_enable = bool(self._dget("td_soft_enable", False))
         td_soft_bp_order = int(self._dget("td_soft_bp_order", 4))
-        td_soft_time_flux_band = self._dget("td_soft_time_flux_band", None)
-        if td_soft_time_flux_band is not None:
-            td_soft_time_flux_band = (
-                float(td_soft_time_flux_band[0]),
-                float(td_soft_time_flux_band[1]),
-            )
         td_soft_subframe_len = int(self._dget("td_soft_subframe_len", 128))
         td_soft_subframe_hop = int(self._dget("td_soft_subframe_hop", 128))
         td_input_mode = str(self._dget("td_input_mode", "default")).lower()
         td_input_band = self._dget("td_input_band", None)
         if td_input_band is not None:
             td_input_band = (float(td_input_band[0]), float(td_input_band[1]))
-        td_soft_baseline_win_sec = float(self._dget("td_soft_baseline_win_sec", 0.5))
-        td_soft_baseline_q = float(self._dget("td_soft_baseline_q", 20.0))
-        td_soft_baseline_min_hist_sec = float(self._dget("td_soft_baseline_min_hist_sec", 0.25))
-        td_soft_time_flux_score_min = float(self._dget("td_soft_time_flux_score_min", 1.5))
-        td_soft_baseline_floor = float(self._dget("td_soft_baseline_floor", 1e-6))
         td_soft_crest_factor_min = float(self._dget("td_soft_crest_factor_min", 4.0))
         td_soft_kurtosis_min = float(self._dget("td_soft_kurtosis_min", 6.0))
         td_soft_min_positive_votes = int(self._dget("td_soft_min_positive_votes", 2))
@@ -648,15 +596,10 @@ class RainFrameClassifierMixin:
                     mode_bands=tuple((float(a), float(b)) for (a, b) in mode_bands),
                     td_input_mode=td_input_mode,
                     td_input_band=td_input_band,
-                    time_flux_band=td_soft_time_flux_band,
                     bp_order=td_soft_bp_order,
                     subframe_len=td_soft_subframe_len,
                     subframe_hop=td_soft_subframe_hop,
                     envelope_features_enable=td_envelope_features_enable,
-                    baseline_win_sec=td_soft_baseline_win_sec,
-                    baseline_min_hist_sec=td_soft_baseline_min_hist_sec,
-                    baseline_q=td_soft_baseline_q,
-                    baseline_floor=td_soft_baseline_floor,
                     process_dtype=str(self._dget("process_dtype", "float32")),
                     eps=eps,
                 )
@@ -669,7 +612,6 @@ class RainFrameClassifierMixin:
         )
 
         td_soft_label = np.zeros(T, dtype=bool)
-        td_time_flux_score = np.zeros(T, dtype=dtype)
         td_crest_factor = np.zeros(T, dtype=dtype)
         td_kurtosis = np.zeros(T, dtype=dtype)
         td_rise_time_sec = np.zeros(T, dtype=dtype)
@@ -682,12 +624,6 @@ class RainFrameClassifierMixin:
         td_soft_score = np.zeros(T, dtype=dtype)
 
         if td_soft_debug and ("error" not in td_soft_debug):
-            td_time_flux_score = self._align_feature_to_frames(
-                td_soft_debug.get("time_flux_score"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
             td_crest_factor = self._align_feature_to_frames(
                 td_soft_debug.get("crest_factor"),
                 n_frames=T,
@@ -741,14 +677,11 @@ class RainFrameClassifierMixin:
 
             if td_soft_enable:
                 td_label_out = assign_td_soft_label(
-                    td_time_flux_score=td_time_flux_score,
                     td_crest_factor=td_crest_factor,
                     td_kurtosis=td_kurtosis,
-                    time_flux_thr=td_soft_time_flux_score_min,
                     crest_thr=td_soft_crest_factor_min,
                     kurt_thr=td_soft_kurtosis_min,
                     min_positive_votes=td_soft_min_positive_votes,
-                    eps=eps,
                 )
 
                 td_vote_count = td_label_out["td_vote_count"]
@@ -1013,14 +946,17 @@ class RainFrameClassifierMixin:
         td_soft_score = np.nan_to_num(td_soft_score, nan=0.0, posinf=0.0, neginf=0.0)
 
         primary_flux_min = float(self._dget("new_rain_primary_flux_min", 1.8))
-        mode12_flux_min = float(self._dget("new_rain_mode12_flux_min", 2.6))
+        legacy_mode12_flux_min = float(self._dget("new_rain_mode12_flux_min", 2.6))
+        mode1_flux_min = float(self._dget("new_rain_mode1_flux_min", legacy_mode12_flux_min))
+        mode2_flux_min = float(self._dget("new_rain_mode2_flux_min", legacy_mode12_flux_min))
         mode3_flux_min = float(self._dget("new_rain_mode3_flux_min", 3.0))
-        min_support_count = int(self._dget("new_rain_min_support_count", 2))
+        min_support_count = int(self._dget("new_rain_min_support_count", 3))
 
         primary_mode_flux = np.nan_to_num(normalized_mode_flux_by_mode[0], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_1 = np.nan_to_num(normalized_mode_flux_by_mode[1], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_2 = np.nan_to_num(normalized_mode_flux_by_mode[2], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_3 = np.nan_to_num(normalized_mode_flux_by_mode[3], nan=0.0, posinf=0.0, neginf=0.0)
+        support_mode_flux_4 = np.nan_to_num(normalized_mode_flux_by_mode[4], nan=0.0, posinf=0.0, neginf=0.0) if normalized_mode_flux_by_mode.shape[0] > 4 else np.zeros_like(primary_mode_flux)
 
         # TD gate: require minimum crest factor and optionally reject overly spiky
         # frames using an upper threshold on kurtosis.
@@ -1038,20 +974,14 @@ class RainFrameClassifierMixin:
         support_mode_flux_2_gated = support_mode_flux_2 * gate_scale
         support_mode_flux_3_gated = support_mode_flux_3 * gate_scale
 
-        # Keep explicit log1p-transformed gated features in debug / feature dump so
-        # offline inspection can verify the exact values used by the hard decision.
-        primary_mode_flux_log_gated = np.log1p(np.clip(primary_mode_flux_gated, 0.0, None))
-        support_mode_flux_1_log_gated = np.log1p(np.clip(support_mode_flux_1_gated, 0.0, None))
-        support_mode_flux_2_log_gated = np.log1p(np.clip(support_mode_flux_2_gated, 0.0, None))
-        support_mode_flux_3_log_gated = np.log1p(np.clip(support_mode_flux_3_gated, 0.0, None))
-
         is_rain, rain_conf = self._rain_frame_decision(
             primary_mode_flux=primary_mode_flux_gated,
             support_mode_flux_1=support_mode_flux_1_gated,
             support_mode_flux_2=support_mode_flux_2_gated,
             support_mode_flux_3=support_mode_flux_3_gated,
             primary_flux_min=primary_flux_min,
-            mode12_flux_min=mode12_flux_min,
+            mode1_flux_min=mode1_flux_min,
+            mode2_flux_min=mode2_flux_min,
             mode3_flux_min=mode3_flux_min,
             min_support_count=min_support_count,
             eps=eps,
@@ -1077,19 +1007,15 @@ class RainFrameClassifierMixin:
             "support_mode_flux_1": support_mode_flux_1,
             "support_mode_flux_2": support_mode_flux_2,
             "support_mode_flux_3": support_mode_flux_3,
+            "support_mode_flux_4": support_mode_flux_4,
             "primary_mode_flux_gated": primary_mode_flux_gated,
             "support_mode_flux_1_gated": support_mode_flux_1_gated,
             "support_mode_flux_2_gated": support_mode_flux_2_gated,
             "support_mode_flux_3_gated": support_mode_flux_3_gated,
-            "primary_mode_flux_log_gated": primary_mode_flux_log_gated,
-            "support_mode_flux_1_log_gated": support_mode_flux_1_log_gated,
-            "support_mode_flux_2_log_gated": support_mode_flux_2_log_gated,
-            "support_mode_flux_3_log_gated": support_mode_flux_3_log_gated,
             "rain_conf": rain_conf,
             "noise_conf": noise_conf,
             "frame_class": frame_class,
             "td_soft_label": td_soft_label,
-            "td_time_flux_score": td_time_flux_score,
             "td_crest_factor": td_crest_factor,
             "td_kurtosis": td_kurtosis,
             "td_gate_threshold": td_gate_threshold,
@@ -1137,22 +1063,9 @@ class RainFrameClassifierMixin:
                 "support_mode_flux_1": support_mode_flux_1,
                 "support_mode_flux_2": support_mode_flux_2,
                 "support_mode_flux_3": support_mode_flux_3,
-            }
-            fd_gated = {
-                "mode_flux_score_gated": mode_flux_score_gated,
-                "primary_mode_flux_gated": primary_mode_flux_gated,
-                "support_mode_flux_1_gated": support_mode_flux_1_gated,
-                "support_mode_flux_2_gated": support_mode_flux_2_gated,
-                "support_mode_flux_3_gated": support_mode_flux_3_gated,
-            }
-            fd_log_gated = {
-                "primary_mode_flux_log_gated": primary_mode_flux_log_gated,
-                "support_mode_flux_1_log_gated": support_mode_flux_1_log_gated,
-                "support_mode_flux_2_log_gated": support_mode_flux_2_log_gated,
-                "support_mode_flux_3_log_gated": support_mode_flux_3_log_gated,
+                "support_mode_flux_4": support_mode_flux_4,
             }
             fd_td = {
-                "td_time_flux_score": td_time_flux_score,
                 "td_crest_factor": td_crest_factor,
                 "td_kurtosis": td_kurtosis,
                 "td_gate_mask": td_gate_mask,
@@ -1161,8 +1074,6 @@ class RainFrameClassifierMixin:
             feature_dump = {
                 "frame_times": detector_frame_times,
                 **fd_primary,
-                # **fd_gated,
-                # **fd_log_gated,
                 **fd_td,
             }
 
