@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple
 import numpy as np
 
 from .band_noise_estimator import (
@@ -19,19 +19,12 @@ class BandNoiseEstimatorProcessor:
       - input: full ndarray (mono)
       - output: (results_dict, state_dict)
     """
-    _printed_params_global: bool = False
 
     def __init__(self, name: str = "band_noise", mode: str = "fft"):
         # Keep mode for backward compatibility with harness configs,
         # but it is not used by the new estimator.
         self.name = name
         self.mode = (mode or "fft").lower().strip()
-
-        # Print params once per processor instance (not once per file)
-        self._printed_params_once = False
-
-        # Optional runtime verbosity (can also be overridden via params["verbose"]).
-        self.verbose: bool = False
 
     # ------------------------
     # Config builder
@@ -49,6 +42,13 @@ class BandNoiseEstimatorProcessor:
         if not hasattr(cfg, "det") or cfg.det is None:
             cfg.det = NoiseFrameDetectorConfig()
 
+        def _normalize_dtype(value: Any) -> type:
+            if value in (np.float32, "float32", "np.float32"):
+                return np.float32
+            if value in (np.float64, "float64", "np.float64"):
+                return np.float64
+            return value
+
         # 1) Apply direct overrides for known cfg attributes
         for k, v in params.items():
             if k.startswith("det."):
@@ -59,6 +59,8 @@ class BandNoiseEstimatorProcessor:
                 continue
 
             if hasattr(cfg, k):
+                if k == "dtype":
+                    v = _normalize_dtype(v)
                 setattr(cfg, k, v)
 
         # 2) Prefer framework global sample_rate if provided
@@ -121,6 +123,22 @@ class BandNoiseEstimatorProcessor:
         n_frames = 1 + (len(x) - N) // hop if len(x) >= N else 0
         times_s = (np.arange(n_frames, dtype=np.float64) * hop) / fs
 
+        empty_energy_stats = {
+            "noise_energy_sum": 0.0,
+            "rain_energy_sum": 0.0,
+            "total_energy_sum": 0.0,
+            "noise_frame_count": 0,
+            "rain_frame_count": 0,
+            "total_frame_count": 0,
+            "noise_buffer_valid_count": 0,
+            "noise_learned_subframe_count": 0,
+            "noise_replenish_count": 0,
+            "noise_effective_q": float(cfg.q),
+            "noise_energy_mean": 0.0,
+            "rain_energy_mean": 0.0,
+            "total_energy_mean": 0.0,
+        }
+
         if n_frames == 0:
             results = {
                 "processor": self.name,
@@ -129,7 +147,10 @@ class BandNoiseEstimatorProcessor:
                 "M_clean_med": np.nan,
                 "noise_E_med": np.nan,
                 "gain_med": np.nan,
+                "noise_effective_q_last": np.nan,
+                "noise_effective_q_med": np.nan,
                 "fft_rain_frac": np.nan,
+                **{f"energy_stats__{k}": v for k, v in empty_energy_stats.items()},
             }
             state: Dict[str, Any] = {
                 "processor": self.name,
@@ -144,8 +165,13 @@ class BandNoiseEstimatorProcessor:
                 "rain_submask": np.zeros((0, S), dtype=bool),
                 "fft_rain_frame": np.zeros(0, dtype=bool),
                 "G_mag": np.zeros(0, dtype=dtype),
+                "noise_effective_q": np.zeros(0, dtype=dtype),
                 "M_clean": np.zeros(0, dtype=dtype),
+                "M_band_fft": np.zeros(0, dtype=dtype),
+                "E_band_fft": np.zeros(0, dtype=dtype),
+                "E_hpf": np.zeros(0, dtype=dtype),
                 "config": cfg,
+                "energy_stats": empty_energy_stats,
             }
             if bool(params.get("include_audio_in_state", False)):
                 state["x_in"] = x.copy()
@@ -159,6 +185,10 @@ class BandNoiseEstimatorProcessor:
         N_E_raw = np.zeros(n_frames, dtype=dtype)
         G_mag = np.zeros(n_frames, dtype=dtype)
         M_clean = np.zeros(n_frames, dtype=dtype)
+        noise_effective_q = np.zeros(n_frames, dtype=dtype)
+        M_band_fft = np.zeros(n_frames, dtype=dtype)
+        E_band_fft = np.zeros(n_frames, dtype=dtype)
+        E_hpf = np.zeros(n_frames, dtype=dtype)
 
         fft_rain_frame = np.zeros(n_frames, dtype=bool)
 
@@ -183,6 +213,10 @@ class BandNoiseEstimatorProcessor:
             N_E_raw[i] = out.N_E_raw
             G_mag[i] = out.G_mag
             M_clean[i] = out.M_clean
+            noise_effective_q[i] = out.noise_effective_q
+            M_band_fft[i] = out.M_band_fft
+            E_band_fft[i] = out.E_band_fft
+            E_hpf[i] = out.E_hpf
 
             # Defensive shape checks (helps catch config / estimator mismatches)
             if out.subE.shape[0] != S:
@@ -197,15 +231,6 @@ class BandNoiseEstimatorProcessor:
             rain_submask[i, :] = out.rain_submask
             N_sub[i, :] = out.N_sub
 
-            if verbose and i < int(params.get("debug_first_n", 0)):
-                # count_valid may be a scalar (stream buffer) or an array (legacy lane buffers)
-                cv = getattr(est, "count_valid", None)
-                try:
-                    cv_disp = cv.copy() if hasattr(cv, "copy") else cv
-                except Exception:
-                    cv_disp = cv
-                #print("band_noise debug:", {"i": i, "count_valid": cv_disp, "N_E_raw": float(out.N_E_raw)})
-
         energy_stats = est.get_energy_stats().as_dict() if hasattr(est, "get_energy_stats") else {}
 
         # Summary (used by results_df)
@@ -216,6 +241,8 @@ class BandNoiseEstimatorProcessor:
             "M_clean_med": float(np.median(M_clean)) if n_frames else np.nan,
             "noise_E_med": float(np.median(N_E)) if n_frames else np.nan,
             "gain_med": float(np.median(G_mag)) if n_frames else np.nan,
+            "noise_effective_q_last": float(noise_effective_q[-1]) if n_frames else np.nan,
+            "noise_effective_q_med": float(np.median(noise_effective_q)) if n_frames else np.nan,
             "fft_rain_frac": float(np.mean(fft_rain_frame)) if n_frames else np.nan,
             **{f"energy_stats__{k}": v for k, v in energy_stats.items()},
         }
@@ -238,6 +265,10 @@ class BandNoiseEstimatorProcessor:
 
             "G_mag": G_mag,
             "M_clean": M_clean,
+            "noise_effective_q": noise_effective_q,
+            "M_band_fft": M_band_fft,
+            "E_band_fft": E_band_fft,
+            "E_hpf": E_hpf,
 
             "config": cfg,
             "energy_stats": energy_stats,

@@ -20,8 +20,10 @@ EPS = 1e-12
 #   M_clean is the noise-suppressed primary-band amplitude-like output:
 #       M_clean = M_band * G_mag
 #
-#   FFT-domain metrics (M_band_fft, E_band_fft) are diagnostics only and are not
-#   directly comparable to time-domain energies without Parseval normalization.
+#   FFT power is used by NoiseFrameDetector for the rain/noise-frame decision.
+#   FFT-domain metrics (M_band_fft, E_band_fft) are retained as diagnostics and are
+#   not directly comparable to time-domain energies without Parseval normalization.
+#
 # -----------------------------------------------------------------------------
 
 
@@ -189,7 +191,7 @@ class NoiseFrameDetector:
         subEhpf: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        subE:    (S,) band energies (400–700 BPF) per subframe
+        subE: (S,) configured primary-band BPF energies per subframe
         subEhpf: (S,) HPF energies per subframe (proxy for overall loudness / total S+N)
 
         Time trigger preference:
@@ -329,13 +331,21 @@ class BandNoiseFrameOut:
     E_band_fft: float = 0.0
     E_hpf: float = 0.0
 
-    # --- Rolling stats snapshot since last read/reset
+    # --- Rolling stats snapshot since last read/reset.
+    # Buffer-health fields below are intended for external reset/telemetry logic.
     noise_energy_sum: float = 0.0
     rain_energy_sum: float = 0.0
     total_energy_sum: float = 0.0
     noise_frame_count: int = 0
     rain_frame_count: int = 0
     total_frame_count: int = 0
+    noise_buffer_valid_count: int = 0
+    noise_buffer_min_valid_count: int = 0
+    noise_buffer_underflow_frame_count: int = 0
+    frames_since_noise_update: int = 0
+    noise_learned_subframe_count: int = 0
+    noise_replenish_count: int = 0
+    noise_effective_q: float = 0.0
 
 
 # New dataclass for telemetry energy stats
@@ -348,6 +358,8 @@ class BandNoiseEnergyStats:
       - total_energy_sum: total inbound band energy observed
       - rain_energy_sum: band energy from frames/subframes classified as rain
       - noise_energy_sum: estimated inbound noise energy from non-rain frames/subframes
+      - noise_buffer_min_valid_count / noise_buffer_underflow_frame_count / frames_since_noise_update:
+        buffer-health telemetry for external reset logic
 
     `read_and_reset_energy_stats()` returns these values and clears the accumulator.
     """
@@ -357,6 +369,13 @@ class BandNoiseEnergyStats:
     noise_frame_count: int = 0
     rain_frame_count: int = 0
     total_frame_count: int = 0
+    noise_buffer_valid_count: int = 0
+    noise_buffer_min_valid_count: int = 0
+    noise_buffer_underflow_frame_count: int = 0
+    frames_since_noise_update: int = 0
+    noise_learned_subframe_count: int = 0
+    noise_replenish_count: int = 0
+    noise_effective_q: float = 0.0
 
     @property
     def noise_energy_mean(self) -> float:
@@ -378,6 +397,13 @@ class BandNoiseEnergyStats:
             "noise_frame_count": int(self.noise_frame_count),
             "rain_frame_count": int(self.rain_frame_count),
             "total_frame_count": int(self.total_frame_count),
+            "noise_buffer_valid_count": int(self.noise_buffer_valid_count),
+            "noise_buffer_min_valid_count": int(self.noise_buffer_min_valid_count),
+            "noise_buffer_underflow_frame_count": int(self.noise_buffer_underflow_frame_count),
+            "frames_since_noise_update": int(self.frames_since_noise_update),
+            "noise_learned_subframe_count": int(self.noise_learned_subframe_count),
+            "noise_replenish_count": int(self.noise_replenish_count),
+            "noise_effective_q": float(self.noise_effective_q),
             "noise_energy_mean": float(self.noise_energy_mean),
             "rain_energy_mean": float(self.rain_energy_mean),
             "total_energy_mean": float(self.total_energy_mean),
@@ -408,6 +434,10 @@ class BandNoiseEstimatorConfig:
     # Noise estimation
     W: int = 30           # quantile window length over recent non-rain subframes
     W_min: int = 10       # warmup valid non-rain subframes required
+    # Expire learned noise samples after this many processed frames, even if no
+    # new non-rain samples arrive. This prevents stale noise estimates from being
+    # held indefinitely when most frames are masked as rain. Set <=0 to disable.
+    noise_buffer_ttl_frames: int = 200
     q: float = 0.3       # quantile
     ema_alpha: float = 1  # smoothing on quantile result
 
@@ -428,6 +458,21 @@ class BandNoiseEstimatorConfig:
     learn_during_rain: bool = False  # If True, also learn from rain subframes (but keep mask for downstream)
     force_learn_all: bool = False    # If True, override all masking and always learn (for experiments)
 
+    # Conservative fallback replenishment for sustained rain / over-masking cases.
+    # If no normal non-rain subframes are learned in a frame, optionally push a
+    # low-quantile value from all subframes into the noise buffer. This assumes
+    # that even during heavy rain, the lower-energy tail contains background/noise-like subframes.
+    noise_replenish_from_all_subframes: bool = False
+    noise_replenish_q: float = 0.20
+    noise_replenish_only_when_buffer_not_full: bool = True
+
+    # Adaptive quantile behavior:
+    # q_eff moves toward replenish_q when replenishment is used
+    # q_eff moves back toward normal q when normal learning happens
+    noise_q_adapt_enable: bool = True
+    noise_q_replenish_alpha: float = 0.5
+    noise_q_normal_alpha: float = 0.1
+
     # detector config
     det: NoiseFrameDetectorConfig = field(default_factory=NoiseFrameDetectorConfig)
     def validate(self) -> None:
@@ -440,8 +485,16 @@ class BandNoiseEstimatorConfig:
             raise ValueError("subframe_len must divide frame_len")
         if not (0.0 < self.q < 1.0):
             raise ValueError("q must be in (0,1)")
+        if not (0.0 < self.noise_replenish_q < 1.0):
+            raise ValueError("noise_replenish_q must be in (0,1)")
+        if not (0.0 < self.noise_q_replenish_alpha <= 1.0):
+            raise ValueError("noise_q_replenish_alpha must be in (0,1]")
+        if not (0.0 < self.noise_q_normal_alpha <= 1.0):
+            raise ValueError("noise_q_normal_alpha must be in (0,1]")
         if self.W <= 0 or self.W_min < 0 or self.W_min > self.W:
             raise ValueError("Need W>0 and 0<=W_min<=W")
+        if self.noise_buffer_ttl_frames < 0:
+            raise ValueError("noise_buffer_ttl_frames must be >= 0")
         lo, hi = self.band_hz
         if not (0 < lo < hi < 0.5 * self.fs):
             raise ValueError("band_hz out of range")
@@ -480,7 +533,7 @@ class BandNoiseEstimator:
         # Compute number of subframes S to match subhop and usable frame
         self.S = 1 + (self.N - self.sub_len) // self.subhop
 
-        # FFT band mask (for M_band/E_band diagnostics)
+        # FFT bin mask for primary-band diagnostics.
         freqs = np.fft.rfftfreq(self.N, d=1.0 / cfg.fs).astype(self.dtype, copy=False)
         lo, hi = cfg.band_hz
         self.band_mask = (freqs >= lo) & (freqs <= hi)
@@ -500,14 +553,18 @@ class BandNoiseEstimator:
         self.det = NoiseFrameDetector(cfg.det, subframes_per_frame=self.S)
 
         # Noise buffer: single continuous subframe stream
-        self.W = int(cfg.W)  # now interpreted as "number of subframes in window"
+        self.W = int(cfg.W)  # number of recent noise samples retained
         self.buf = np.zeros(self.W, dtype=self.dtype)
         self.valid = np.zeros(self.W, dtype=bool)
+        self.buf_frame_idx = np.full(self.W, -1, dtype=np.int64)
+        self.frame_idx = 0
         self.wr = 0
         self.count_valid = 0
+        self.frames_since_noise_update = 0
 
         # EMA state for scalar noise estimate (per-subframe)
         self.noise_ema = 0.0
+        self.noise_effective_q = float(cfg.q)
 
         # Rolling telemetry accumulator. This is intended to be read once per
         # rain-report interval, then reset via read_and_reset_energy_stats().
@@ -537,6 +594,7 @@ class BandNoiseEstimator:
         self.bpf_zi = None
         self._need_zi_seed = True
 
+        self.frame_idx = 0
         self.reset_noise_estimator()
         self.reset_energy_stats()
         self.det.reset()
@@ -552,9 +610,16 @@ class BandNoiseEstimator:
         """
         self.buf[:] = 0.0
         self.valid[:] = False
+        self.buf_frame_idx[:] = -1
+        # Do not reset frame_idx here. reset_noise_estimator() may be called during
+        # a continuous stream; frame_idx is the stream timebase used for TTL aging.
+        # Full reset() creates a new stream/file state and already calls this after
+        # resetting filter/detector state.
         self.wr = 0
         self.count_valid = 0
+        self.frames_since_noise_update = 0
         self.noise_ema = 0.0
+        self.noise_effective_q = float(self.cfg.q)
         self.N_E_smooth = 0.0
 
 
@@ -564,21 +629,51 @@ class BandNoiseEstimator:
 
         self.buf[j] = float(v)
         self.valid[j] = True
+        self.buf_frame_idx[j] = int(self.frame_idx)
 
         if not was_valid:
             self.count_valid += 1
 
         self.wr = (j + 1) % self.W
 
+    def _expire_stale_noise_samples(self) -> None:
+        """
+        Expire old noise samples based on processed-frame age.
+
+        This runs even when no new non-rain subframes are learned, so the noise
+        estimate cannot remain pinned forever to stale buffer contents.
+        """
+        ttl = int(self.cfg.noise_buffer_ttl_frames)
+        if ttl <= 0 or self.count_valid <= 0:
+            return
+
+        ages = int(self.frame_idx) - self.buf_frame_idx
+        stale = self.valid & (ages > ttl)
+        if not np.any(stale):
+            return
+
+        expired = int(np.sum(stale))
+        self.valid[stale] = False
+        self.buf[stale] = 0.0
+        self.buf_frame_idx[stale] = -1
+        self.count_valid = max(0, int(self.count_valid) - expired)
+
     def _estimate_noise_scalar(self) -> float:
+        self._expire_stale_noise_samples()
+
         if int(self.count_valid) < int(self.cfg.W_min):
+            # Once stale samples expire below warmup, do not keep a hidden stale
+            # EMA value that can leak back in when the buffer refills.
+            self.noise_ema = 0.0
+            self.N_E_smooth = 0.0
             return 0.0
 
         vals = self.buf[self.valid]
         if vals.size == 0:
             return 0.0
 
-        qv = float(np.quantile(vals, self.cfg.q))
+        q_eff = float(self.noise_effective_q)
+        qv = float(np.quantile(vals, q_eff))
         a = float(self.cfg.ema_alpha)
         self.noise_ema = (1.0 - a) * self.noise_ema + a * qv
         return float(self.noise_ema)
@@ -596,6 +691,13 @@ class BandNoiseEstimator:
             noise_frame_count=int(self.energy_stats.noise_frame_count),
             rain_frame_count=int(self.energy_stats.rain_frame_count),
             total_frame_count=int(self.energy_stats.total_frame_count),
+            noise_buffer_valid_count=int(self.energy_stats.noise_buffer_valid_count),
+            noise_buffer_min_valid_count=int(self.energy_stats.noise_buffer_min_valid_count),
+            noise_buffer_underflow_frame_count=int(self.energy_stats.noise_buffer_underflow_frame_count),
+            frames_since_noise_update=int(self.energy_stats.frames_since_noise_update),
+            noise_learned_subframe_count=int(self.energy_stats.noise_learned_subframe_count),
+            noise_replenish_count=int(self.energy_stats.noise_replenish_count),
+            noise_effective_q=float(self.energy_stats.noise_effective_q),
         )
 
     def read_and_reset_energy_stats(self) -> BandNoiseEnergyStats:
@@ -634,16 +736,30 @@ class BandNoiseEstimator:
         rain_energy = float(np.sum(subE[rain_submask])) if np.any(rain_submask) else 0.0
         non_rain_energy = float(np.sum(subE[~rain_submask])) if np.any(~rain_submask) else 0.0
 
-        # For noise, report the smaller of observed non-rain band energy and the
-        # current noise estimate. This avoids reporting more inbound noise energy
-        # than was observed in non-rain subframes while still tying the value to
-        # the estimator state used for suppression.
+        # For telemetry, report the smaller of observed non-rain band energy and
+        # the current noise estimate. This avoids reporting more inbound noise
+        # energy than was observed in non-rain subframes while still tying the
+        # value to the estimator state used for suppression.
         noise_energy = float(min(max(noise_energy_est, 0.0), max(non_rain_energy, 0.0)))
 
+        prev_total_frame_count = int(self.energy_stats.total_frame_count)
         self.energy_stats.total_energy_sum += float(max(total_energy, 0.0))
         self.energy_stats.rain_energy_sum += rain_energy
         self.energy_stats.noise_energy_sum += noise_energy
         self.energy_stats.total_frame_count += 1
+        current_valid_count = int(self.count_valid)
+        self.energy_stats.noise_buffer_valid_count = current_valid_count
+        if prev_total_frame_count == 0:
+            self.energy_stats.noise_buffer_min_valid_count = current_valid_count
+        else:
+            self.energy_stats.noise_buffer_min_valid_count = min(
+                int(self.energy_stats.noise_buffer_min_valid_count),
+                current_valid_count,
+            )
+        if current_valid_count < int(self.cfg.W_min):
+            self.energy_stats.noise_buffer_underflow_frame_count += 1
+        self.energy_stats.frames_since_noise_update = int(self.frames_since_noise_update)
+        self.energy_stats.noise_effective_q = float(self.noise_effective_q)
 
         if bool(np.any(rain_submask)):
             self.energy_stats.rain_frame_count += 1
@@ -654,6 +770,8 @@ class BandNoiseEstimator:
         """
         Process a single frame and return band noise estimation and diagnostics.
         """
+        self.frame_idx += 1
+
         cfg = self.cfg
         x = np.asarray(frame, dtype=self.dtype)
         if x.ndim != 1 or x.size != self.N:
@@ -730,13 +848,18 @@ class BandNoiseEstimator:
             elif subE.size > self.S:
                 subE = subE[:self.S]
 
-        # detector (pass subEhpf for time-domain rain detection)
+        # Detector uses FFT power for frame-level rain/noise decision and subEhpf
+        # for time-domain subframe rain detection.
         fft_rain_frame, rain_submask = self.det.process_frame(
             x,
             subE,
             subEhpf=subEhpf,
             fft_power=P_fft,
         )
+
+        # Expire stale noise samples before deciding whether fallback replenishment
+        # is needed; otherwise a full-but-stale buffer can suppress replenishment.
+        self._expire_stale_noise_samples()
 
         # --- Learning logic (production): decide which subframes to use for noise learning
         # Learn noise only from non-rain subframes (default).
@@ -747,9 +870,48 @@ class BandNoiseEstimator:
         else:
             learn_mask = ~rain_submask
 
+        learned_count = 0
         for s in range(self.S):
             if bool(learn_mask[s]):
                 self._push_stream(float(max(subE[s], cfg.eps)))
+                learned_count += 1
+
+        replenish_count = 0
+        buffer_not_full = int(self.count_valid) < int(self.W)
+        should_replenish = (
+            bool(cfg.noise_replenish_from_all_subframes)
+            and learned_count == 0
+            and ((not bool(cfg.noise_replenish_only_when_buffer_not_full)) or buffer_not_full)
+        )
+        if should_replenish:
+            q_noise = float(np.quantile(np.asarray(subE, dtype=self.dtype), float(cfg.noise_replenish_q)))
+            self._push_stream(float(max(q_noise, cfg.eps)))
+            replenish_count = 1
+
+        self.energy_stats.noise_learned_subframe_count += int(learned_count)
+        self.energy_stats.noise_replenish_count += int(replenish_count)
+        if (learned_count + replenish_count) > 0:
+            self.frames_since_noise_update = 0
+        else:
+            self.frames_since_noise_update += 1
+
+        # --- Adaptive q update ---
+        if bool(cfg.noise_q_adapt_enable):
+            if replenish_count > 0:
+                self.noise_effective_q = (
+                    (1.0 - cfg.noise_q_replenish_alpha) * self.noise_effective_q
+                    + cfg.noise_q_replenish_alpha * cfg.noise_replenish_q
+                )
+            if learned_count > 0:
+                self.noise_effective_q = (
+                    (1.0 - cfg.noise_q_normal_alpha) * self.noise_effective_q
+                    + cfg.noise_q_normal_alpha * cfg.q
+                )
+            self.noise_effective_q = float(np.clip(
+                self.noise_effective_q,
+                1e-6,
+                1.0 - 1e-6,
+            ))
 
         N_sub_scalar = self._estimate_noise_scalar()  # noise per-subframe energy
         N_sub = np.full(self.S, N_sub_scalar, dtype=self.dtype)
@@ -813,4 +975,11 @@ class BandNoiseEstimator:
             noise_frame_count=int(self.energy_stats.noise_frame_count),
             rain_frame_count=int(self.energy_stats.rain_frame_count),
             total_frame_count=int(self.energy_stats.total_frame_count),
+            noise_buffer_valid_count=int(self.count_valid),
+            noise_buffer_min_valid_count=int(self.energy_stats.noise_buffer_min_valid_count),
+            noise_buffer_underflow_frame_count=int(self.energy_stats.noise_buffer_underflow_frame_count),
+            frames_since_noise_update=int(self.frames_since_noise_update),
+            noise_learned_subframe_count=int(self.energy_stats.noise_learned_subframe_count),
+            noise_replenish_count=int(self.energy_stats.noise_replenish_count),
+            noise_effective_q=float(self.noise_effective_q),
         )

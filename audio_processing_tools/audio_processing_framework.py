@@ -15,6 +15,7 @@ audio_io (get_keys, get_input_data), but custom implementations can be
 injected via the get_keys_fn and get_input_data_fn parameters.
 """
 
+import dataclasses
 import gc
 import os
 import time
@@ -396,10 +397,14 @@ def _to_parquet_compatible_value(value: Any) -> Any:
     - list/tuple -> list with converted values
     - other      -> unchanged
     """
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _to_parquet_compatible_value(dataclasses.asdict(value))
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
     if isinstance(value, Mapping):
         return {k: _to_parquet_compatible_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
