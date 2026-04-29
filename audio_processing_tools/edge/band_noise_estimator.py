@@ -467,10 +467,11 @@ class BandNoiseEstimatorConfig:
     noise_replenish_only_when_buffer_not_full: bool = True
 
     # Adaptive quantile behavior:
-    # q_eff moves toward replenish_q when replenishment is used
-    # q_eff moves back toward normal q when normal learning happens
+    # q_eff moves toward replenish_q when replenishment is used.
+    # Keep this relatively slow to avoid overreacting to isolated replenish frames.
+    # q_eff moves back toward normal q when normal learning happens.
     noise_q_adapt_enable: bool = True
-    noise_q_replenish_alpha: float = 0.5
+    noise_q_replenish_alpha: float = 0.2
     noise_q_normal_alpha: float = 0.1
 
     # detector config
