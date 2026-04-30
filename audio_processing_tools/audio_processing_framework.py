@@ -172,6 +172,10 @@ def _process_single_file_task(
         "file_key": file_key,
         "rain_actual": rain_actual,
     }
+    for meta_key in ("synthetic_noise_info",):
+        if meta_key in meta:
+            row[meta_key] = meta[meta_key]
+
     states_for_file: Dict[str, Dict[str, Any]] = {}
 
     ctx_params: Dict[str, Any] = dict(params_global)
@@ -189,6 +193,9 @@ def _process_single_file_task(
         proc_state = dict(proc_state) if isinstance(proc_state, dict) else {"state": proc_state}
 
         proc_state["file_key"] = file_key
+        for meta_key in ("synthetic_noise_info",):
+            if meta_key in meta:
+                proc_state[meta_key] = meta[meta_key]
         states_for_file[proc.name] = proc_state
 
         row.update(_flatten_with_namespace(proc.name, proc_results))
@@ -593,6 +600,7 @@ def process_audio_batches_v2(
     get_input_data_fn: Optional[
         Callable[..., Dict[str, Dict[str, Any]]]
     ] = None,
+    get_input_data_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """
     Run one or more AudioProcessors over an audio corpus in batches.
@@ -642,6 +650,10 @@ def process_audio_batches_v2(
         Optional key-discovery function. If None, uses audio_io.get_keys.
     get_input_data_fn :
         Optional audio-loading function. If None, uses audio_io.get_input_data.
+    get_input_data_kwargs :
+        Optional extra keyword arguments forwarded to `get_input_data_fn`. This is
+        intended for test-only input augmentation such as synthetic noise injection
+        without adding test-specific parameters to the core orchestrator signature.
 
     max_batch_save :
         Maximum number of accumulated result rows to keep in memory before
@@ -682,6 +694,8 @@ def process_audio_batches_v2(
         params_by_processor = {}
     if debug_params is None:
         debug_params = {}
+    if get_input_data_kwargs is None:
+        get_input_data_kwargs = {}
 
     if max_batch_save is None:
         max_batch_save = 10_000
@@ -759,6 +773,7 @@ def process_audio_batches_v2(
             local_cache,
             read_size=None,
             bytes_per_sample=2,
+            **get_input_data_kwargs,
         )
 
         # dir_content: {file_key: {"file_contents": np.ndarray, "raining": bool, ...}}
