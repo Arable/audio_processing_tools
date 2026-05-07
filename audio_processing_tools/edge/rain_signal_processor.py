@@ -816,7 +816,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         # 1) STFT
         S = librosa.stft(
-            x_proc,
+            x,
             n_fft=cfg.n_fft,
             hop_length=cfg.hop,
             win_length=cfg.n_fft,
@@ -890,13 +890,15 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 # legacy detector input: absolute spectrum in dB
                 P_for_detection = 10.0 * np.log10(P_for_detection + cfg.eps)
 
-            # Use the pre-filtered waveform for TD features as well, so once x_proc
-            # is computed it is the single signal used everywhere in the pipeline.
+            # Use the original waveform for detector input_audio; pre-filtered waveform is used for later stages.
             frame_class, rain_conf, det_debug, feature_dump = self._detect_rain_over_time(
+
                 P_for_detection,
                 freqs,
                 detector_frame_times=np.asarray(times, dtype=work_dtype),
-                input_audio=x_proc,
+                input_audio=x,
+                raw_power=P,
+                work_dtype=work_dtype,
             )
             if isinstance(det_debug, dict) and isinstance(feature_dump, dict):
                 det_debug["feature_dump"] = feature_dump
