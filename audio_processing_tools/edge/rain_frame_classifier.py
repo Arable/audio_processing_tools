@@ -346,6 +346,7 @@ def extract_raw_spectral_shape_features_inline(
     operating_band: Tuple[float, float],
     rain_band: Tuple[float, float] = (400.0, 800.0),
     low_band: Tuple[float, float] = (0.0, 200.0),
+    mode_bands: Optional[Tuple[Tuple[float, float], ...]] = None,
     rolloff_fraction: float = 0.85,
     process_dtype: str = "float32",
     eps: float = 1e-12,
@@ -369,11 +370,18 @@ def extract_raw_spectral_shape_features_inline(
             "raw_spectral_bandwidth_hz": z,
             "raw_low_freq_ratio": z,
             "raw_rain_band_ratio": z,
+            "raw_mode_band_ratio_0": z,
+            "raw_mode_band_ratio_1": z,
+            "raw_mode_band_ratio_2": z,
+            "raw_mode_band_ratio_3": z,
+            "raw_mode_band_ratio_4": z,
+            "raw_mode_band_entropy": z,
+            "raw_mode_band_std": z,
+            "raw_mode_band_max_ratio": z,
             "raw_spectral_flatness": z,
             "raw_spectral_rolloff_hz": z,
             "raw_dominant_freq_hz": z,
             "raw_frame_energy": z,
-            "raw_temporal_variance": z,
         }
 
     if raw_power is not None:
@@ -416,59 +424,127 @@ def extract_raw_spectral_shape_features_inline(
             "raw_spectral_bandwidth_hz": z,
             "raw_low_freq_ratio": z,
             "raw_rain_band_ratio": z,
+            "raw_mode_band_ratio_0": z,
+            "raw_mode_band_ratio_1": z,
+            "raw_mode_band_ratio_2": z,
+            "raw_mode_band_ratio_3": z,
+            "raw_mode_band_ratio_4": z,
+            "raw_mode_band_entropy": z,
+            "raw_mode_band_std": z,
+            "raw_mode_band_max_ratio": z,
             "raw_spectral_flatness": z,
             "raw_spectral_rolloff_hz": z,
             "raw_dominant_freq_hz": z,
             "raw_frame_energy": z,
-            "raw_temporal_variance": z,
         }
 
     total_power = np.sum(power, axis=0) + eps
-    freq_col = freqs.reshape(-1, 1).astype(np.float64)
-
-    centroid = np.sum(freq_col * power, axis=0) / total_power
-    bandwidth = np.sqrt(
-        np.sum(((freq_col - centroid.reshape(1, -1)) ** 2) * power, axis=0) / total_power
+    # Exclude the DC bin from ratio normalization because DC/very-low-frequency
+    # energy is not meaningful for rain/noise spectral occupancy analysis and
+    # can dilute the ratios.
+    non_dc_mask = freqs > 0.0
+    total_power_no_dc = (
+        np.sum(power[non_dc_mask, :], axis=0) + eps
+        if np.any(non_dc_mask)
+        else total_power
     )
 
     low_lo, low_hi = float(low_band[0]), float(low_band[1])
     rain_lo, rain_hi = float(rain_band[0]), float(rain_band[1])
     op_lo, op_hi = float(operating_band[0]), float(operating_band[1])
 
-    low_mask = (freqs >= low_lo) & (freqs < low_hi)
+    # Raw band ratios are normalized by total frame power so the numerator and
+    # denominator refer to the same raw spectrum. This is especially important
+    # for raw_low_freq_ratio because the low band can sit outside the operating
+    # band; using operating-band power as the denominator makes that ratio hard
+    # to interpret.
+    # Exclude the DC bin from the low-frequency numerator as well. The feature
+    # is intended to capture low-frequency spectral occupancy (e.g. wind /
+    # motion energy), not static DC offset or baseline drift.
+    low_mask = (freqs >= max(low_lo, eps)) & (freqs < low_hi)
     rain_mask = (freqs >= rain_lo) & (freqs <= rain_hi)
     op_mask = (freqs >= op_lo) & (freqs <= op_hi)
+    op_power = np.sum(power[op_mask, :], axis=0) + eps if np.any(op_mask) else total_power
 
-    low_ratio = np.sum(power[low_mask, :], axis=0) / total_power if np.any(low_mask) else np.zeros(power.shape[1])
-    rain_ratio = np.sum(power[rain_mask, :], axis=0) / total_power if np.any(rain_mask) else np.zeros(power.shape[1])
+    # Spectral centroid, bandwidth, and rolloff are computed over the operating
+    # band so they describe the spectral shape seen by the rain detector, rather
+    # than being dominated by out-of-band wind/DC/handling energy.
+    shape_power = power[op_mask, :] if np.any(op_mask) else power[non_dc_mask, :]
+    shape_freqs = freqs[op_mask] if np.any(op_mask) else freqs[non_dc_mask]
+    if shape_power.size == 0 or shape_power.shape[0] == 0:
+        shape_power = power
+        shape_freqs = freqs
+
+    shape_total_power = np.sum(shape_power, axis=0) + eps
+    shape_freq_col = shape_freqs.reshape(-1, 1).astype(np.float64)
+
+    centroid = np.sum(shape_freq_col * shape_power, axis=0) / shape_total_power
+    bandwidth = np.sqrt(
+        np.sum(((shape_freq_col - centroid.reshape(1, -1)) ** 2) * shape_power, axis=0) / shape_total_power
+    )
+
+    low_ratio = np.sum(power[low_mask, :], axis=0) / total_power_no_dc if np.any(low_mask) else np.zeros(power.shape[1])
+    rain_ratio = np.sum(power[rain_mask, :], axis=0) / total_power_no_dc if np.any(rain_mask) else np.zeros(power.shape[1])
+
+    # Mode-band occupancy features. These summarize how raw spectral energy is
+    # distributed across the configured rain resonance bands. Real rain is expected
+    # to excite multiple bands; structured mechanical FP often concentrates
+    # energy in one or two stable bands.
+    if mode_bands is None:
+        mode_bands = (
+            (450.0, 650.0),
+            (800.0, 1050.0),
+            (1500.0, 1800.0),
+            (2350.0, 2550.0),
+            (3150.0, 3350.0),
+        )
+    mode_bands = tuple((float(lo), float(hi)) for lo, hi in mode_bands)
+    mode_band_power = []
+    for lo, hi in mode_bands:
+        m = (freqs >= float(lo)) & (freqs <= float(hi))
+        if np.any(m):
+            mode_band_power.append(np.sum(power[m, :], axis=0))
+        else:
+            mode_band_power.append(np.zeros(power.shape[1], dtype=np.float64))
+    mode_band_power = np.asarray(mode_band_power, dtype=np.float64)
+    mode_band_total = np.sum(mode_band_power, axis=0) + eps
+    mode_band_ratio = mode_band_power / mode_band_total.reshape(1, -1)
+    mode_band_entropy = -np.sum(mode_band_ratio * np.log(mode_band_ratio + eps), axis=0)
+    mode_band_std = np.std(mode_band_ratio, axis=0)
+    mode_band_max_ratio = np.max(mode_band_ratio, axis=0)
 
     # Flatness over operating band is more useful than over the full spectrum,
     # because very low frequency wind energy can otherwise dominate the statistic.
     flat_power = power[op_mask, :] if np.any(op_mask) else power
     spectral_flatness = np.exp(np.mean(np.log(flat_power + eps), axis=0)) / (np.mean(flat_power + eps, axis=0) + eps)
 
-    cumsum_power = np.cumsum(power, axis=0)
-    rolloff_threshold = float(np.clip(rolloff_fraction, 0.0, 1.0)) * total_power
+    cumsum_power = np.cumsum(shape_power, axis=0)
+    rolloff_threshold = float(np.clip(rolloff_fraction, 0.0, 1.0)) * shape_total_power
     rolloff_idx = np.argmax(cumsum_power >= rolloff_threshold.reshape(1, -1), axis=0)
-    spectral_rolloff = freqs[np.clip(rolloff_idx, 0, freqs.size - 1)]
+    spectral_rolloff = shape_freqs[np.clip(rolloff_idx, 0, shape_freqs.size - 1)]
 
-    dominant_idx = np.argmax(power, axis=0)
-    dominant_freq = freqs[np.clip(dominant_idx, 0, freqs.size - 1)]
+    dominant_idx = np.argmax(shape_power, axis=0)
+    dominant_freq = shape_freqs[np.clip(dominant_idx, 0, shape_freqs.size - 1)]
 
-    frame_energy = total_power
-    temporal_variance_scalar = float(np.std(frame_energy) / (np.mean(frame_energy) + eps))
-    temporal_variance = np.full(frame_energy.shape, temporal_variance_scalar, dtype=np.float64)
+    frame_energy = op_power
 
     return {
         "raw_spectral_centroid_hz": np.asarray(centroid, dtype=dtype),
         "raw_spectral_bandwidth_hz": np.asarray(bandwidth, dtype=dtype),
         "raw_low_freq_ratio": np.asarray(low_ratio, dtype=dtype),
         "raw_rain_band_ratio": np.asarray(rain_ratio, dtype=dtype),
+        "raw_mode_band_ratio_0": np.asarray(mode_band_ratio[0], dtype=dtype),
+        "raw_mode_band_ratio_1": np.asarray(mode_band_ratio[1], dtype=dtype),
+        "raw_mode_band_ratio_2": np.asarray(mode_band_ratio[2], dtype=dtype),
+        "raw_mode_band_ratio_3": np.asarray(mode_band_ratio[3], dtype=dtype),
+        "raw_mode_band_ratio_4": np.asarray(mode_band_ratio[4], dtype=dtype),
+        "raw_mode_band_entropy": np.asarray(mode_band_entropy, dtype=dtype),
+        "raw_mode_band_std": np.asarray(mode_band_std, dtype=dtype),
+        "raw_mode_band_max_ratio": np.asarray(mode_band_max_ratio, dtype=dtype),
         "raw_spectral_flatness": np.asarray(spectral_flatness, dtype=dtype),
         "raw_spectral_rolloff_hz": np.asarray(spectral_rolloff, dtype=dtype),
         "raw_dominant_freq_hz": np.asarray(dominant_freq, dtype=dtype),
         "raw_frame_energy": np.asarray(frame_energy, dtype=dtype),
-        "raw_temporal_variance": np.asarray(temporal_variance, dtype=dtype),
     }
 
 class RainFrameClassifierMixin:
@@ -680,7 +756,7 @@ class RainFrameClassifierMixin:
         # log(P(t)) - log(N_lag(t)).
         raw_spectral_shape_enable = bool(self._dget("raw_spectral_shape_enable", True))
         raw_spectral_rain_band = self._dget("raw_spectral_rain_band", (400.0, 800.0))
-        raw_spectral_low_band = self._dget("raw_spectral_low_band", (0.0, 200.0))
+        raw_spectral_low_band = self._dget("raw_spectral_low_band", (50.0, 200.0))
         raw_spectral_rolloff_fraction = float(self._dget("raw_spectral_rolloff_fraction", 0.85))
 
         # TD features should match the previous pre-filtered detector path even
@@ -784,6 +860,7 @@ class RainFrameClassifierMixin:
                         operating_band=(op_lo, op_hi),
                         rain_band=(float(raw_spectral_rain_band[0]), float(raw_spectral_rain_band[1])),
                         low_band=(float(raw_spectral_low_band[0]), float(raw_spectral_low_band[1])),
+                        mode_bands=mode_bands,
                         rolloff_fraction=raw_spectral_rolloff_fraction,
                         process_dtype=str(self._dget("process_dtype", "float32")),
                         eps=eps,
@@ -815,11 +892,18 @@ class RainFrameClassifierMixin:
         raw_spectral_bandwidth_hz = np.zeros(T, dtype=dtype)
         raw_low_freq_ratio = np.zeros(T, dtype=dtype)
         raw_rain_band_ratio = np.zeros(T, dtype=dtype)
+        raw_mode_band_ratio_0 = np.zeros(T, dtype=dtype)
+        raw_mode_band_ratio_1 = np.zeros(T, dtype=dtype)
+        raw_mode_band_ratio_2 = np.zeros(T, dtype=dtype)
+        raw_mode_band_ratio_3 = np.zeros(T, dtype=dtype)
+        raw_mode_band_ratio_4 = np.zeros(T, dtype=dtype)
+        raw_mode_band_entropy = np.zeros(T, dtype=dtype)
+        raw_mode_band_std = np.zeros(T, dtype=dtype)
+        raw_mode_band_max_ratio = np.zeros(T, dtype=dtype)
         raw_spectral_flatness = np.zeros(T, dtype=dtype)
         raw_spectral_rolloff_hz = np.zeros(T, dtype=dtype)
         raw_dominant_freq_hz = np.zeros(T, dtype=dtype)
         raw_frame_energy = np.zeros(T, dtype=dtype)
-        raw_temporal_variance = np.zeros(T, dtype=dtype)
 
         if td_soft_debug and ("error" not in td_soft_debug):
             td_crest_factor = self._align_feature_to_frames(
@@ -910,6 +994,54 @@ class RainFrameClassifierMixin:
                 dtype=dtype,
                 fill_value=0,
             )
+            raw_mode_band_ratio_0 = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_ratio_0"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            raw_mode_band_ratio_1 = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_ratio_1"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            raw_mode_band_ratio_2 = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_ratio_2"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            raw_mode_band_ratio_3 = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_ratio_3"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            raw_mode_band_ratio_4 = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_ratio_4"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            raw_mode_band_entropy = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_entropy"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            raw_mode_band_std = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_std"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
+            raw_mode_band_max_ratio = self._align_feature_to_frames(
+                raw_spectral_debug.get("raw_mode_band_max_ratio"),
+                n_frames=T,
+                dtype=dtype,
+                fill_value=0,
+            )
             raw_spectral_flatness = self._align_feature_to_frames(
                 raw_spectral_debug.get("raw_spectral_flatness"),
                 n_frames=T,
@@ -930,12 +1062,6 @@ class RainFrameClassifierMixin:
             )
             raw_frame_energy = self._align_feature_to_frames(
                 raw_spectral_debug.get("raw_frame_energy"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_temporal_variance = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_temporal_variance"),
                 n_frames=T,
                 dtype=dtype,
                 fill_value=0,
@@ -1035,6 +1161,8 @@ class RainFrameClassifierMixin:
                 # Second frame: still warming up the t-2 reference.
                 # Keep flux at zero so all later frames use a consistent delay definition.
                 flux = np.zeros_like(frame)
+                flux_primary[t] = 0.0       
+                flux_modes[t] = 0.0  
                 prev_frame_2 = prev_frame_1
                 prev_frame_1 = frame
             else:
@@ -1280,11 +1408,18 @@ class RainFrameClassifierMixin:
             "raw_spectral_bandwidth_hz": raw_spectral_bandwidth_hz,
             "raw_low_freq_ratio": raw_low_freq_ratio,
             "raw_rain_band_ratio": raw_rain_band_ratio,
+            "raw_mode_band_ratio_0": raw_mode_band_ratio_0,
+            "raw_mode_band_ratio_1": raw_mode_band_ratio_1,
+            "raw_mode_band_ratio_2": raw_mode_band_ratio_2,
+            "raw_mode_band_ratio_3": raw_mode_band_ratio_3,
+            "raw_mode_band_ratio_4": raw_mode_band_ratio_4,
+            "raw_mode_band_entropy": raw_mode_band_entropy,
+            "raw_mode_band_std": raw_mode_band_std,
+            "raw_mode_band_max_ratio": raw_mode_band_max_ratio,
             "raw_spectral_flatness": raw_spectral_flatness,
             "raw_spectral_rolloff_hz": raw_spectral_rolloff_hz,
             "raw_dominant_freq_hz": raw_dominant_freq_hz,
             "raw_frame_energy": raw_frame_energy,
-            "raw_temporal_variance": raw_temporal_variance,
             "raw_spectral_shape_enable": raw_spectral_shape_enable,
             "raw_spectral_uses_raw_power": raw_power is not None,
             "td_apply_input_prefilter": td_apply_input_prefilter,
@@ -1342,11 +1477,18 @@ class RainFrameClassifierMixin:
                 "raw_spectral_bandwidth_hz": raw_spectral_bandwidth_hz,
                 "raw_low_freq_ratio": raw_low_freq_ratio,
                 "raw_rain_band_ratio": raw_rain_band_ratio,
+                "raw_mode_band_ratio_0": raw_mode_band_ratio_0,
+                "raw_mode_band_ratio_1": raw_mode_band_ratio_1,
+                "raw_mode_band_ratio_2": raw_mode_band_ratio_2,
+                "raw_mode_band_ratio_3": raw_mode_band_ratio_3,
+                "raw_mode_band_ratio_4": raw_mode_band_ratio_4,
+                "raw_mode_band_entropy": raw_mode_band_entropy,
+                "raw_mode_band_std": raw_mode_band_std,
+                "raw_mode_band_max_ratio": raw_mode_band_max_ratio,
                 "raw_spectral_flatness": raw_spectral_flatness,
                 "raw_spectral_rolloff_hz": raw_spectral_rolloff_hz,
                 "raw_dominant_freq_hz": raw_dominant_freq_hz,
                 "raw_frame_energy": raw_frame_energy,
-                "raw_temporal_variance": raw_temporal_variance,
             }
 
             feature_dump = {
