@@ -547,6 +547,116 @@ def extract_raw_spectral_shape_features_inline(
         "raw_frame_energy": np.asarray(frame_energy, dtype=dtype),
     }
 
+
+# --- Helper for clip-level spectral occupancy ---
+def default_spectral_occupancy_bands() -> Tuple[Tuple[str, float, float], ...]:
+    """Default semantic frequency bands for clip-level spectral occupancy."""
+    return (
+        ("dc", 0.0, 43.6015625),
+        ("wind_1", 43.6015625, 261.609375),
+        ("wind_2", 261.609375, 436.015625),
+        ("mode_1", 436.015625, 654.0234375),
+        ("inter_1", 654.0234375, 784.828125),
+        ("mode_2", 784.828125, 1046.4375),
+        ("inter_2a", 1046.4375, 1264.4453125),
+        ("inter_2b", 1264.4453125, 1482.453125),
+        ("mode_3", 1482.453125, 1787.6640625),
+        ("inter_3a", 1787.6640625, 2092.875),
+        ("inter_3b", 2092.875, 2354.484375),
+        ("mode_4", 2354.484375, 2616.09375),
+        ("inter_4a", 2616.09375, 2790.5),
+        ("inter_4b", 2790.5, 2964.90625),
+        ("inter_4c", 2964.90625, 3139.3125),
+        ("mode_5", 3139.3125, 3575.328125),
+    )
+
+
+def compute_clip_spectral_occupancy_stats(
+    *,
+    raw_power: np.ndarray,
+    freqs: np.ndarray,
+    frame_class: np.ndarray,
+    bands: Optional[Tuple[Tuple[str, float, float], ...]] = None,
+    dtype: Any = np.float32,
+    eps: float = 1e-12,
+) -> Dict[str, Any]:
+    """
+    Compute compact clip-level spectral occupancy summaries.
+
+    For each semantic frequency band, aggregate band log-power and per-frame
+    band power ratio separately over rain and no-rain frames.
+    """
+    raw_power = np.asarray(raw_power, dtype=np.float64)
+    freqs = np.asarray(freqs, dtype=np.float64).reshape(-1)
+    frame_class = np.asarray(frame_class).reshape(-1)
+
+    if raw_power.ndim != 2:
+        raise ValueError(f"raw_power must be 2-D, got shape={raw_power.shape}")
+    if raw_power.shape[0] != freqs.size:
+        raise ValueError(
+            f"raw_power.shape[0] ({raw_power.shape[0]}) must match freqs.size ({freqs.size})"
+        )
+    if raw_power.shape[1] != frame_class.size:
+        raise ValueError(
+            f"raw_power.shape[1] ({raw_power.shape[1]}) must match frame_class.size ({frame_class.size})"
+        )
+
+    if bands is None:
+        bands = default_spectral_occupancy_bands()
+    bands = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
+    n_bands = len(bands)
+    n_frames = raw_power.shape[1]
+
+    band_power = np.zeros((n_bands, n_frames), dtype=np.float64)
+    for i, (_, lo, hi) in enumerate(bands):
+        if i == n_bands - 1:
+            mask = (freqs >= lo) & (freqs <= hi)
+        else:
+            mask = (freqs >= lo) & (freqs < hi)
+        if np.any(mask):
+            band_power[i, :] = np.sum(raw_power[mask, :], axis=0)
+
+    total_band_power = np.sum(band_power, axis=0) + float(eps)
+    log_power = np.log1p(np.maximum(band_power, 0.0))
+    power_ratio = band_power / total_band_power.reshape(1, -1)
+
+    rain_mask = frame_class == FrameClass.RAIN
+    no_rain_mask = frame_class != FrameClass.RAIN
+
+    def _empty() -> np.ndarray:
+        return np.zeros(n_bands, dtype=dtype)
+
+    def _stats(arr: np.ndarray, mask: np.ndarray, prefix: str) -> Dict[str, np.ndarray]:
+        if arr.shape[1] == 0 or not np.any(mask):
+            return {
+                f"{prefix}_mean": _empty(),
+                f"{prefix}_std": _empty(),
+                f"{prefix}_p50": _empty(),
+                f"{prefix}_p90": _empty(),
+                f"{prefix}_max": _empty(),
+            }
+        vals = arr[:, mask]
+        return {
+            f"{prefix}_mean": np.asarray(np.mean(vals, axis=1), dtype=dtype),
+            f"{prefix}_std": np.asarray(np.std(vals, axis=1), dtype=dtype),
+            f"{prefix}_p50": np.asarray(np.percentile(vals, 50, axis=1), dtype=dtype),
+            f"{prefix}_p90": np.asarray(np.percentile(vals, 90, axis=1), dtype=dtype),
+            f"{prefix}_max": np.asarray(np.max(vals, axis=1), dtype=dtype),
+        }
+
+    out: Dict[str, Any] = {
+        "band_names": np.asarray([name for name, _, _ in bands], dtype=object),
+        "band_lo_hz": np.asarray([lo for _, lo, _ in bands], dtype=dtype),
+        "band_hi_hz": np.asarray([hi for _, _, hi in bands], dtype=dtype),
+        "rain_frame_count": int(np.sum(rain_mask)),
+        "no_rain_frame_count": int(np.sum(no_rain_mask)),
+    }
+    out.update(_stats(log_power, rain_mask, "rain_log_power"))
+    out.update(_stats(power_ratio, rain_mask, "rain_power_ratio"))
+    out.update(_stats(log_power, no_rain_mask, "no_rain_log_power"))
+    out.update(_stats(power_ratio, no_rain_mask, "no_rain_power_ratio"))
+    return out
+
 class RainFrameClassifierMixin:
     """
     Rain / Noise frame classifier.
@@ -735,6 +845,35 @@ class RainFrameClassifierMixin:
             self._dget("feature_dump_include_peak_payload", False)
         )
         feature_dump_include_frame_class = bool(self._dget("feature_dump_include_frame_class", True))
+
+        # Feature-dump size controls. These only affect what is persisted in
+        # feature_dump; detector internals and det_debug remain available during
+        # runtime for debugging.
+        feature_dump_include_mode_flux_score = bool(
+            self._dget("feature_dump_include_mode_flux_score", False)
+        )
+        feature_dump_include_raw_spectral_basic = bool(
+            self._dget("feature_dump_include_raw_spectral_basic", False)
+        )
+        feature_dump_include_raw_spectral_frame_features = bool(
+            self._dget("feature_dump_include_raw_spectral_frame_features", True)
+        )
+        feature_dump_include_td_soft = bool(
+            self._dget("feature_dump_include_td_soft", False)
+        )
+        feature_dump_include_td_envelope = bool(
+            self._dget("feature_dump_include_td_envelope", False)
+        )
+        feature_dump_include_peak_summary = bool(
+            self._dget("feature_dump_include_peak_summary", False)
+        )
+
+        clip_spectral_occupancy_enable = bool(
+            self._dget("clip_spectral_occupancy_enable", False)
+        )
+        clip_spectral_occupancy_dtype = resolve_np_dtype(
+            self._dget("clip_spectral_occupancy_dtype", "float32")
+        )
 
         op_band = self._dget("operating_band", (400.0, 3500.0))
         op_lo, op_hi = float(op_band[0]), float(op_band[1])
@@ -1424,6 +1563,7 @@ class RainFrameClassifierMixin:
             "raw_spectral_uses_raw_power": raw_power is not None,
             "td_apply_input_prefilter": td_apply_input_prefilter,
             "td_prefilter_mode": td_prefilter_mode,
+            "clip_spectral_occupancy_enable": clip_spectral_occupancy_enable,
         }
 
         if td_envelope_features_enable:
@@ -1451,6 +1591,26 @@ class RainFrameClassifierMixin:
                 "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
             })
 
+        clip_spectral_occupancy: Dict[str, Any] = {}
+        if clip_spectral_occupancy_enable:
+            if raw_power is not None:
+                try:
+                    clip_spectral_occupancy = compute_clip_spectral_occupancy_stats(
+                        raw_power=raw_power,
+                        freqs=freqs,
+                        frame_class=frame_class,
+                        bands=self._dget("clip_spectral_occupancy_bands", None),
+                        dtype=clip_spectral_occupancy_dtype,
+                        eps=eps,
+                    )
+                    det_debug["clip_spectral_occupancy"] = clip_spectral_occupancy
+                except Exception as e:
+                    det_debug["clip_spectral_occupancy_error"] = str(e)
+            else:
+                det_debug["clip_spectral_occupancy_error"] = (
+                    "raw_power is required for clip_spectral_occupancy_enable=True"
+                )
+
         feature_dump_level = int(self._dget("feature_dump_level", 0))
         feature_dump: Dict[str, Any] = {}
 
@@ -1459,37 +1619,44 @@ class RainFrameClassifierMixin:
             # Keep settings / thresholds / decisions in det_debug so the saved
             # feature payload stays compact and focused on primary + derived features.
             fd_primary = {
-                "mode_flux_score": mode_flux_score,
                 "primary_mode_flux": primary_mode_flux,
                 "support_mode_flux_1": support_mode_flux_1,
                 "support_mode_flux_2": support_mode_flux_2,
                 "support_mode_flux_3": support_mode_flux_3,
                 "support_mode_flux_4": support_mode_flux_4,
             }
+            if feature_dump_include_mode_flux_score:
+                fd_primary["mode_flux_score"] = mode_flux_score
+
             fd_td = {
                 "td_crest_factor": td_crest_factor,
                 "td_kurtosis": td_kurtosis,
                 "td_gate_mask": td_gate_mask,
             }
 
-            fd_raw_spectral = {
-                "raw_spectral_centroid_hz": raw_spectral_centroid_hz,
-                "raw_spectral_bandwidth_hz": raw_spectral_bandwidth_hz,
-                "raw_low_freq_ratio": raw_low_freq_ratio,
-                "raw_rain_band_ratio": raw_rain_band_ratio,
-                "raw_mode_band_ratio_0": raw_mode_band_ratio_0,
-                "raw_mode_band_ratio_1": raw_mode_band_ratio_1,
-                "raw_mode_band_ratio_2": raw_mode_band_ratio_2,
-                "raw_mode_band_ratio_3": raw_mode_band_ratio_3,
-                "raw_mode_band_ratio_4": raw_mode_band_ratio_4,
-                "raw_mode_band_entropy": raw_mode_band_entropy,
-                "raw_mode_band_std": raw_mode_band_std,
-                "raw_mode_band_max_ratio": raw_mode_band_max_ratio,
-                "raw_spectral_flatness": raw_spectral_flatness,
-                "raw_spectral_rolloff_hz": raw_spectral_rolloff_hz,
-                "raw_dominant_freq_hz": raw_dominant_freq_hz,
-                "raw_frame_energy": raw_frame_energy,
-            }
+            fd_raw_spectral = {}
+            if feature_dump_include_raw_spectral_frame_features:
+                fd_raw_spectral.update({
+                    "raw_spectral_bandwidth_hz": raw_spectral_bandwidth_hz,
+                    "raw_low_freq_ratio": raw_low_freq_ratio,
+                    "raw_mode_band_ratio_0": raw_mode_band_ratio_0,
+                    "raw_mode_band_ratio_1": raw_mode_band_ratio_1,
+                    "raw_mode_band_ratio_2": raw_mode_band_ratio_2,
+                    "raw_mode_band_ratio_3": raw_mode_band_ratio_3,
+                    "raw_mode_band_ratio_4": raw_mode_band_ratio_4,
+                    "raw_mode_band_entropy": raw_mode_band_entropy,
+                    "raw_mode_band_std": raw_mode_band_std,
+                    "raw_mode_band_max_ratio": raw_mode_band_max_ratio,
+                    "raw_spectral_flatness": raw_spectral_flatness,
+                    "raw_dominant_freq_hz": raw_dominant_freq_hz,
+                    "raw_frame_energy": raw_frame_energy,
+                })
+                if feature_dump_include_raw_spectral_basic:
+                    fd_raw_spectral.update({
+                        "raw_spectral_centroid_hz": raw_spectral_centroid_hz,
+                        "raw_rain_band_ratio": raw_rain_band_ratio,
+                        "raw_spectral_rolloff_hz": raw_spectral_rolloff_hz,
+                    })
 
             feature_dump = {
                 "frame_times": detector_frame_times,
@@ -1501,7 +1668,10 @@ class RainFrameClassifierMixin:
             if feature_dump_include_frame_class:
                 feature_dump["frame_class"] = frame_class
 
-            if td_envelope_features_enable:
+            if clip_spectral_occupancy:
+                feature_dump["clip_spectral_occupancy"] = clip_spectral_occupancy
+
+            if td_envelope_features_enable and feature_dump_include_td_envelope:
                 feature_dump.update({
                     "td_energy_envelope": td_energy_envelope,
                     "td_peak_energy": td_peak_energy,
@@ -1512,12 +1682,16 @@ class RainFrameClassifierMixin:
                 })
 
             if feature_dump_level > 1:
-                feature_dump.update({
-                    "flux_primary": flux_primary,
-                    "td_soft_score": td_soft_score,
-                    "td_vote_count": td_vote_count.astype(dtype, copy=False),
-                })
-                if peak_features_enable:
+                if feature_dump_include_mode_flux_score:
+                    feature_dump["flux_primary"] = flux_primary
+
+                if feature_dump_include_td_soft:
+                    feature_dump.update({
+                        "td_soft_score": td_soft_score,
+                        "td_vote_count": td_vote_count.astype(dtype, copy=False),
+                    })
+
+                if peak_features_enable and feature_dump_include_peak_summary:
                     feature_dump.update({
                         "peak_ratio": peak_ratio,
                         "peak_gate_score": peak_gate_score,
