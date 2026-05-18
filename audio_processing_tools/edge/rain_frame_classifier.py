@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 import scipy.signal as spsig
-from scipy.stats import kurtosis
-from scipy.signal import peak_widths
+from audio_processing_tools.edge.feature_extraction import (
+    RAW_SPECTRAL_FEATURE_NAMES,
+    TD_FEATURE_NAMES,
+    compute_clip_spectral_occupancy_stats,
+    extract_raw_spectral_shape_features_inline,
+    extract_td_features_inline,
+)
+
 
 class FrameClass(IntEnum):
     """Frame classification used by the rain detector and downstream suppressor."""
@@ -19,6 +26,7 @@ class FrameClass(IntEnum):
 def resolve_np_dtype(process_dtype: str):
     dt = str(process_dtype).lower()
     return np.float32 if dt == "float32" else np.float64
+
 
 def causal_stochastic_low_quantile_baseline(
     x: np.ndarray,
@@ -49,7 +57,7 @@ def causal_stochastic_low_quantile_baseline(
     min_hist = max(1, int(round(float(min_hist_sec) * samples_per_sec)))
     scale_alpha = float(np.clip(1.0 - eta, 0.0, 0.9999))
 
-    baseline = float(max(x[0], floor))  
+    baseline = float(max(x[0], floor))
     scale = float(max(abs(x[0]), floor))
     out = np.empty(T, dtype=dtype)
     warm_ok = np.zeros(T, dtype=bool)
@@ -73,7 +81,6 @@ def causal_stochastic_low_quantile_baseline(
 
     return out, warm_ok
 
-# --- TD soft label assignment helper ---
 
 def assign_td_soft_label(
     *,
@@ -102,560 +109,7 @@ def assign_td_soft_label(
         "td_soft_label": soft_label,
     }
 
-# --- Inline TD feature extraction for detector use ---
 
-def extract_td_features_inline(
-    *,
-    x: np.ndarray,
-    fs: int,
-    frame_len: int,
-    hop: int,
-    operating_band: Tuple[float, float],
-    mode_bands: Optional[Tuple[Tuple[float, float], ...]],
-    td_input_mode: str,
-    td_input_band: Optional[Tuple[float, float]],
-    bp_order: int,
-    subframe_len: int,
-    subframe_hop: int,
-    envelope_features_enable: bool,
-    process_dtype: str = "float32",
-    eps: float = 1e-9,
-) -> Dict[str, np.ndarray]:
-    """Inline TD feature extraction for detector use without a labeller-class dependency."""
-    dtype = resolve_np_dtype(process_dtype)
-    x = np.asarray(x, dtype=dtype).reshape(-1)
-
-    def _bandpass(sig: np.ndarray, band: Tuple[float, float]) -> np.ndarray:
-        if sig.size == 0:
-            return sig.copy()
-        nyq = 0.5 * float(fs)
-        lo = float(np.clip(band[0], 1e-3, nyq * 0.999))
-        hi = float(np.clip(band[1], lo + 1e-3, nyq * 0.999))
-        sos = spsig.butter(int(bp_order), [lo / nyq, hi / nyq], btype="bandpass", output="sos")
-        try:
-            return spsig.sosfiltfilt(sos, sig).astype(dtype, copy=False)
-        except ValueError:
-            return spsig.sosfilt(sos, sig).astype(dtype, copy=False)
-
-    def _mode_band_comb(sig: np.ndarray) -> np.ndarray:
-        if sig.size == 0:
-            return sig.copy()
-        if not mode_bands:
-            return _bandpass(sig, operating_band)
-        y_sum = np.zeros_like(sig, dtype=dtype)
-        for band in mode_bands:
-            y_sum += _bandpass(sig, band)
-        return y_sum
-
-    def _frame_view(sig: np.ndarray) -> np.ndarray:
-        if sig.size < frame_len:
-            return np.empty((0, frame_len), dtype=dtype)
-        Tloc = 1 + (sig.size - frame_len) // hop
-        stride = sig.strides[0]
-        return np.lib.stride_tricks.as_strided(
-            sig,
-            shape=(Tloc, frame_len),
-            strides=(hop * stride, stride),
-            writeable=False,
-        )
-
-    def _subframe_energy(sig: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        if sig.size == 0:
-            return np.zeros(0, dtype=dtype), np.zeros(0, dtype=dtype)
-        B = int(max(1, subframe_len))
-        H = int(max(1, subframe_hop))
-        if sig.size < B:
-            energy = np.array([float(np.mean(sig**2))], dtype=dtype)
-            times = np.array([0.0], dtype=dtype)
-            return energy, times
-
-        starts = np.arange(0, sig.size - B + 1, H, dtype=np.int64)
-        sig2 = np.asarray(sig, dtype=np.float64) ** 2
-        csum = np.empty(sig2.size + 1, dtype=np.float64)
-        csum[0] = 0.0
-        csum[1:] = np.cumsum(sig2, dtype=np.float64)
-        sums = csum[starts + B] - csum[starts]
-        energy = (sums / float(B)).astype(dtype, copy=False)
-        times = (starts / float(fs)).astype(dtype, copy=False)
-        return energy, times
-
-    def _subframe_peak_shape_features(
-        sub_vals: np.ndarray,
-        *,
-        enable_envelope_features: bool,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        env = np.asarray(sub_vals, dtype=dtype).reshape(-1)
-        N = env.size
-        if N == 0:
-            z = np.zeros(0, dtype=dtype)
-            return z, z, z, z, z, z, np.zeros(0, dtype=bool)
-
-        if not enable_envelope_features:
-            z = np.zeros(N, dtype=dtype)
-            return z, z, z, z, z, z, np.zeros(N, dtype=bool)
-
-        if N >= 3:
-            kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
-            env_smooth = np.convolve(env.astype(np.float64), kernel, mode="same")
-        else:
-            env_smooth = env.astype(np.float64, copy=False)
-
-        rise_time = np.zeros(N, dtype=dtype)
-        fall_time = np.zeros(N, dtype=dtype)
-        peak_level = np.zeros(N, dtype=dtype)
-        peak_mask = np.zeros(N, dtype=bool)
-        rise_slope = np.zeros(N, dtype=dtype)
-        fall_slope = np.zeros(N, dtype=dtype)
-        dt_sec = float(subframe_hop) / float(fs)
-
-        if N >= 3:
-            peak_idx = np.flatnonzero(
-                (env_smooth[1:-1] >= env_smooth[:-2])
-                & (env_smooth[1:-1] > env_smooth[2:])
-            ) + 1
-        elif N == 2:
-            peak_idx = np.array([int(np.argmax(env_smooth))], dtype=np.int64)
-        else:
-            peak_idx = np.array([0], dtype=np.int64)
-
-        for p in peak_idx:
-            peak = float(max(env_smooth[p], eps))
-            lo = 0.1 * peak
-            hi = 0.9 * peak
-
-            left = env_smooth[: p + 1]
-            lo_left = np.where(left <= lo)[0]
-            i_lo = int(lo_left[-1]) if lo_left.size else 0
-            hi_after = np.where(left[i_lo:] >= hi)[0]
-            i_hi = int(i_lo + hi_after[0]) if hi_after.size else int(p)
-
-            right = env_smooth[p:]
-            below_hi = np.where(right[1:] <= hi)[0]
-            i_hi_fall = int(1 + below_hi[0]) if below_hi.size else 0
-            below_lo = np.where(right[i_hi_fall:] <= lo)[0]
-            i_lo_fall = int(i_hi_fall + below_lo[0]) if below_lo.size else int(max(right.size - 1, 0))
-
-            rise_dt = float(max(i_hi - i_lo, 0)) * dt_sec
-            fall_dt = float(max(i_lo_fall, 0)) * dt_sec
-            rise_time[p] = rise_dt
-            fall_time[p] = fall_dt
-
-            amp_delta_rise = max(hi - lo, 0.0)
-            amp_delta_fall = max(hi - lo, 0.0)
-            rise_slope[p] = float(amp_delta_rise / max(rise_dt, dt_sec))
-            fall_slope[p] = float(amp_delta_fall / max(fall_dt, dt_sec))
-
-            peak_level[p] = peak
-            peak_mask[p] = True
-
-        return (
-            np.asarray(env_smooth, dtype=dtype),
-            rise_time,
-            fall_time,
-            rise_slope,
-            fall_slope,
-            peak_level,
-            peak_mask,
-        )
-
-    def _frame_max_from_subframes(sub_vals: np.ndarray, n_frames: int) -> np.ndarray:
-        sub_vals = np.asarray(sub_vals, dtype=dtype).reshape(-1)
-        out = np.zeros(n_frames, dtype=dtype)
-        if n_frames == 0 or sub_vals.size == 0:
-            return out
-        padded = np.zeros(n_frames + 1, dtype=dtype)
-        ncopy = min(sub_vals.size, n_frames + 1)
-        padded[:ncopy] = sub_vals[:ncopy]
-        return np.maximum(padded[:-1], padded[1:])
-
-    def _frame_sum_from_subframes(sub_vals: np.ndarray, n_frames: int) -> np.ndarray:
-        sub_vals = np.asarray(sub_vals, dtype=dtype).reshape(-1)
-        out = np.zeros(n_frames, dtype=dtype)
-        if n_frames == 0 or sub_vals.size == 0:
-            return out
-        for t in range(n_frames):
-            v0 = sub_vals[t] if t < sub_vals.size else 0.0
-            v1 = sub_vals[t + 1] if (t + 1) < sub_vals.size else 0.0
-            out[t] = float(v0 + v1)
-        return out
-
-    td_mode = str(td_input_mode).lower()
-    if td_mode == "default":
-        # Use the caller-provided waveform as-is. When the caller passes x_proc,
-        # this becomes the default operating-band TD frontend.
-        x_td = x.copy()
-    elif td_mode == "comb_filter":
-        x_td = _mode_band_comb(x)
-    elif td_mode == "bandpass":
-        band = td_input_band if td_input_band is not None else operating_band
-        x_td = _bandpass(x, band)
-    else:
-        raise ValueError(
-            f"Unsupported td_input_mode={td_input_mode!r}. "
-            "Expected one of {'default', 'comb_filter', 'bandpass'}."
-        )
-    
-    frames = _frame_view(x_td)
-    Tloc = frames.shape[0]
-    frame_times = (np.arange(Tloc, dtype=dtype) * hop) / float(fs)
-    sub_energy, _ = _subframe_energy(x_td)
-    sub_envelope, sub_rise_time, sub_fall_time, sub_rise_slope, sub_fall_slope, sub_peak_level, _ = _subframe_peak_shape_features(
-        sub_energy,
-        enable_envelope_features=bool(envelope_features_enable),
-    )
-    frame_envelope = _frame_sum_from_subframes(sub_envelope, Tloc)
-    frame_rise_time = _frame_max_from_subframes(sub_rise_time, Tloc)
-    frame_fall_time = _frame_max_from_subframes(sub_fall_time, Tloc)
-    frame_rise_slope = _frame_max_from_subframes(sub_rise_slope, Tloc)
-    frame_fall_slope = _frame_max_from_subframes(sub_fall_slope, Tloc)
-    frame_peak_level = _frame_max_from_subframes(sub_peak_level, Tloc)
-    td_crest_factor = np.zeros(Tloc, dtype=dtype)
-    td_kurtosis = np.zeros(Tloc, dtype=dtype)
-
-    for t in range(Tloc):
-        seg = np.asarray(frames[t], dtype=dtype)
-        rms = float(np.sqrt(np.mean(seg**2) + eps))
-        peak_abs = float(np.max(np.abs(seg))) if seg.size else 0.0
-        td_crest_factor[t] = peak_abs / max(rms, eps)
-        if seg.size >= 4:
-            kv = float(kurtosis(seg, fisher=False, bias=False))
-            td_kurtosis[t] = kv if np.isfinite(kv) else 0.0
-        else:
-            td_kurtosis[t] = 0.0
-
-    return {
-        "frame_times": frame_times,
-        "crest_factor": td_crest_factor,
-        "kurtosis": td_kurtosis,
-        "energy_envelope": frame_envelope,
-        "rise_time_sec": frame_rise_time,
-        "fall_time_sec": frame_fall_time,
-        "rise_slope": frame_rise_slope,
-        "fall_slope": frame_fall_slope,
-        "peak_energy": frame_peak_level,
-    }
-
-
-# --- Raw spectral-shape features for diagnostics ---
-def extract_raw_spectral_shape_features_inline(
-    *,
-    x: Optional[np.ndarray] = None,
-    fs: int,
-    n_fft: int,
-    hop: int,
-    operating_band: Tuple[float, float],
-    rain_band: Tuple[float, float] = (400.0, 800.0),
-    low_band: Tuple[float, float] = (0.0, 200.0),
-    mode_bands: Optional[Tuple[Tuple[float, float], ...]] = None,
-    rolloff_fraction: float = 0.85,
-    process_dtype: str = "float32",
-    eps: float = 1e-12,
-    raw_power: Optional[np.ndarray] = None,
-    freqs: Optional[np.ndarray] = None,
-) -> Dict[str, np.ndarray]:
-    """
-    Extract spectral-shape features from the raw linear power spectrum.
-
-    Prefer passing raw_power and freqs from the caller to avoid a second STFT.
-    These features intentionally use raw linear power, not the detector input P.
-    The detector P may already be log(P(t)) - log(N_lag(t)), which is useful for
-    novelty/flux detection but not ideal for answering where the original energy
-    is distributed across frequency.
-    """
-    dtype = resolve_np_dtype(process_dtype)
-    def _empty_raw_spectral_features() -> Dict[str, np.ndarray]:
-        z = np.zeros(0, dtype=dtype)
-        return {
-            "raw_spectral_centroid_hz": z,
-            "raw_spectral_bandwidth_hz": z,
-            "raw_low_freq_ratio": z,
-            "raw_rain_band_ratio": z,
-            "raw_mode_band_ratio_0": z,
-            "raw_mode_band_ratio_1": z,
-            "raw_mode_band_ratio_2": z,
-            "raw_mode_band_ratio_3": z,
-            "raw_mode_band_ratio_4": z,
-            "raw_mode_band_entropy": z,
-            "raw_mode_band_std": z,
-            "raw_mode_band_max_ratio": z,
-            "raw_spectral_flatness": z,
-            "raw_spectral_rolloff_hz": z,
-            "raw_dominant_freq_hz": z,
-            "raw_frame_energy": z,
-        }
-
-    if raw_power is not None:
-        if freqs is None:
-            raise ValueError("freqs must be provided when raw_power is provided")
-        power = np.asarray(raw_power, dtype=np.float64)
-        freqs = np.asarray(freqs, dtype=np.float64).reshape(-1)
-        if power.ndim != 2:
-            raise ValueError(f"raw_power must be 2-D, got shape={power.shape}")
-        if power.shape[0] != freqs.size:
-            raise ValueError(
-                f"raw_power.shape[0] ({power.shape[0]}) must match freqs.size ({freqs.size})"
-            )
-    else:
-        if x is None:
-            return _empty_raw_spectral_features()
-        x = np.asarray(x, dtype=dtype).reshape(-1)
-        if x.size == 0:
-            return _empty_raw_spectral_features()
-
-        n_fft = int(max(8, n_fft))
-        hop = int(max(1, hop))
-        noverlap = max(0, n_fft - hop)
-
-        freqs, _, zxx = spsig.stft(
-            x,
-            fs=int(fs),
-            window="hann",
-            nperseg=n_fft,
-            noverlap=noverlap,
-            nfft=n_fft,
-            boundary=None,
-            padded=False,
-        )
-        power = np.asarray(np.abs(zxx) ** 2, dtype=np.float64)
-    if power.size == 0 or power.shape[1] == 0:
-        z = np.zeros(0, dtype=dtype)
-        return {
-            "raw_spectral_centroid_hz": z,
-            "raw_spectral_bandwidth_hz": z,
-            "raw_low_freq_ratio": z,
-            "raw_rain_band_ratio": z,
-            "raw_mode_band_ratio_0": z,
-            "raw_mode_band_ratio_1": z,
-            "raw_mode_band_ratio_2": z,
-            "raw_mode_band_ratio_3": z,
-            "raw_mode_band_ratio_4": z,
-            "raw_mode_band_entropy": z,
-            "raw_mode_band_std": z,
-            "raw_mode_band_max_ratio": z,
-            "raw_spectral_flatness": z,
-            "raw_spectral_rolloff_hz": z,
-            "raw_dominant_freq_hz": z,
-            "raw_frame_energy": z,
-        }
-
-    total_power = np.sum(power, axis=0) + eps
-    # Exclude the DC bin from ratio normalization because DC/very-low-frequency
-    # energy is not meaningful for rain/noise spectral occupancy analysis and
-    # can dilute the ratios.
-    non_dc_mask = freqs > 0.0
-    total_power_no_dc = (
-        np.sum(power[non_dc_mask, :], axis=0) + eps
-        if np.any(non_dc_mask)
-        else total_power
-    )
-
-    low_lo, low_hi = float(low_band[0]), float(low_band[1])
-    rain_lo, rain_hi = float(rain_band[0]), float(rain_band[1])
-    op_lo, op_hi = float(operating_band[0]), float(operating_band[1])
-
-    # Raw band ratios are normalized by total frame power so the numerator and
-    # denominator refer to the same raw spectrum. This is especially important
-    # for raw_low_freq_ratio because the low band can sit outside the operating
-    # band; using operating-band power as the denominator makes that ratio hard
-    # to interpret.
-    # Exclude the DC bin from the low-frequency numerator as well. The feature
-    # is intended to capture low-frequency spectral occupancy (e.g. wind /
-    # motion energy), not static DC offset or baseline drift.
-    low_mask = (freqs >= max(low_lo, eps)) & (freqs < low_hi)
-    rain_mask = (freqs >= rain_lo) & (freqs <= rain_hi)
-    op_mask = (freqs >= op_lo) & (freqs <= op_hi)
-    op_power = np.sum(power[op_mask, :], axis=0) + eps if np.any(op_mask) else total_power
-
-    # Spectral centroid, bandwidth, and rolloff are computed over the operating
-    # band so they describe the spectral shape seen by the rain detector, rather
-    # than being dominated by out-of-band wind/DC/handling energy.
-    shape_power = power[op_mask, :] if np.any(op_mask) else power[non_dc_mask, :]
-    shape_freqs = freqs[op_mask] if np.any(op_mask) else freqs[non_dc_mask]
-    if shape_power.size == 0 or shape_power.shape[0] == 0:
-        shape_power = power
-        shape_freqs = freqs
-
-    shape_total_power = np.sum(shape_power, axis=0) + eps
-    shape_freq_col = shape_freqs.reshape(-1, 1).astype(np.float64)
-
-    centroid = np.sum(shape_freq_col * shape_power, axis=0) / shape_total_power
-    bandwidth = np.sqrt(
-        np.sum(((shape_freq_col - centroid.reshape(1, -1)) ** 2) * shape_power, axis=0) / shape_total_power
-    )
-
-    low_ratio = np.sum(power[low_mask, :], axis=0) / total_power_no_dc if np.any(low_mask) else np.zeros(power.shape[1])
-    rain_ratio = np.sum(power[rain_mask, :], axis=0) / total_power_no_dc if np.any(rain_mask) else np.zeros(power.shape[1])
-
-    # Mode-band occupancy features. These summarize how raw spectral energy is
-    # distributed across the configured rain resonance bands. Real rain is expected
-    # to excite multiple bands; structured mechanical FP often concentrates
-    # energy in one or two stable bands.
-    if mode_bands is None:
-        mode_bands = (
-            (450.0, 650.0),
-            (800.0, 1050.0),
-            (1500.0, 1800.0),
-            (2350.0, 2550.0),
-            (3150.0, 3350.0),
-        )
-    mode_bands = tuple((float(lo), float(hi)) for lo, hi in mode_bands)
-    mode_band_power = []
-    for lo, hi in mode_bands:
-        m = (freqs >= float(lo)) & (freqs <= float(hi))
-        if np.any(m):
-            mode_band_power.append(np.sum(power[m, :], axis=0))
-        else:
-            mode_band_power.append(np.zeros(power.shape[1], dtype=np.float64))
-    mode_band_power = np.asarray(mode_band_power, dtype=np.float64)
-    mode_band_total = np.sum(mode_band_power, axis=0) + eps
-    mode_band_ratio = mode_band_power / mode_band_total.reshape(1, -1)
-    mode_band_entropy = -np.sum(mode_band_ratio * np.log(mode_band_ratio + eps), axis=0)
-    mode_band_std = np.std(mode_band_ratio, axis=0)
-    mode_band_max_ratio = np.max(mode_band_ratio, axis=0)
-
-    # Flatness over operating band is more useful than over the full spectrum,
-    # because very low frequency wind energy can otherwise dominate the statistic.
-    flat_power = power[op_mask, :] if np.any(op_mask) else power
-    spectral_flatness = np.exp(np.mean(np.log(flat_power + eps), axis=0)) / (np.mean(flat_power + eps, axis=0) + eps)
-
-    cumsum_power = np.cumsum(shape_power, axis=0)
-    rolloff_threshold = float(np.clip(rolloff_fraction, 0.0, 1.0)) * shape_total_power
-    rolloff_idx = np.argmax(cumsum_power >= rolloff_threshold.reshape(1, -1), axis=0)
-    spectral_rolloff = shape_freqs[np.clip(rolloff_idx, 0, shape_freqs.size - 1)]
-
-    dominant_idx = np.argmax(shape_power, axis=0)
-    dominant_freq = shape_freqs[np.clip(dominant_idx, 0, shape_freqs.size - 1)]
-
-    frame_energy = op_power
-
-    return {
-        "raw_spectral_centroid_hz": np.asarray(centroid, dtype=dtype),
-        "raw_spectral_bandwidth_hz": np.asarray(bandwidth, dtype=dtype),
-        "raw_low_freq_ratio": np.asarray(low_ratio, dtype=dtype),
-        "raw_rain_band_ratio": np.asarray(rain_ratio, dtype=dtype),
-        "raw_mode_band_ratio_0": np.asarray(mode_band_ratio[0], dtype=dtype),
-        "raw_mode_band_ratio_1": np.asarray(mode_band_ratio[1], dtype=dtype),
-        "raw_mode_band_ratio_2": np.asarray(mode_band_ratio[2], dtype=dtype),
-        "raw_mode_band_ratio_3": np.asarray(mode_band_ratio[3], dtype=dtype),
-        "raw_mode_band_ratio_4": np.asarray(mode_band_ratio[4], dtype=dtype),
-        "raw_mode_band_entropy": np.asarray(mode_band_entropy, dtype=dtype),
-        "raw_mode_band_std": np.asarray(mode_band_std, dtype=dtype),
-        "raw_mode_band_max_ratio": np.asarray(mode_band_max_ratio, dtype=dtype),
-        "raw_spectral_flatness": np.asarray(spectral_flatness, dtype=dtype),
-        "raw_spectral_rolloff_hz": np.asarray(spectral_rolloff, dtype=dtype),
-        "raw_dominant_freq_hz": np.asarray(dominant_freq, dtype=dtype),
-        "raw_frame_energy": np.asarray(frame_energy, dtype=dtype),
-    }
-
-
-# --- Helper for clip-level spectral occupancy ---
-def default_spectral_occupancy_bands() -> Tuple[Tuple[str, float, float], ...]:
-    """Default semantic frequency bands for clip-level spectral occupancy."""
-    return (
-        ("dc", 0.0, 43.6015625),
-        ("wind_1", 43.6015625, 261.609375),
-        ("wind_2", 261.609375, 436.015625),
-        ("mode_1", 436.015625, 654.0234375),
-        ("inter_1", 654.0234375, 784.828125),
-        ("mode_2", 784.828125, 1046.4375),
-        ("inter_2a", 1046.4375, 1264.4453125),
-        ("inter_2b", 1264.4453125, 1482.453125),
-        ("mode_3", 1482.453125, 1787.6640625),
-        ("inter_3a", 1787.6640625, 2092.875),
-        ("inter_3b", 2092.875, 2354.484375),
-        ("mode_4", 2354.484375, 2616.09375),
-        ("inter_4a", 2616.09375, 2790.5),
-        ("inter_4b", 2790.5, 2964.90625),
-        ("inter_4c", 2964.90625, 3139.3125),
-        ("mode_5", 3139.3125, 3575.328125),
-    )
-
-
-def compute_clip_spectral_occupancy_stats(
-    *,
-    raw_power: np.ndarray,
-    freqs: np.ndarray,
-    frame_class: np.ndarray,
-    bands: Optional[Tuple[Tuple[str, float, float], ...]] = None,
-    dtype: Any = np.float32,
-    eps: float = 1e-12,
-) -> Dict[str, Any]:
-    """
-    Compute compact clip-level spectral occupancy summaries.
-
-    For each semantic frequency band, aggregate band log-power and per-frame
-    band power ratio separately over rain and no-rain frames.
-    """
-    raw_power = np.asarray(raw_power, dtype=np.float64)
-    freqs = np.asarray(freqs, dtype=np.float64).reshape(-1)
-    frame_class = np.asarray(frame_class).reshape(-1)
-
-    if raw_power.ndim != 2:
-        raise ValueError(f"raw_power must be 2-D, got shape={raw_power.shape}")
-    if raw_power.shape[0] != freqs.size:
-        raise ValueError(
-            f"raw_power.shape[0] ({raw_power.shape[0]}) must match freqs.size ({freqs.size})"
-        )
-    if raw_power.shape[1] != frame_class.size:
-        raise ValueError(
-            f"raw_power.shape[1] ({raw_power.shape[1]}) must match frame_class.size ({frame_class.size})"
-        )
-
-    if bands is None:
-        bands = default_spectral_occupancy_bands()
-    bands = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
-    n_bands = len(bands)
-    n_frames = raw_power.shape[1]
-
-    band_power = np.zeros((n_bands, n_frames), dtype=np.float64)
-    for i, (_, lo, hi) in enumerate(bands):
-        if i == n_bands - 1:
-            mask = (freqs >= lo) & (freqs <= hi)
-        else:
-            mask = (freqs >= lo) & (freqs < hi)
-        if np.any(mask):
-            band_power[i, :] = np.sum(raw_power[mask, :], axis=0)
-
-    total_band_power = np.sum(band_power, axis=0) + float(eps)
-    log_power = np.log1p(np.maximum(band_power, 0.0))
-    power_ratio = band_power / total_band_power.reshape(1, -1)
-
-    rain_mask = frame_class == FrameClass.RAIN
-    no_rain_mask = frame_class != FrameClass.RAIN
-
-    def _empty() -> np.ndarray:
-        return np.zeros(n_bands, dtype=dtype)
-
-    def _stats(arr: np.ndarray, mask: np.ndarray, prefix: str) -> Dict[str, np.ndarray]:
-        if arr.shape[1] == 0 or not np.any(mask):
-            return {
-                f"{prefix}_mean": _empty(),
-                f"{prefix}_std": _empty(),
-                f"{prefix}_p50": _empty(),
-                f"{prefix}_p90": _empty(),
-                f"{prefix}_max": _empty(),
-            }
-        vals = arr[:, mask]
-        return {
-            f"{prefix}_mean": np.asarray(np.mean(vals, axis=1), dtype=dtype),
-            f"{prefix}_std": np.asarray(np.std(vals, axis=1), dtype=dtype),
-            f"{prefix}_p50": np.asarray(np.percentile(vals, 50, axis=1), dtype=dtype),
-            f"{prefix}_p90": np.asarray(np.percentile(vals, 90, axis=1), dtype=dtype),
-            f"{prefix}_max": np.asarray(np.max(vals, axis=1), dtype=dtype),
-        }
-
-    out: Dict[str, Any] = {
-        "band_names": np.asarray([name for name, _, _ in bands], dtype=object),
-        "band_lo_hz": np.asarray([lo for _, lo, _ in bands], dtype=dtype),
-        "band_hi_hz": np.asarray([hi for _, _, hi in bands], dtype=dtype),
-        "rain_frame_count": int(np.sum(rain_mask)),
-        "no_rain_frame_count": int(np.sum(no_rain_mask)),
-    }
-    out.update(_stats(log_power, rain_mask, "rain_log_power"))
-    out.update(_stats(power_ratio, rain_mask, "rain_power_ratio"))
-    out.update(_stats(log_power, no_rain_mask, "no_rain_log_power"))
-    out.update(_stats(power_ratio, no_rain_mask, "no_rain_power_ratio"))
-    return out
 
 class RainFrameClassifierMixin:
     """
@@ -739,6 +193,26 @@ class RainFrameClassifierMixin:
             out[:ncopy] = arr[:ncopy]
         return out
 
+    def _align_feature_dict_to_frames(
+        self,
+        feature_dict: Dict[str, Any],
+        feature_names: Sequence[str],
+        *,
+        n_frames: int,
+        dtype: Any,
+        fill_value: float | int | bool = 0,
+    ) -> Dict[str, np.ndarray]:
+        """Align a dictionary of 1-D feature arrays to the detector frame count."""
+        return {
+            name: self._align_feature_to_frames(
+                feature_dict.get(name),
+                n_frames=n_frames,
+                dtype=dtype,
+                fill_value=fill_value,
+            )
+            for name in feature_names
+        }
+
     def _resolve_detector_frame_times(
         self,
         detector_frame_times: Optional[np.ndarray],
@@ -784,6 +258,7 @@ class RainFrameClassifierMixin:
         rain_conf is returned as a binary float so downstream frame-count aggregation
         remains aligned with the hard frame decision.
         """
+
         # Apply clip + log1p in one step (matches offline threshold search space)
         f0 = np.log1p(np.clip(np.asarray(primary_mode_flux), 0.0, None))
         f1 = np.log1p(np.clip(np.asarray(support_mode_flux_1), 0.0, None))
@@ -807,6 +282,7 @@ class RainFrameClassifierMixin:
         rain_conf = is_rain.astype(np.float32, copy=False)
 
         return is_rain, rain_conf
+
     # ------------------------------------------------------------
     # Core detection
     # ------------------------------------------------------------
@@ -844,7 +320,9 @@ class RainFrameClassifierMixin:
         include_peak_payload = peak_features_enable and bool(
             self._dget("feature_dump_include_peak_payload", False)
         )
-        feature_dump_include_frame_class = bool(self._dget("feature_dump_include_frame_class", True))
+        feature_dump_include_frame_class = bool(
+            self._dget("feature_dump_include_frame_class", True)
+        )
 
         # Feature-dump size controls. These only affect what is persisted in
         # feature_dump; detector internals and det_debug remain available during
@@ -866,6 +344,21 @@ class RainFrameClassifierMixin:
         )
         feature_dump_include_peak_summary = bool(
             self._dget("feature_dump_include_peak_summary", False)
+        )
+        feature_dump_dense_enable = bool(
+            self._dget("feature_dump_dense_enable", True)
+        )
+        feature_dump_sparse_enable = bool(
+            self._dget("feature_dump_sparse_enable", False)
+        )
+        feature_dump_clip_summary_enable = bool(
+            self._dget("feature_dump_clip_summary_enable", False)
+        )
+        feature_dump_sparse_gate_feature = str(
+            self._dget("feature_dump_sparse_gate_feature", "td_block_energy_crest")
+        ).strip().lower()
+        feature_dump_sparse_gate_threshold = float(
+            self._dget("feature_dump_sparse_gate_threshold", 3.5)
         )
 
         clip_spectral_occupancy_enable = bool(
@@ -889,26 +382,40 @@ class RainFrameClassifierMixin:
                 "mode 0 as primary and modes 1, 2, 3 as support"
             )
 
-        # Raw spectral-shape features are diagnostics for FP/FN analysis.
-        # They intentionally use the raw waveform spectrum, while the existing
-        # FD flux detector continues to use P, which may be noise-normalized as
-        # log(P(t)) - log(N_lag(t)).
+        # Raw spectral-shape diagnostics computed from the original waveform
+        # spectrum rather than the detector novelty spectrum P.
         raw_spectral_shape_enable = bool(self._dget("raw_spectral_shape_enable", True))
         raw_spectral_rain_band = self._dget("raw_spectral_rain_band", (400.0, 800.0))
         raw_spectral_low_band = self._dget("raw_spectral_low_band", (50.0, 200.0))
-        raw_spectral_rolloff_fraction = float(self._dget("raw_spectral_rolloff_fraction", 0.85))
+        raw_spectral_rolloff_fraction = float(
+            self._dget("raw_spectral_rolloff_fraction", 0.85)
+        )
 
         # TD features should match the previous pre-filtered detector path even
         # when input_audio is now the raw waveform. Prefer the processor's
         # existing _build_prefilter_sos() implementation when available.
         td_apply_input_prefilter = bool(self._dget("td_apply_input_prefilter", True))
-        td_prefilter_mode = str(self._dget("td_prefilter_mode", self._dget("pre_filter_mode", "none"))).lower()
+        td_prefilter_mode = str(
+            self._dget(
+                "td_prefilter_mode",
+                self._dget("pre_filter_mode", "none"),
+            )
+        ).lower()
 
         # TD features are always extracted when input_audio is available; soft labels remain optional.
         td_soft_enable = bool(self._dget("td_soft_enable", False))
         td_soft_bp_order = int(self._dget("td_soft_bp_order", 4))
         td_soft_subframe_len = int(self._dget("td_soft_subframe_len", 128))
         td_soft_subframe_hop = int(self._dget("td_soft_subframe_hop", 128))
+        td_block_energy_len = int(self._dget("td_block_energy_len", 8))
+        td_block_energy_hop_raw = self._dget("td_block_energy_hop", None)
+        td_block_energy_hop = (
+            None
+            if td_block_energy_hop_raw is None
+            else int(td_block_energy_hop_raw)
+        )
+        td_block_energy_post_pre_blocks = int(self._dget("td_block_energy_post_pre_blocks", 4))
+        td_block_energy_smooth_enable = bool(self._dget("td_block_energy_smooth_enable", True))
         td_input_mode = str(self._dget("td_input_mode", "default")).lower()
         td_input_band = self._dget("td_input_band", None)
         if td_input_band is not None:
@@ -986,6 +493,10 @@ class RainFrameClassifierMixin:
                     subframe_len=td_soft_subframe_len,
                     subframe_hop=td_soft_subframe_hop,
                     envelope_features_enable=td_envelope_features_enable,
+                    block_energy_len=td_block_energy_len,
+                    block_energy_hop=td_block_energy_hop,
+                    block_energy_post_pre_blocks=td_block_energy_post_pre_blocks,
+                    block_energy_smooth_enable=td_block_energy_smooth_enable,
                     process_dtype=str(self._dget("process_dtype", "float32")),
                     eps=eps,
                 )
@@ -997,8 +508,14 @@ class RainFrameClassifierMixin:
                         n_fft=n_fft_local,
                         hop=hop_local,
                         operating_band=(op_lo, op_hi),
-                        rain_band=(float(raw_spectral_rain_band[0]), float(raw_spectral_rain_band[1])),
-                        low_band=(float(raw_spectral_low_band[0]), float(raw_spectral_low_band[1])),
+                        rain_band=(
+                            float(raw_spectral_rain_band[0]),
+                            float(raw_spectral_rain_band[1]),
+                        ),
+                        low_band=(
+                            float(raw_spectral_low_band[0]),
+                            float(raw_spectral_low_band[1]),
+                        ),
                         mode_bands=mode_bands,
                         rolloff_fraction=raw_spectral_rolloff_fraction,
                         process_dtype=str(self._dget("process_dtype", "float32")),
@@ -1009,6 +526,7 @@ class RainFrameClassifierMixin:
             except Exception as e:
                 td_soft_debug = {"error": str(e)}
                 raw_spectral_debug = {"error": str(e)}
+        
         detector_frame_times = self._resolve_detector_frame_times(
             detector_frame_times,
             n_frames=T,
@@ -1024,77 +542,78 @@ class RainFrameClassifierMixin:
         td_fall_slope = np.zeros(T, dtype=dtype)
         td_energy_envelope = np.zeros(T, dtype=dtype)
         td_peak_energy = np.zeros(T, dtype=dtype)
+        td_block_energy_crest = np.zeros(T, dtype=dtype)
+        td_block_peak_width_50 = np.zeros(T, dtype=dtype)
+        td_block_post_pre_energy_ratio = np.zeros(T, dtype=dtype)
         td_vote_count = np.zeros(T, dtype=np.int32)
         td_soft_score = np.zeros(T, dtype=dtype)
 
-        raw_spectral_centroid_hz = np.zeros(T, dtype=dtype)
-        raw_spectral_bandwidth_hz = np.zeros(T, dtype=dtype)
-        raw_low_freq_ratio = np.zeros(T, dtype=dtype)
-        raw_rain_band_ratio = np.zeros(T, dtype=dtype)
-        raw_mode_band_ratio_0 = np.zeros(T, dtype=dtype)
-        raw_mode_band_ratio_1 = np.zeros(T, dtype=dtype)
-        raw_mode_band_ratio_2 = np.zeros(T, dtype=dtype)
-        raw_mode_band_ratio_3 = np.zeros(T, dtype=dtype)
-        raw_mode_band_ratio_4 = np.zeros(T, dtype=dtype)
-        raw_mode_band_entropy = np.zeros(T, dtype=dtype)
-        raw_mode_band_std = np.zeros(T, dtype=dtype)
-        raw_mode_band_max_ratio = np.zeros(T, dtype=dtype)
-        raw_spectral_flatness = np.zeros(T, dtype=dtype)
-        raw_spectral_rolloff_hz = np.zeros(T, dtype=dtype)
-        raw_dominant_freq_hz = np.zeros(T, dtype=dtype)
-        raw_frame_energy = np.zeros(T, dtype=dtype)
+        aligned_raw_spectral = {
+            name: np.zeros(T, dtype=dtype)
+            for name in RAW_SPECTRAL_FEATURE_NAMES
+        }
+
+        # Registry-driven TD alignment block
+        aligned_td = {
+            name: np.zeros(T, dtype=dtype)
+            for name in TD_FEATURE_NAMES
+        }
 
         if td_soft_debug and ("error" not in td_soft_debug):
-            td_crest_factor = self._align_feature_to_frames(
-                td_soft_debug.get("crest_factor"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            td_kurtosis = self._align_feature_to_frames(
-                td_soft_debug.get("kurtosis"),
+
+            aligned_td = self._align_feature_dict_to_frames(
+                td_soft_debug,
+                TD_FEATURE_NAMES,
                 n_frames=T,
                 dtype=dtype,
                 fill_value=0,
             )
 
+            # Sanity check: registry names must match extraction output keys.
+            # Envelope features are optional and only expected when enabled.
+            expected_td_features = {
+                "td_crest_factor",
+                "td_kurtosis",
+                "td_block_energy_crest",
+                "td_block_peak_width_50",
+                "td_block_post_pre_energy_ratio",
+            }
+
             if td_envelope_features_enable:
-                td_rise_time_sec = self._align_feature_to_frames(
-                    td_soft_debug.get("rise_time_sec"),
-                    n_frames=T,
-                    dtype=dtype,
-                    fill_value=0,
+                expected_td_features.update({
+                    "td_rise_time_sec",
+                    "td_fall_time_sec",
+                    "td_rise_slope",
+                    "td_fall_slope",
+                    "td_energy_envelope",
+                    "td_peak_energy",
+                })
+
+            missing_td_features = sorted(
+                name for name in expected_td_features
+                if name not in td_soft_debug
+            )
+
+            if missing_td_features:
+                det_missing = ", ".join(missing_td_features)
+                raise KeyError(
+                    "TD feature extraction mismatch. Missing TD features: "
+                    f"{det_missing}"
                 )
-                td_fall_time_sec = self._align_feature_to_frames(
-                    td_soft_debug.get("fall_time_sec"),
-                    n_frames=T,
-                    dtype=dtype,
-                    fill_value=0,
-                )
-                td_rise_slope = self._align_feature_to_frames(
-                    td_soft_debug.get("rise_slope"),
-                    n_frames=T,
-                    dtype=dtype,
-                    fill_value=0,
-                )
-                td_fall_slope = self._align_feature_to_frames(
-                    td_soft_debug.get("fall_slope"),
-                    n_frames=T,
-                    dtype=dtype,
-                    fill_value=0,
-                )
-                td_energy_envelope = self._align_feature_to_frames(
-                    td_soft_debug.get("energy_envelope"),
-                    n_frames=T,
-                    dtype=dtype,
-                    fill_value=0,
-                )
-                td_peak_energy = self._align_feature_to_frames(
-                    td_soft_debug.get("peak_energy"),
-                    n_frames=T,
-                    dtype=dtype,
-                    fill_value=0,
-                )
+
+            td_crest_factor = aligned_td["td_crest_factor"]
+            td_kurtosis = aligned_td["td_kurtosis"]
+            td_block_energy_crest = aligned_td["td_block_energy_crest"]
+            td_block_peak_width_50 = aligned_td["td_block_peak_width_50"]
+            td_block_post_pre_energy_ratio = aligned_td["td_block_post_pre_energy_ratio"]
+
+            if td_envelope_features_enable:
+                td_rise_time_sec = aligned_td["td_rise_time_sec"]
+                td_fall_time_sec = aligned_td["td_fall_time_sec"]
+                td_rise_slope = aligned_td["td_rise_slope"]
+                td_fall_slope = aligned_td["td_fall_slope"]
+                td_energy_envelope = aligned_td["td_energy_envelope"]
+                td_peak_energy = aligned_td["td_peak_energy"]
 
             if td_soft_enable:
                 td_label_out = assign_td_soft_label(
@@ -1108,103 +627,17 @@ class RainFrameClassifierMixin:
                 td_vote_count = td_label_out["td_vote_count"]
                 td_soft_score = td_label_out["td_soft_score"]
                 td_soft_label = td_label_out["td_soft_label"]
+
         if raw_spectral_debug and ("error" not in raw_spectral_debug):
-            raw_spectral_centroid_hz = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_spectral_centroid_hz"),
+
+            aligned_raw_spectral = self._align_feature_dict_to_frames(
+                raw_spectral_debug,
+                RAW_SPECTRAL_FEATURE_NAMES,
                 n_frames=T,
                 dtype=dtype,
                 fill_value=0,
             )
-            raw_spectral_bandwidth_hz = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_spectral_bandwidth_hz"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_low_freq_ratio = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_low_freq_ratio"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_rain_band_ratio = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_rain_band_ratio"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_ratio_0 = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_ratio_0"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_ratio_1 = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_ratio_1"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_ratio_2 = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_ratio_2"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_ratio_3 = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_ratio_3"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_ratio_4 = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_ratio_4"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_entropy = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_entropy"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_std = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_std"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_mode_band_max_ratio = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_mode_band_max_ratio"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_spectral_flatness = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_spectral_flatness"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_spectral_rolloff_hz = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_spectral_rolloff_hz"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_dominant_freq_hz = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_dominant_freq_hz"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
-            raw_frame_energy = self._align_feature_to_frames(
-                raw_spectral_debug.get("raw_frame_energy"),
-                n_frames=T,
-                dtype=dtype,
-                fill_value=0,
-            )
+
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
 
         if P.shape[0] != freqs.shape[0]:
@@ -1346,7 +779,11 @@ class RainFrameClassifierMixin:
                     # Valid peaks are those satisfying the requested prominence range.
                     pk_h = np.asarray(props.get("peak_heights", spec_db[peaks]), dtype=dtype)
                     pk_prom = np.asarray(props.get("prominences", np.zeros(peaks.size)), dtype=dtype)
-                    widths_bins, *_ = peak_widths(spec_db, peaks, rel_height=0.5)
+                    widths_bins, *_ = spsig.peak_widths(
+                        spec_db,
+                        peaks,
+                        rel_height=0.5,
+                    )
                     df_hz = float(freqs_band[1] - freqs_band[0]) if freqs_band.size > 1 else 0.0
                     pk_bw_hz = np.asarray(widths_bins, dtype=dtype) * df_hz
 
@@ -1463,20 +900,37 @@ class RainFrameClassifierMixin:
         mode_flux_score = np.nan_to_num(mode_flux_score, nan=0.0, posinf=0.0, neginf=0.0)
         td_crest_factor = np.nan_to_num(td_crest_factor, nan=0.0, posinf=0.0, neginf=0.0)
         td_kurtosis = np.nan_to_num(td_kurtosis, nan=0.0, posinf=0.0, neginf=0.0)
+        td_block_energy_crest = np.nan_to_num(td_block_energy_crest, nan=0.0, posinf=0.0, neginf=0.0)
+        td_block_peak_width_50 = np.nan_to_num(td_block_peak_width_50, nan=0.0, posinf=0.0, neginf=0.0)
+        td_block_post_pre_energy_ratio = np.nan_to_num(
+            td_block_post_pre_energy_ratio,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         td_soft_score = np.nan_to_num(td_soft_score, nan=0.0, posinf=0.0, neginf=0.0)
-
+        # FD rain decision thresholds are applied in log1p space.
+        # min_support_count refers to support bands {1,2,3}.
         primary_flux_min = float(self._dget("new_rain_primary_flux_min", 1.8))
         legacy_mode12_flux_min = float(self._dget("new_rain_mode12_flux_min", 2.6))
         mode1_flux_min = float(self._dget("new_rain_mode1_flux_min", legacy_mode12_flux_min))
         mode2_flux_min = float(self._dget("new_rain_mode2_flux_min", legacy_mode12_flux_min))
         mode3_flux_min = float(self._dget("new_rain_mode3_flux_min", 3.0))
-        min_support_count = int(self._dget("new_rain_min_support_count", 3))
+        min_support_count = int(self._dget("new_rain_min_support_count", 2))
 
         primary_mode_flux = np.nan_to_num(normalized_mode_flux_by_mode[0], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_1 = np.nan_to_num(normalized_mode_flux_by_mode[1], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_2 = np.nan_to_num(normalized_mode_flux_by_mode[2], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_3 = np.nan_to_num(normalized_mode_flux_by_mode[3], nan=0.0, posinf=0.0, neginf=0.0)
-        support_mode_flux_4 = np.nan_to_num(normalized_mode_flux_by_mode[4], nan=0.0, posinf=0.0, neginf=0.0) if normalized_mode_flux_by_mode.shape[0] > 4 else np.zeros_like(primary_mode_flux)
+        if normalized_mode_flux_by_mode.shape[0] > 4:
+            support_mode_flux_4 = np.nan_to_num(
+                normalized_mode_flux_by_mode[4],
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        else:
+            support_mode_flux_4 = np.zeros_like(primary_mode_flux)
 
         # TD gate: require minimum crest factor and optionally reject overly spiky
         # frames using an upper threshold on kurtosis.
@@ -1487,6 +941,31 @@ class RainFrameClassifierMixin:
         if td_kurtosis_upper_threshold is not None:
             td_kurtosis_upper_threshold = float(td_kurtosis_upper_threshold)
             td_gate_mask = td_gate_mask & (td_kurtosis <= td_kurtosis_upper_threshold)
+
+        if feature_dump_sparse_gate_feature == "td_block_energy_crest":
+            sparse_gate_source = td_block_energy_crest
+        elif feature_dump_sparse_gate_feature == "td_crest_factor":
+            sparse_gate_source = td_crest_factor
+        else:
+            sparse_gate_source = td_block_energy_crest
+
+        sparse_gate_source_safe = np.nan_to_num(
+            sparse_gate_source,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        if feature_dump_sparse_enable:
+            raw_spectral_dump_mask = (
+                sparse_gate_source_safe > feature_dump_sparse_gate_threshold
+            )
+        else:
+            # Dense-only mode keeps all frames.
+            raw_spectral_dump_mask = np.ones(T, dtype=bool)
+
+        sparse_frame_idx = np.flatnonzero(raw_spectral_dump_mask).astype(np.int32)
+
         gate_scale = td_gate_mask.astype(dtype)
 
         primary_mode_flux_gated = primary_mode_flux * gate_scale
@@ -1513,12 +992,10 @@ class RainFrameClassifierMixin:
         mode_flux_score_gated = mode_flux_score * gate_scale
         weak_mode_flux = mode_flux_score_gated <= mode_flux_noise_max
 
-        # FrameClass is the canonical raw detector output.
+        # FrameClass is the canonical detector output used by downstream logic
         frame_class = np.full(T, FrameClass.UNCERTAIN, dtype=np.int8)
         frame_class[(noise_conf >= noise_hi) & weak_mode_flux & (~is_rain)] = FrameClass.NOISE
         frame_class[is_rain] = FrameClass.RAIN
-
-        # FrameClass is produced here; downstream suppressor logic may use it for later decisions.
 
         det_debug = {
             "mode_flux_score": mode_flux_score,
@@ -1538,33 +1015,38 @@ class RainFrameClassifierMixin:
             "td_soft_label": td_soft_label,
             "td_crest_factor": td_crest_factor,
             "td_kurtosis": td_kurtosis,
+            "td_block_energy_crest": td_block_energy_crest,
+            "td_block_peak_width_50": td_block_peak_width_50,
+            "td_block_post_pre_energy_ratio": td_block_post_pre_energy_ratio,
+            "td_block_energy_len": td_block_energy_len,
+            "td_block_energy_hop": td_block_energy_hop,
+            "td_block_energy_post_pre_blocks": td_block_energy_post_pre_blocks,
+            "td_block_energy_smooth_enable": td_block_energy_smooth_enable,
             "td_gate_threshold": td_gate_threshold,
             "td_kurtosis_upper_threshold": td_kurtosis_upper_threshold,
             "td_gate_mask": td_gate_mask,
+            "raw_spectral_dump_mask": raw_spectral_dump_mask,
+            "raw_spectral_dump_mask_fraction": (
+                float(np.mean(raw_spectral_dump_mask.astype(np.float32)))
+                if T > 0 else 0.0
+            ),
             "td_vote_count": td_vote_count,
             "td_soft_score": td_soft_score,
-            "raw_spectral_centroid_hz": raw_spectral_centroid_hz,
-            "raw_spectral_bandwidth_hz": raw_spectral_bandwidth_hz,
-            "raw_low_freq_ratio": raw_low_freq_ratio,
-            "raw_rain_band_ratio": raw_rain_band_ratio,
-            "raw_mode_band_ratio_0": raw_mode_band_ratio_0,
-            "raw_mode_band_ratio_1": raw_mode_band_ratio_1,
-            "raw_mode_band_ratio_2": raw_mode_band_ratio_2,
-            "raw_mode_band_ratio_3": raw_mode_band_ratio_3,
-            "raw_mode_band_ratio_4": raw_mode_band_ratio_4,
-            "raw_mode_band_entropy": raw_mode_band_entropy,
-            "raw_mode_band_std": raw_mode_band_std,
-            "raw_mode_band_max_ratio": raw_mode_band_max_ratio,
-            "raw_spectral_flatness": raw_spectral_flatness,
-            "raw_spectral_rolloff_hz": raw_spectral_rolloff_hz,
-            "raw_dominant_freq_hz": raw_dominant_freq_hz,
-            "raw_frame_energy": raw_frame_energy,
+            "sparse_frame_idx": sparse_frame_idx,
+            "feature_dump_dense_enable": feature_dump_dense_enable,
+            "feature_dump_sparse_enable": feature_dump_sparse_enable,
+            "feature_dump_clip_summary_enable": feature_dump_clip_summary_enable,
+            "feature_dump_sparse_gate_feature": feature_dump_sparse_gate_feature,
+            "feature_dump_sparse_gate_threshold": feature_dump_sparse_gate_threshold,
             "raw_spectral_shape_enable": raw_spectral_shape_enable,
             "raw_spectral_uses_raw_power": raw_power is not None,
             "td_apply_input_prefilter": td_apply_input_prefilter,
             "td_prefilter_mode": td_prefilter_mode,
             "clip_spectral_occupancy_enable": clip_spectral_occupancy_enable,
         }
+
+        # Registry-driven raw spectral debug wiring.
+        det_debug.update(aligned_raw_spectral)
 
         if td_envelope_features_enable:
             det_debug.update({
@@ -1615,98 +1097,72 @@ class RainFrameClassifierMixin:
         feature_dump: Dict[str, Any] = {}
 
         if feature_dump_level > 0:
-            # Feature dump contains only feature arrays used for tuning / replay.
-            # Keep settings / thresholds / decisions in det_debug so the saved
-            # feature payload stays compact and focused on primary + derived features.
-            fd_primary = {
-                "primary_mode_flux": primary_mode_flux,
-                "support_mode_flux_1": support_mode_flux_1,
-                "support_mode_flux_2": support_mode_flux_2,
-                "support_mode_flux_3": support_mode_flux_3,
-                "support_mode_flux_4": support_mode_flux_4,
-            }
-            if feature_dump_include_mode_flux_score:
-                fd_primary["mode_flux_score"] = mode_flux_score
+            fd_dense = {}
+            fd_sparse = {}
+            fd_clip_summary = {}
 
-            fd_td = {
-                "td_crest_factor": td_crest_factor,
-                "td_kurtosis": td_kurtosis,
-                "td_gate_mask": td_gate_mask,
-            }
-
-            fd_raw_spectral = {}
-            if feature_dump_include_raw_spectral_frame_features:
-                fd_raw_spectral.update({
-                    "raw_spectral_bandwidth_hz": raw_spectral_bandwidth_hz,
-                    "raw_low_freq_ratio": raw_low_freq_ratio,
-                    "raw_mode_band_ratio_0": raw_mode_band_ratio_0,
-                    "raw_mode_band_ratio_1": raw_mode_band_ratio_1,
-                    "raw_mode_band_ratio_2": raw_mode_band_ratio_2,
-                    "raw_mode_band_ratio_3": raw_mode_band_ratio_3,
-                    "raw_mode_band_ratio_4": raw_mode_band_ratio_4,
-                    "raw_mode_band_entropy": raw_mode_band_entropy,
-                    "raw_mode_band_std": raw_mode_band_std,
-                    "raw_mode_band_max_ratio": raw_mode_band_max_ratio,
-                    "raw_spectral_flatness": raw_spectral_flatness,
-                    "raw_dominant_freq_hz": raw_dominant_freq_hz,
-                    "raw_frame_energy": raw_frame_energy,
-                })
-                if feature_dump_include_raw_spectral_basic:
-                    fd_raw_spectral.update({
-                        "raw_spectral_centroid_hz": raw_spectral_centroid_hz,
-                        "raw_rain_band_ratio": raw_rain_band_ratio,
-                        "raw_spectral_rolloff_hz": raw_spectral_rolloff_hz,
-                    })
-
-            feature_dump = {
-                "frame_times": detector_frame_times,
-                **fd_primary,
-                **fd_td,
-                **fd_raw_spectral,
-            }
-
-            if feature_dump_include_frame_class:
-                feature_dump["frame_class"] = frame_class
-
-            if clip_spectral_occupancy:
-                feature_dump["clip_spectral_occupancy"] = clip_spectral_occupancy
-
-            if td_envelope_features_enable and feature_dump_include_td_envelope:
-                feature_dump.update({
-                    "td_energy_envelope": td_energy_envelope,
-                    "td_peak_energy": td_peak_energy,
-                    "td_rise_time_sec": td_rise_time_sec,
-                    "td_fall_time_sec": td_fall_time_sec,
-                    "td_rise_slope": td_rise_slope,
-                    "td_fall_slope": td_fall_slope,
+            if feature_dump_dense_enable:
+                fd_dense.update({
+                    "primary_mode_flux": primary_mode_flux,
+                    "support_mode_flux_1": support_mode_flux_1,
+                    "support_mode_flux_2": support_mode_flux_2,
+                    "support_mode_flux_3": support_mode_flux_3,
+                    "support_mode_flux_4": support_mode_flux_4,
+                    "td_block_energy_crest": td_block_energy_crest,
+                    "td_block_peak_width_50": td_block_peak_width_50,
+                    "td_block_post_pre_energy_ratio": td_block_post_pre_energy_ratio,
+                    "td_gate_mask": td_gate_mask,
                 })
 
-            if feature_dump_level > 1:
-                if feature_dump_include_mode_flux_score:
-                    feature_dump["flux_primary"] = flux_primary
+                if feature_dump_include_frame_class:
+                    fd_dense["frame_class"] = frame_class
 
                 if feature_dump_include_td_soft:
-                    feature_dump.update({
+                    fd_dense.update({
+                        "td_crest_factor": td_crest_factor,
+                        "td_kurtosis": td_kurtosis,
+                        "td_vote_count": td_vote_count,
                         "td_soft_score": td_soft_score,
-                        "td_vote_count": td_vote_count.astype(dtype, copy=False),
                     })
 
-                if peak_features_enable and feature_dump_include_peak_summary:
-                    feature_dump.update({
-                        "peak_ratio": peak_ratio,
-                        "peak_gate_score": peak_gate_score,
-                        "peak_valid_count": peak_valid_count.astype(dtype, copy=False),
-                        "peak_count_by_mode": peak_count_by_mode.astype(dtype, copy=False),
-                    })
+            if feature_dump_sparse_enable:
+                fd_sparse["sparse_frame_idx"] = sparse_frame_idx
 
-            if feature_dump_level > 1 and include_peak_payload:
-                feature_dump.update({
-                    "peak_valid_freqs_hz": peak_valid_freqs_hz,
-                    "peak_valid_prominences_db": peak_valid_prominences_db,
-                    "peak_valid_bandwidths_hz": peak_valid_bandwidths_hz,
-                })
+                raw_spectral_basic_names = {
+                    "raw_spectral_centroid_hz",
+                    "raw_rain_band_ratio",
+                    "raw_spectral_rolloff_hz",
+                }
+
+                if feature_dump_include_raw_spectral_frame_features:
+                    for name in RAW_SPECTRAL_FEATURE_NAMES:
+                        if (
+                            name in raw_spectral_basic_names
+                            and not feature_dump_include_raw_spectral_basic
+                        ):
+                            continue
+
+                        fd_sparse[f"sparse_{name}"] = (
+                            aligned_raw_spectral[name][sparse_frame_idx]
+                        )
+                elif feature_dump_include_raw_spectral_basic:
+                    for name in raw_spectral_basic_names:
+                        fd_sparse[f"sparse_{name}"] = (
+                            aligned_raw_spectral[name][sparse_frame_idx]
+                        )
+
+            if feature_dump_clip_summary_enable and clip_spectral_occupancy:
+                fd_clip_summary["clip_spectral_occupancy"] = clip_spectral_occupancy
+
+            # Keep backward-compatible flat feature_dump structure.
+            # The downstream flattening loader supports both flat and 3-tier formats.
+            feature_dump.update(fd_dense)
+            feature_dump.update(fd_sparse)
+            feature_dump.update(fd_clip_summary)
 
         det_debug["peak_features_enable"] = peak_features_enable
+
         if raw_spectral_debug and "error" in raw_spectral_debug:
             det_debug["raw_spectral_shape_error"] = raw_spectral_debug["error"]
+
         return frame_class, rain_conf, det_debug, feature_dump
