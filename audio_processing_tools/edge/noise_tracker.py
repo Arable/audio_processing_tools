@@ -79,6 +79,7 @@ class CausalNoiseTracker:
         self._prev_N: Optional[np.ndarray] = None
         self._warmup_count: int = 0
         self._rain_prev_ema: float = 0.0
+        self._seeded: bool = False
 
     # ------------------------------------------------------------------
     # State management
@@ -100,9 +101,11 @@ class CausalNoiseTracker:
             ff = np.asarray(first_frame, dtype=dtype).reshape(-1)
             self._tracker = np.maximum(ff.copy(), 0.0)
             self._tracker_scale = np.maximum(np.abs(ff), self._step_floor)
+            self._seeded = True
         else:
             self._tracker = np.zeros(self._n_bins, dtype=dtype)
             self._tracker_scale = np.full(self._n_bins, self._step_floor, dtype=dtype)
+            self._seeded = False
         self._prev_N = None
         self._warmup_count = 0
         self._rain_prev_ema = 0.0
@@ -134,7 +137,12 @@ class CausalNoiseTracker:
         allow_update = (self._warmup_count < self._warmup_need) or (not bool(is_rain))
 
         if self._prev_N is None:
-            # First frame: initialise tracker from current power if not seeded.
+            if not self._seeded:
+                # Auto-seed from first observed frame so reset() without a
+                # first_frame argument still starts from a sensible baseline.
+                self._tracker = np.maximum(P_band.copy(), 0.0)
+                self._tracker_scale = np.maximum(np.abs(P_band), self._step_floor)
+                self._seeded = True
             if allow_update:
                 self._warmup_count += 1
             raw_q = self._tracker

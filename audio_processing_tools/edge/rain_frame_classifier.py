@@ -6,11 +6,13 @@ from collections.abc import Sequence
 
 import numpy as np
 import scipy.signal as spsig
+from audio_processing_tools.edge.noise_tracker import CausalNoiseTracker
 from audio_processing_tools.edge.feature_extraction import (
     RAW_SPECTRAL_FEATURE_NAMES,
     TD_FEATURE_NAMES,
     compute_clip_spectral_occupancy_stats,
     extract_raw_spectral_shape_features_inline,
+    extract_td_features_causal_frame_inline,
     extract_td_features_inline,
 )
 
@@ -372,6 +374,13 @@ class RainFrameClassifierMixin:
             )
         ).lower()
 
+        td_feature_timing_mode = str(self._dget("td_feature_timing_mode", "offline")).strip().lower()
+        if td_feature_timing_mode not in {"offline", "causal_frame"}:
+            raise ValueError(
+                "td_feature_timing_mode must be one of {'offline', 'causal_frame'}; "
+                f"got {td_feature_timing_mode!r}"
+            )
+
         # TD features are always extracted when input_audio is available; soft labels remain optional.
         td_soft_enable = bool(self._dget("td_soft_enable", False))
         td_soft_bp_order = int(self._dget("td_soft_bp_order", 4))
@@ -440,13 +449,15 @@ class RainFrameClassifierMixin:
                     if callable(build_prefilter):
                         sos = build_prefilter(fs_local, td_prefilter_mode)
                         if sos is not None:
-                            try:
-                                x_td_in = spsig.sosfiltfilt(sos, x_in).astype(dtype, copy=False)
-                            except ValueError:
+                            if td_feature_timing_mode == "causal_frame":
                                 x_td_in = spsig.sosfilt(sos, x_in).astype(dtype, copy=False)
+                            else:
+                                try:
+                                    x_td_in = spsig.sosfiltfilt(sos, x_in).astype(dtype, copy=False)
+                                except ValueError:
+                                    x_td_in = spsig.sosfilt(sos, x_in).astype(dtype, copy=False)
 
-                td_soft_debug = extract_td_features_inline(
-                    x=x_td_in,
+                td_feature_kwargs = dict(
                     fs=fs_local,
                     frame_len=n_fft_local,
                     hop=hop_local,
@@ -466,9 +477,20 @@ class RainFrameClassifierMixin:
                     eps=eps,
                 )
 
+                if td_feature_timing_mode == "causal_frame":
+                    td_soft_debug = extract_td_features_causal_frame_inline(
+                        x=x_td_in,
+                        n_frames=T,
+                        **td_feature_kwargs,
+                    )
+                else:
+                    td_soft_debug = extract_td_features_inline(
+                        x=x_td_in,
+                        **td_feature_kwargs,
+                    )
+
                 if raw_spectral_shape_enable:
                     raw_spectral_debug = extract_raw_spectral_shape_features_inline(
-                        x=x_in,
                         fs=fs_local,
                         n_fft=n_fft_local,
                         hop=hop_local,
@@ -985,6 +1007,7 @@ class RainFrameClassifierMixin:
             "raw_spectral_uses_raw_power": raw_power is not None,
             "td_apply_input_prefilter": td_apply_input_prefilter,
             "td_prefilter_mode": td_prefilter_mode,
+            "td_feature_timing_mode": td_feature_timing_mode,
             "clip_spectral_occupancy_enable": clip_spectral_occupancy_enable,
         }
 
@@ -1271,6 +1294,15 @@ class RainFrameClassifierState:
         # Winsorization of combined flux (mirrors flux_modes_winsor_* in the batch path)
         flux_modes_winsor_enable: bool = False,
         flux_modes_winsor_q: float = 99.0,
+        # Causal noise tracker params (used by process_audio_frame)
+        noise_tracker_q: float = 0.25,
+        noise_tracker_win_sec: float = 0.5,
+        noise_tracker_ema_up: float = 0.6,
+        noise_tracker_ema_down: float = 0.95,
+        noise_tracker_max_ratio: float = 1.0,
+        noise_tracker_adaptive_q_enable: bool = False,
+        noise_tracker_adaptive_q_min: float = 0.10,
+        noise_tracker_adaptive_q_alpha: float = 0.95,
     ):
         dtype = resolve_np_dtype(process_dtype)
         self._dtype = dtype
@@ -1359,9 +1391,26 @@ class RainFrameClassifierState:
         )
         self._raw_spectral_rolloff_fraction = float(raw_spectral_rolloff_fraction)
 
-        # Prefilter params for replay_clip
+        # Prefilter params shared by replay_clip and process_frame
         self._hp_cutoff_hz = float(hp_cutoff_hz)
         self._hp_order = int(hp_order)
+
+        # Causal prefilter state for process_frame streaming path.
+        # replay_clip uses sosfiltfilt (non-causal, full clip); process_frame uses
+        # sosfilt with persistent zi so state carries across frames without a DC
+        # transient at each chunk boundary.
+        _sos = (
+            self._build_sos(self._td_prefilter_mode)
+            if self._td_apply_input_prefilter and self._td_prefilter_mode not in ("", "none")
+            else None
+        )
+        self._hp_sos: Optional[np.ndarray] = _sos
+        self._hp_zi: Optional[np.ndarray] = (
+            np.zeros((_sos.shape[0], 2), dtype=dtype) if _sos is not None else None
+        )
+        self._hp_zi_live: Optional[np.ndarray] = (
+            self._hp_zi.copy() if self._hp_zi is not None else None
+        )
 
         # Winsorization params (used by replay_clip only; not applicable to true streaming)
         self._flux_modes_winsor_enable = bool(flux_modes_winsor_enable)
@@ -1385,11 +1434,45 @@ class RainFrameClassifierState:
         self._prev_frame_1: Optional[np.ndarray] = None
         self._prev_frame_2: Optional[np.ndarray] = None
 
-        # Audio ring buffer: n_fft + hop samples so extract_td_features_inline
-        # returns 2 frames and we take the last one.
-        self._audio_buf: np.ndarray = np.zeros(n_fft + hop, dtype=dtype)
+        # TD audio ring buffer.
+        # Holds exactly one STFT frame worth of filtered audio aligned to the
+        # current detector frame. The newest `hop` samples are appended each
+        # call while preserving causal filter state across hops.
+        #
+        # This intentionally assumes TD subframes are aligned to STFT frame
+        # boundaries so offline and streaming TD extraction share the same
+        # timing convention.
+        self._audio_buf: np.ndarray = np.zeros(n_fft, dtype=dtype)
+
+        # Raw audio ring buffer: holds exactly one STFT frame of unfiltered
+        # audio for raw spectral-shape features.
+        self._raw_audio_buf: np.ndarray = np.zeros(n_fft, dtype=dtype)
 
         self._frame_idx: int = 0
+        self._audio_seeded: bool = False  # True after seed_audio() is called
+
+        # Hann window for frame-level FFT (used by process_audio_frame).
+        self._hann_window: np.ndarray = np.hanning(n_fft).astype(dtype)
+
+        # Causal noise PSD tracker for process_audio_frame.
+        # Tracks the per-bin noise baseline in the operating band, updated
+        # one frame at a time.  Reset alongside other streaming state.
+        n_band_bins = int(np.sum(band_mask))
+        self._noise_tracker = CausalNoiseTracker(
+            n_bins=n_band_bins,
+            q=float(noise_tracker_q),
+            fs=int(fs),
+            hop=int(hop),
+            win_sec=float(noise_tracker_win_sec),
+            ema_up=float(noise_tracker_ema_up),
+            ema_down=float(noise_tracker_ema_down),
+            eps=float(eps),
+            noise_psd_max_ratio=float(noise_tracker_max_ratio),
+            adaptive_q_enable=bool(noise_tracker_adaptive_q_enable),
+            adaptive_q_min=float(noise_tracker_adaptive_q_min),
+            adaptive_q_alpha=float(noise_tracker_adaptive_q_alpha),
+            dtype=dtype,
+        )
 
     # ------------------------------------------------------------------
     # State management
@@ -1400,15 +1483,172 @@ class RainFrameClassifierState:
         self._prev_frame_1 = None
         self._prev_frame_2 = None
         self._audio_buf[:] = 0.0
+        self._raw_audio_buf[:] = 0.0
         self._frame_idx = 0
+        self._audio_seeded = False
         self._total_flux_cap = None
+        self._hp_zi_live = self._hp_zi.copy() if self._hp_zi is not None else None
+        self._noise_tracker.reset()
         self._combined_tracker.reset()
         for tracker in self._mode_trackers:
             tracker.reset()
 
+    def seed_audio(self, chunk: np.ndarray) -> None:
+        """
+        Warm up the IIR prefilter and rolling audio buffers with one hop of
+        audio before the frame loop begins.
+
+        Call once after reset(), passing x[0:hop].  After this call, each
+        subsequent process_frame() should pass the *completing* hop for STFT
+        frame t — i.e., x[(t+1)*hop:(t+2)*hop] — so that the rolling buffer
+        holds exactly x[t*hop:(t+2)*hop], the STFT analysis window for frame t.
+
+        Sets _audio_seeded to True so _extract_frame_features() runs on the
+        first process_frame() or process_audio_frame() call.  _frame_idx is
+        left at 0 so the first STFT frame is correctly recorded as frame 0.
+        """
+        dtype = self._dtype
+        chunk = np.asarray(chunk, dtype=dtype).reshape(-1)
+        shift = min(chunk.size, self._hop)
+        chunk = chunk[-shift:]
+
+        self._raw_audio_buf = np.roll(self._raw_audio_buf, -shift)
+        self._raw_audio_buf[-shift:] = chunk
+
+        self._audio_buf = np.roll(self._audio_buf, -shift)
+        if self._hp_zi_live is not None:
+            filtered, self._hp_zi_live = spsig.sosfilt(
+                self._hp_sos, chunk, zi=self._hp_zi_live
+            )
+            self._audio_buf[-shift:] = filtered.astype(dtype, copy=False)
+        else:
+            self._audio_buf[-shift:] = chunk
+
+        self._audio_seeded = True
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _update_audio_buffers(self, chunk: np.ndarray) -> None:
+        """
+        Push one hop-sized audio chunk into both rolling audio buffers.
+
+        Applies the causal IIR prefilter to the new chunk before writing to
+        the filtered TD buffer.  Only the new hop-sized region is filtered —
+        the overlapping portion already in the buffer is left unchanged so
+        that filter state carries correctly across frames.
+        """
+        dtype = self._dtype
+        chunk = np.asarray(chunk, dtype=dtype).reshape(-1)
+        if chunk.size > self._hop:
+            chunk = chunk[-self._hop:]
+        shift = min(chunk.size, self._hop)
+
+        self._raw_audio_buf = np.roll(self._raw_audio_buf, -shift)
+        self._raw_audio_buf[-shift:] = chunk[-shift:]
+
+        self._audio_buf = np.roll(self._audio_buf, -shift)
+        if self._hp_zi_live is not None:
+            filtered_new, self._hp_zi_live = spsig.sosfilt(
+                self._hp_sos, chunk[-shift:], zi=self._hp_zi_live,
+            )
+            self._audio_buf[-shift:] = filtered_new.astype(dtype, copy=False)
+        else:
+            self._audio_buf[-shift:] = chunk[-shift:]
+
+    def _extract_frame_features(
+        self,
+        precomputed_power: "Optional[np.ndarray]" = None,
+    ) -> "Tuple[Dict[str, float], Dict[str, float]]":
+        """
+        Extract TD and raw-spectral features from the current rolling buffers.
+
+        TD features are always extracted with td_input_mode="default": the
+        rolling _audio_buf already holds causally prefiltered audio, so no
+        additional filtering is applied here.
+
+        Raw-spectral features always use a pre-computed FFT frame.  When
+        precomputed_power is not provided (process_frame path), _compute_fft_frame
+        is called once here so no second STFT is needed inside
+        extract_raw_spectral_shape_features_inline.
+
+        Returns empty dicts if the buffer has not been populated yet or on any
+        extraction error.  Skips frame 0 only when seed_audio() was not called
+        (cold-start: buffer is half-filled with zeros).
+        """
+        if self._frame_idx == 0 and not self._audio_seeded:
+            return {}, {}
+
+        if precomputed_power is None:
+            precomputed_power = self._compute_fft_frame()
+
+        eps = self._eps
+        td_features: Dict[str, float] = {}
+        try:
+            td_raw = extract_td_features_inline(
+                x=self._audio_buf,
+                fs=self._fs,
+                frame_len=self._n_fft,
+                hop=self._n_fft,
+                operating_band=self._op_band,
+                mode_bands=self._mode_bands,
+                td_input_mode="default",
+                td_input_band=None,
+                bp_order=self._td_soft_bp_order,
+                subframe_len=self._td_soft_subframe_len,
+                subframe_hop=self._td_soft_subframe_hop,
+                envelope_features_enable=self._td_envelope_features_enable,
+                block_energy_len=self._td_block_energy_len,
+                block_energy_hop=self._td_block_energy_hop,
+                block_energy_post_pre_blocks=self._td_block_energy_post_pre_blocks,
+                block_energy_smooth_enable=self._td_block_energy_smooth_enable,
+                process_dtype=self._process_dtype_str,
+                eps=eps,
+            )
+            for k, v in td_raw.items():
+                arr = np.asarray(v).reshape(-1)
+                if arr.size:
+                    td_features[k] = float(arr[0])
+        except Exception:  # noqa: BLE001
+            pass
+
+        raw_spectral_features: Dict[str, float] = {}
+        if self._raw_spectral_shape_enable:
+            try:
+                rs_raw = extract_raw_spectral_shape_features_inline(
+                    fs=self._fs,
+                    n_fft=self._n_fft,
+                    hop=self._n_fft,
+                    operating_band=self._op_band,
+                    rain_band=self._raw_spectral_rain_band,
+                    low_band=self._raw_spectral_low_band,
+                    mode_bands=self._mode_bands,
+                    rolloff_fraction=self._raw_spectral_rolloff_fraction,
+                    process_dtype=self._process_dtype_str,
+                    eps=eps,
+                    raw_power=np.asarray(precomputed_power, dtype=np.float64).reshape(-1, 1),
+                    freqs=self._freqs,
+                )
+                for k, v in rs_raw.items():
+                    arr = np.asarray(v).reshape(-1)
+                    if arr.size:
+                        raw_spectral_features[k] = float(arr[0])
+            except Exception:  # noqa: BLE001
+                pass
+
+        return td_features, raw_spectral_features
+
+    def _compute_fft_frame(self) -> np.ndarray:
+        """
+        Compute the magnitude-squared FFT of the current raw audio buffer.
+
+        Applies the pre-built Hann window and returns shape (n_fft//2+1,),
+        matching the librosa frequency grid stored in self._freqs.
+        """
+        windowed = self._hann_window * self._raw_audio_buf
+        spectrum = np.fft.rfft(windowed, n=self._n_fft)
+        return (np.abs(spectrum).astype(self._dtype)) ** 2
 
     def _build_sos(self, mode: str):
         """Build SOS prefilter for the given mode ("highpass" or "bandpass")."""
@@ -1584,22 +1824,37 @@ class RainFrameClassifierState:
         frame_time: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Classify one spectral frame using the true streaming path.
+        Classify one spectral frame using the causal streaming path.
 
-        This method is intended for causal / embedded execution and is not
-        expected to be bitwise-equivalent to replay_clip(), because it uses
-        only the current rolling audio buffer and cannot use future context.
+        Intended for frame-by-frame embedded or real-time execution.  Not
+        bitwise-equivalent to replay_clip() due to three known causal constraints:
+
+        1. Prefilter: uses causal sosfilt with persistent zi state (vs non-causal
+           sosfiltfilt over the full clip in replay_clip).  Causes a short filter
+           warm-up transient on the first few frames after reset().
+        2. TD filtering: streaming mode uses causal sosfilt with persistent
+           filter state and computes TD features from the same STFT-aligned
+           analysis frame used by the detector. replay_clip may still differ
+           slightly because the offline path can use non-causal filtering.
+        3. Winsorization: clip-level 99th-percentile flux cap cannot be computed
+           without future frames.  _total_flux_cap is always None here, so
+           high-flux outlier frames score slightly higher than in replay_clip.
+
         Use replay_clip() for offline golden-regression parity checks.
 
         Parameters
         ----------
         frame_spectrum : array, shape (F,)
-            One column of the novelty/power spectrogram (same F axis as freqs).
+            One column of the noise-normalised log-power spectrogram (same F
+            axis as freqs).  Caller is responsible for noise normalisation
+            before this call.
         frame_audio : array, shape (~hop,), optional
-            Raw audio samples for this frame. Used for TD and raw-spectral
-            feature extraction. Omitting disables those features.
+            Raw (unfiltered) audio completing hop for STFT frame t:
+            x[(t+1)*hop:(t+2)*hop].  When seed_audio(x[0:hop]) has been called
+            before the loop, this exactly aligns TD/FD features with the STFT
+            analysis window.  Omitting disables TD and raw-spectral features.
         frame_time : float, optional
-            Absolute time offset in seconds. Defaults to frame_idx * hop / fs.
+            Absolute time offset in seconds.  Defaults to frame_idx * hop / fs.
 
         Returns
         -------
@@ -1619,63 +1874,89 @@ class RainFrameClassifierState:
         raw_spectral_features: Dict[str, float] = {}
 
         if frame_audio is not None:
-            chunk = np.asarray(frame_audio, dtype=dtype).reshape(-1)
-            shift = min(chunk.size, self._audio_buf.size)
-            self._audio_buf = np.roll(self._audio_buf, -shift)
-            self._audio_buf[-shift:] = chunk[-shift:]
-
-            # Skip frame 0: buffer only has the current hop, no prior context.
-            if self._frame_idx > 0:
-                try:
-                    td_raw = extract_td_features_inline(
-                        x=self._audio_buf,
-                        fs=self._fs,
-                        frame_len=self._n_fft,
-                        hop=self._hop,
-                        operating_band=self._op_band,
-                        mode_bands=self._mode_bands,
-                        td_input_mode=self._td_input_mode,
-                        td_input_band=self._td_input_band,
-                        bp_order=self._td_soft_bp_order,
-                        subframe_len=self._td_soft_subframe_len,
-                        subframe_hop=self._td_soft_subframe_hop,
-                        envelope_features_enable=self._td_envelope_features_enable,
-                        block_energy_len=self._td_block_energy_len,
-                        block_energy_hop=self._td_block_energy_hop,
-                        block_energy_post_pre_blocks=self._td_block_energy_post_pre_blocks,
-                        block_energy_smooth_enable=self._td_block_energy_smooth_enable,
-                        process_dtype=self._process_dtype_str,
-                        eps=eps,
-                    )
-                    # Buffer holds 2 frames; take the last (current frame).
-                    td_features = {k: float(np.asarray(v).reshape(-1)[-1]) for k, v in td_raw.items() if np.ndim(v) > 0}
-                except Exception:  # noqa: BLE001
-                    td_features = {}
-
-                if self._raw_spectral_shape_enable:
-                    try:
-                        rs_raw = extract_raw_spectral_shape_features_inline(
-                            x=self._audio_buf,
-                            fs=self._fs,
-                            n_fft=self._n_fft,
-                            hop=self._hop,
-                            operating_band=self._op_band,
-                            rain_band=self._raw_spectral_rain_band,
-                            low_band=self._raw_spectral_low_band,
-                            mode_bands=self._mode_bands,
-                            rolloff_fraction=self._raw_spectral_rolloff_fraction,
-                            process_dtype=self._process_dtype_str,
-                            eps=eps,
-                            raw_power=None,
-                            freqs=self._freqs,
-                        )
-                        raw_spectral_features = {
-                            k: float(np.asarray(v).reshape(-1)[-1]) for k, v in rs_raw.items() if np.ndim(v) > 0
-                        }
-                    except Exception:  # noqa: BLE001
-                        raw_spectral_features = {}
+            # When seed_audio(x[0:hop]) is called before the loop and
+            # frame_audio carries the completing hop x[(t+1)*hop:(t+2)*hop],
+            # the rolling buffer holds x[t*hop:(t+2)*hop] — the STFT analysis
+            # window for frame t. Without seeding the buffer lags by one hop.
+            self._update_audio_buffers(frame_audio)
+            td_features, raw_spectral_features = self._extract_frame_features()
 
         return self._decide_frame(frame_spectrum, td_features, raw_spectral_features, frame_time)
+
+    def process_audio_frame(
+        self,
+        chunk: np.ndarray,
+        is_rain: bool = False,
+        frame_time: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fully frame-level entry point: raw audio in, classifier decision out.
+
+        Computes the FFT frame from the rolling raw audio buffer, runs the
+        embedded CausalNoiseTracker to produce a noise-normalised spectrum,
+        extracts TD and raw-spectral features, and calls _decide_frame().
+
+        No pre-computed spectrogram is required.  The entire pipeline runs
+        frame by frame with no future-audio look-ahead.
+
+        Call seed_audio(x[0:hop]) once after reset() before starting the loop,
+        then pass the completing hop x[(t+1)*hop:(t+2)*hop] for each STFT
+        frame t so the rolling buffer aligns to x[t*hop:(t+2)*hop].
+
+        Parameters
+        ----------
+        chunk : array, shape (~hop,)
+            Completing hop of raw audio for STFT frame t.
+        is_rain : bool, optional
+            Whether the previous frame was classified as rain.  Used to gate
+            the noise tracker (rain frames do not update the noise baseline
+            outside warm-up).  Pass the frame_class from the previous call.
+        frame_time : float, optional
+            Absolute time in seconds.  Defaults to frame_idx * hop / fs.
+
+        Returns
+        -------
+        dict
+            Same keys as process_frame(): frame_class, rain_conf, per-mode
+            flux scalars, TD feature scalars, raw-spectral scalars,
+            frame_idx, frame_time.  Also includes ``noise_floor_db`` — the
+            per-frame noise estimate (mean over operating band, in dB).
+        """
+        dtype = self._dtype
+        eps = self._eps
+
+        # 1) Update rolling audio buffers (filtered + raw)
+        self._update_audio_buffers(chunk)
+
+        # 2) FFT frame from the raw audio buffer
+        P_t = self._compute_fft_frame()  # (n_fft//2+1,)
+
+        # 3) Causal noise normalisation.
+        # On the first call, seed the tracker from the observed power so the
+        # initial estimate matches the batch path (which seeds from P[:, 0]).
+        P_band_t = P_t[self._band_mask]
+        if self._noise_tracker.current_estimate is None:
+            self._noise_tracker.reset(first_frame=P_band_t)
+        N_band_t = self._noise_tracker.update(P_band_t, is_rain=bool(is_rain))
+
+        frame_spectrum = np.zeros(len(self._freqs), dtype=dtype)
+        frame_spectrum[self._band_mask] = (
+            10.0 * np.log10(P_band_t + eps) - 10.0 * np.log10(N_band_t + eps)
+        )
+
+        # 4) TD and raw-spectral features from the rolling buffers.
+        # Pass P_t so extract_raw_spectral_shape_features_inline reuses the
+        # already-computed FFT frame instead of running a second STFT.
+        td_features, raw_spectral_features = self._extract_frame_features(
+            precomputed_power=P_t
+        )
+
+        # 5) Append mean noise floor for diagnostics
+        result = self._decide_frame(frame_spectrum, td_features, raw_spectral_features, frame_time)
+        result["noise_floor_db"] = float(
+            10.0 * np.log10(float(np.mean(N_band_t)) + eps)
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Convenience: replay a full clip (for regression testing)
@@ -1770,8 +2051,18 @@ class RainFrameClassifierState:
 
             if self._raw_spectral_shape_enable:
                 try:
+                    # Compute raw power spectrogram from audio (centre=False, Hann window),
+                    # consistent with the main STFT convention.  One numpy FFT per frame;
+                    # no scipy STFT needed here.
+                    _hann = np.hanning(self._n_fft).astype(np.float64)
+                    _rs_power = np.zeros((len(self._freqs), T), dtype=np.float64)
+                    for _t in range(T):
+                        _s = _t * self._hop
+                        _seg = np.asarray(x_in[_s : _s + self._n_fft], dtype=np.float64)
+                        if _seg.size < self._n_fft:
+                            _seg = np.pad(_seg, (0, self._n_fft - _seg.size))
+                        _rs_power[:, _t] = np.abs(np.fft.rfft(_hann * _seg, n=self._n_fft)) ** 2
                     all_rs = extract_raw_spectral_shape_features_inline(
-                        x=x_in,
                         fs=self._fs,
                         n_fft=self._n_fft,
                         hop=self._hop,
@@ -1782,8 +2073,8 @@ class RainFrameClassifierState:
                         rolloff_fraction=self._raw_spectral_rolloff_fraction,
                         process_dtype=self._process_dtype_str,
                         eps=eps,
-                        raw_power=None,
-                        freqs=self._freqs,
+                        raw_power=_rs_power,
+                        freqs=self._freqs.astype(np.float64),
                     )
                 except Exception:  # noqa: BLE001
                     all_rs = None
@@ -1899,4 +2190,13 @@ class RainFrameClassifierState:
             hp_order=int(dget("hp_order", 4)),
             flux_modes_winsor_enable=bool(dget("flux_modes_winsor_enable", False)),
             flux_modes_winsor_q=float(np.clip(dget("flux_modes_winsor_q", 99.0), 50.0, 100.0)),
+            # Noise tracker params — read from top-level cfg (not detector sub-dict)
+            noise_tracker_q=float(dget("q", 0.25)),
+            noise_tracker_win_sec=float(dget("win_sec", 0.5)),
+            noise_tracker_ema_up=float(dget("ema_up", 0.6)),
+            noise_tracker_ema_down=float(dget("ema_down", 0.95)),
+            noise_tracker_max_ratio=float(dget("noise_psd_max_ratio", 1.0)),
+            noise_tracker_adaptive_q_enable=bool(dget("adaptive_q_enable", False)),
+            noise_tracker_adaptive_q_min=float(dget("adaptive_q_min", 0.10)),
+            noise_tracker_adaptive_q_alpha=float(dget("adaptive_q_alpha", 0.95)),
         )

@@ -14,6 +14,7 @@ from audio_processing_tools.edge.rain_frame_classifier import (
     FrameClass,
     RainFrameClassifierState,
 )
+from audio_processing_tools.edge.noise_tracker import CausalNoiseTracker
 
 
 @dataclass
@@ -192,6 +193,25 @@ class NoiseProcessorConfig:
     # batch detector path. It does not validate the true causal process_frame()
     # streaming path, which should be tested separately.
     run_frame_level_comparison: bool = False
+
+    # When True, RainFrameClassifierState.process_frame() is called once per
+    # spectral frame using audio chunks aligned to each hop boundary, simulating
+    # true causal streaming.  The result is stored under "streaming_comparison".
+    #
+    # Expected differences vs replay_clip / _detect_rain_over_time:
+    #   - Prefilter warm-up: first ~n_fft/hop frames have no prior audio context
+    #   - TD timing: rolling buffer causes a 1-frame lag on TD gate transitions
+    #   - Winsorization: per-clip 99th-pct flux cap is not available causally
+    run_streaming_comparison: bool = False
+
+    # When True, runs replay_clip() with flux_modes_winsor_enable forced to False,
+    # independent of the detector config.  Stored under "nowinsor_replay_comparison".
+    #
+    # Use this alongside run_streaming_comparison to compare process_frame() against
+    # a winsorization-free replay_clip reference, isolating only the causal differences:
+    #   - Prefilter warm-up (sosfilt vs sosfiltfilt)
+    #   - TD gate timing offset (1-frame lag in rolling buffer)
+    run_nowinsor_replay: bool = False
 
     # -----------------------------------------------------------
     # Nested detector configuration (framework-friendly)
@@ -565,118 +585,26 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             mask |= (fb >= lo) & (fb <= hi)
         return mask
 
-    def _init_noise_psd_tracker(self, first_band_frame: np.ndarray, W: int) -> Dict[str, Any]:
-        """
-        Initialize state for causal frame-wise noise PSD tracking.
-        """
+    def _make_noise_tracker(self, n_bins: int, sr: Optional[int] = None) -> CausalNoiseTracker:
+        """Build a CausalNoiseTracker configured from this processor's cfg."""
         cfg = self.cfg
-        dtype = self._work_dtype()
-
-        eta = float(2.0 / max(W + 1, 2))
-        eta = float(np.clip(eta, 1e-4, 1.0))
-        scale_alpha = float(cfg.ema_down)
-        step_floor = float(max(cfg.eps, 1e-9))
-        maxr = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
-        maxr = 1.0 if (not np.isfinite(maxr)) else float(np.clip(maxr, 0.0, 1.0))
-
-        adaptive_q_enable = bool(getattr(cfg, "adaptive_q_enable", False))
-        adaptive_q_base = float(getattr(cfg, "q", 0.25))
-        adaptive_q_min = float(getattr(cfg, "adaptive_q_min", 0.10))
-        adaptive_q_min = float(np.clip(adaptive_q_min, 1e-4, adaptive_q_base))
-        adaptive_q_alpha = float(getattr(cfg, "adaptive_q_alpha", 0.95))
-        adaptive_q_alpha = float(np.clip(adaptive_q_alpha, 0.0, 1.0))
-
-        return {
-            "tracker": np.maximum(np.asarray(first_band_frame, dtype=dtype).copy(), 0.0),
-            "tracker_scale": np.maximum(np.abs(np.asarray(first_band_frame, dtype=dtype)), step_floor),
-            "warmup_count": 0,
-            "warmup_need": max(10, W // 2),
-            "eta": eta,
-            "scale_alpha": scale_alpha,
-            "step_floor": step_floor,
-            "ema_up": float(cfg.ema_up),
-            "ema_down": float(cfg.ema_down),
-            "maxr": maxr,
-            "adaptive_q_enable": adaptive_q_enable,
-            "adaptive_q_base": adaptive_q_base,
-            "adaptive_q_min": adaptive_q_min,
-            "adaptive_q_alpha": adaptive_q_alpha,
-            "rain_prev_ema": 0.0,
-        }
-
-    def _update_noise_psd_frame(
-        self,
-        P_band: np.ndarray,
-        is_rain_t: bool,
-        prev_N_band: Optional[np.ndarray],
-        state: Dict[str, Any],
-    ) -> np.ndarray:
-        """
-        Update the causal noise PSD tracker using one frame and return N(t).
-        """
-        cfg = self.cfg
-        dtype = self._work_dtype()
-
-        tracker = state["tracker"]
-        tracker_scale = state["tracker_scale"]
-        warmup_count = int(state["warmup_count"])
-        warmup_need = int(state["warmup_need"])
-        eta = float(state["eta"])
-        scale_alpha = float(state["scale_alpha"])
-        step_floor = float(state["step_floor"])
-        ema_up = float(state["ema_up"])
-        ema_down = float(state["ema_down"])
-        maxr = float(state["maxr"])
-
-        adaptive_q_enable = bool(state.get("adaptive_q_enable", False))
-        adaptive_q_base = float(state.get("adaptive_q_base", cfg.q))
-        adaptive_q_min = float(state.get("adaptive_q_min", adaptive_q_base))
-        adaptive_q_alpha = float(state.get("adaptive_q_alpha", 0.95))
-        rain_prev_ema = float(state.get("rain_prev_ema", 0.0))
-
-        P_band = np.asarray(P_band, dtype=dtype)
-        allow_update = (warmup_count < warmup_need) or (not bool(is_rain_t))
-
-        if prev_N_band is None:
-            raw_q = tracker
-            if allow_update:
-                warmup_count += 1
-        else:
-            err = P_band - tracker
-            tracker_scale = scale_alpha * tracker_scale + (1.0 - scale_alpha) * np.abs(err)
-            step = eta * np.maximum(tracker_scale, step_floor)
-
-            if adaptive_q_enable:
-                q_eff = adaptive_q_base - (adaptive_q_base - adaptive_q_min) * rain_prev_ema
-                q_eff = float(np.clip(q_eff, adaptive_q_min, adaptive_q_base))
-            else:
-                q_eff = float(cfg.q)
-
-            delta = np.where(P_band >= tracker, q_eff * step, -(1.0 - q_eff) * step)
-            candidate = np.maximum(tracker + delta, 0.0)
-
-            if allow_update:
-                tracker = candidate
-                warmup_count += 1
-
-            raw_q = tracker
-
-        if prev_N_band is None:
-            N_band = raw_q
-        else:
-            up = raw_q > prev_N_band
-            lam = np.where(up, ema_up, ema_down)
-            N_band = lam * prev_N_band + (1.0 - lam) * raw_q
-
-        N_band = np.minimum(N_band, maxr * P_band)
-        N_band = np.maximum(N_band, 0.0).astype(dtype, copy=False)
-
-        rain_prev_ema = adaptive_q_alpha * rain_prev_ema + (1.0 - adaptive_q_alpha) * float(bool(is_rain_t))
-        state["rain_prev_ema"] = rain_prev_ema
-        state["tracker"] = tracker
-        state["tracker_scale"] = tracker_scale
-        state["warmup_count"] = warmup_count
-        return N_band
+        if sr is None:
+            sr = cfg.fs
+        return CausalNoiseTracker(
+            n_bins=n_bins,
+            q=float(cfg.q),
+            fs=int(sr),
+            hop=int(cfg.hop),
+            win_sec=float(cfg.win_sec),
+            ema_up=float(cfg.ema_up),
+            ema_down=float(cfg.ema_down),
+            eps=float(cfg.eps),
+            noise_psd_max_ratio=float(getattr(cfg, "noise_psd_max_ratio", 1.0)),
+            adaptive_q_enable=bool(getattr(cfg, "adaptive_q_enable", False)),
+            adaptive_q_min=float(getattr(cfg, "adaptive_q_min", 0.10)),
+            adaptive_q_alpha=float(getattr(cfg, "adaptive_q_alpha", 0.95)),
+            dtype=self._work_dtype(),
+        )
 
     def _estimate_noise_psd_fft(
         self,
@@ -690,10 +618,6 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         op_lo, op_hi = cfg.operating_band
         band_mask = (freqs >= op_lo) & (freqs <= op_hi)
-        if sr is None:
-            sr = cfg.fs
-        frames_per_sec = float(sr) / float(cfg.hop)
-        W = max(10, int(cfg.win_sec * frames_per_sec))
 
         # Extract band power
         P_band_all = P[band_mask, :]  # (K, T)
@@ -710,20 +634,13 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
         if K == 0 or T == 0:
             return noise_psd
 
-        state = self._init_noise_psd_tracker(P_band_all[:, 0], W)
-        prev_N_band = None
+        tracker = self._make_noise_tracker(n_bins=K, sr=sr)
+        tracker.reset(first_frame=P_band_all[:, 0])
 
-        # is_rain_for_psd indicates which frames are excluded from PSD updates (True = exclude).
+        # is_rain_for_psd: True = exclude this frame from PSD updates.
         for t in range(T):
-            P_band = P_band_all[:, t]
-            N_band = self._update_noise_psd_frame(
-                P_band=P_band,
-                is_rain_t=bool(is_rain_for_psd[t]),
-                prev_N_band=prev_N_band,
-                state=state,
-            )
+            N_band = tracker.update(P_band_all[:, t], is_rain=bool(is_rain_for_psd[t]))
             noise_psd[band_mask, t] = N_band
-            prev_N_band = N_band
 
         # Optional causal median smoothing over time (per frequency) after stochastic tracking
         m = int(getattr(cfg, "median_frames", 0))
@@ -833,7 +750,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             hop_length=cfg.hop,
             win_length=cfg.n_fft,
             window="hann",
-            center=True,
+            center=False,
         )
         P = (np.abs(S).astype(work_dtype, copy=False)) ** 2
         freqs = np.asarray(librosa.fft_frequencies(sr=sr, n_fft=cfg.n_fft), dtype=work_dtype)
@@ -938,6 +855,70 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             except Exception as _e:
                 _frame_level_result = {"error": f"{type(_e).__name__}: {_e}"}
 
+        # Causal streaming comparison path (validation only, default off).
+        # Calls process_frame() once per spectral column, passing the hop-aligned
+        # audio chunk so the causal prefilter state and TD rolling buffer are
+        # exercised exactly as they would be in a real-time deployment.
+        _run_sc = bool(
+            getattr(cfg, "run_streaming_comparison", False)
+            or (getattr(cfg, "detector", None) or {}).get("run_streaming_comparison", False)
+        )
+        _streaming_result: Optional[Dict[str, Any]] = None
+        if _run_sc and not bypass_classifier:
+            try:
+                _fls_sc = RainFrameClassifierState.from_mixin(self, freqs)
+                _fls_sc.reset()
+                _sc_frames = []
+                _hop = int(cfg.hop)
+                _times_arr = np.asarray(times, dtype=work_dtype)
+                # Seed IIR state with x[0:hop] so process_frame() receives the
+                # completing hop x[(t+1)*hop:(t+2)*hop] and the rolling buffer
+                # aligns exactly to the STFT analysis window x[t*hop:(t+2)*hop].
+                _seed = x[:_hop] if len(x) >= _hop else x
+                if len(_seed) > 0:
+                    _fls_sc.seed_audio(np.asarray(_seed, dtype=work_dtype))
+                for _t in range(T):
+                    # Completing hop: second half of the STFT analysis window for
+                    # frame t.  Combined with the seeded first hop, the rolling
+                    # buffer holds x[t*hop:(t+2)*hop] = STFT frame t exactly.
+                    _c_start = (_t + 1) * _hop
+                    _c_end = _c_start + _hop
+                    _chunk = x[_c_start:_c_end] if _c_end <= len(x) else x[_c_start:]
+                    _sc_frames.append(
+                        _fls_sc.process_frame(
+                            P_for_detection[:, _t],
+                            frame_audio=_chunk if len(_chunk) > 0 else None,
+                            frame_time=float(_times_arr[_t]),
+                        )
+                    )
+                if _sc_frames:
+                    _sc_keys = list(_sc_frames[0].keys())
+                    _streaming_result = {k: np.array([f[k] for f in _sc_frames]) for k in _sc_keys}
+            except Exception as _e:
+                _streaming_result = {"error": f"{type(_e).__name__}: {_e}"}
+
+        # No-winsor replay_clip reference (validation only, default off).
+        # Identical to the replay_clip path but with flux_modes_winsor_enable forced
+        # False, so it matches what process_frame() can produce causally.
+        # Comparing streaming_comparison vs nowinsor_replay_comparison isolates only
+        # the genuine causal differences: filter warm-up and TD timing offset.
+        _run_nwr = bool(
+            getattr(cfg, "run_nowinsor_replay", False)
+            or (getattr(cfg, "detector", None) or {}).get("run_nowinsor_replay", False)
+        )
+        _nowinsor_result: Optional[Dict[str, Any]] = None
+        if _run_nwr and not bypass_classifier:
+            try:
+                _fls_nw = RainFrameClassifierState.from_mixin(self, freqs)
+                _fls_nw._flux_modes_winsor_enable = False
+                _nowinsor_result = _fls_nw.replay_clip(
+                    P_for_detection,
+                    audio=x,
+                    frame_times=np.asarray(times, dtype=work_dtype),
+                )
+            except Exception as _e:
+                _nowinsor_result = {"error": f"{type(_e).__name__}: {_e}"}
+
         frame_class = np.asarray(frame_class, dtype=np.int8)
         is_rain = frame_class == FrameClass.RAIN
         is_noise = frame_class == FrameClass.NOISE
@@ -1029,6 +1010,10 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 result["S_hat"] = S
             if _frame_level_result is not None:
                 result["frame_level_comparison"] = _frame_level_result
+            if _streaming_result is not None:
+                result["streaming_comparison"] = _streaming_result
+            if _nowinsor_result is not None:
+                result["nowinsor_replay_comparison"] = _nowinsor_result
 
             return result
 
@@ -1152,7 +1137,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                     hop_length=cfg.hop,
                     win_length=cfg.n_fft,
                     window="hann",
-                    center=True,
+                    center=False,
                     length=len(x),
                 ).astype(work_dtype, copy=False)
                 # Choose output waveform:
@@ -1227,6 +1212,10 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
             result["noise_psd"] = noise_psd
         if _frame_level_result is not None:
             result["frame_level_comparison"] = _frame_level_result
+        if _streaming_result is not None:
+            result["streaming_comparison"] = _streaming_result
+        if _nowinsor_result is not None:
+            result["nowinsor_replay_comparison"] = _nowinsor_result
 
         return result
 
@@ -1377,5 +1366,9 @@ class RainDetectorProcessor(BaseProcessor):
 
         if "frame_level_comparison" in out:
             state["frame_level_comparison"] = out["frame_level_comparison"]
+        if "streaming_comparison" in out:
+            state["streaming_comparison"] = out["streaming_comparison"]
+        if "nowinsor_replay_comparison" in out:
+            state["nowinsor_replay_comparison"] = out["nowinsor_replay_comparison"]
 
         return metrics, state
