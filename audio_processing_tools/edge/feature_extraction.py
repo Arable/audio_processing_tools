@@ -61,6 +61,8 @@ def resolve_np_dtype(process_dtype: str) -> Any:
 
     return np.dtype(process_dtype).type
 
+
+
 # --- Helper for clip-level spectral occupancy ---
 def default_spectral_occupancy_bands() -> Tuple[Tuple[str, float, float], ...]:
     """Default semantic frequency bands for clip-level spectral occupancy."""
@@ -449,20 +451,30 @@ def extract_td_features_inline(
         out = np.zeros(n_frames, dtype=dtype)
         if n_frames == 0 or sub_vals.size == 0:
             return out
-        padded = np.zeros(n_frames + 1, dtype=dtype)
-        ncopy = min(sub_vals.size, n_frames + 1)
-        padded[:ncopy] = sub_vals[:ncopy]
-        return np.maximum(padded[:-1], padded[1:])
+        # Number of new subframes per STFT hop and total subframes per STFT frame.
+        # When frame_len == hop (streaming), subs_per_hop == subs_per_frame == k.
+        # When hop < frame_len (overlapping STFT), subs_per_hop < subs_per_frame.
+        subs_per_hop = max(1, int(round(float(hop) / float(subframe_hop))))
+        subs_per_frame = max(1, int(round(float(frame_len) / float(subframe_hop))))
+        for t in range(n_frames):
+            s0 = t * subs_per_hop
+            s1 = min(sub_vals.size, s0 + subs_per_frame)
+            if s1 > s0:
+                out[t] = float(np.max(sub_vals[s0:s1]))
+        return out
 
     def _frame_sum_from_subframes(sub_vals: np.ndarray, n_frames: int) -> np.ndarray:
         sub_vals = np.asarray(sub_vals, dtype=dtype).reshape(-1)
         out = np.zeros(n_frames, dtype=dtype)
         if n_frames == 0 or sub_vals.size == 0:
             return out
+        subs_per_hop = max(1, int(round(float(hop) / float(subframe_hop))))
+        subs_per_frame = max(1, int(round(float(frame_len) / float(subframe_hop))))
         for t in range(n_frames):
-            v0 = sub_vals[t] if t < sub_vals.size else 0.0
-            v1 = sub_vals[t + 1] if (t + 1) < sub_vals.size else 0.0
-            out[t] = float(v0 + v1)
+            s0 = t * subs_per_hop
+            s1 = min(sub_vals.size, s0 + subs_per_frame)
+            if s1 > s0:
+                out[t] = float(np.sum(sub_vals[s0:s1]))
         return out
 
     td_mode = str(td_input_mode).lower()
@@ -538,10 +550,96 @@ def extract_td_features_inline(
     }
 
 
+def extract_td_features_causal_frame_inline(
+    *,
+    x: np.ndarray,
+    n_frames: int,
+    fs: int,
+    frame_len: int,
+    hop: int,
+    operating_band: Tuple[float, float],
+    mode_bands: Optional[Tuple[Tuple[float, float], ...]],
+    td_input_mode: str,
+    td_input_band: Optional[Tuple[float, float]],
+    bp_order: int,
+    subframe_len: int,
+    subframe_hop: int,
+    block_energy_len: int,
+    block_energy_hop: Optional[int],
+    block_energy_post_pre_blocks: int,
+    block_energy_smooth_enable: bool,
+    envelope_features_enable: bool,
+    process_dtype: str = "float32",
+    eps: float = 1e-9,
+) -> Dict[str, np.ndarray]:
+    """
+    Causal frame-aligned TD feature extraction.
+
+    For frame t, compute TD features only from samples in the causal FFT
+    analysis window:
+
+        x[t * hop : t * hop + frame_len]
+
+    This mirrors embedded streaming behavior where frame decisions are emitted
+    only after the current FFT window has fully arrived.
+
+    Unlike extract_td_features_inline(), this avoids retrospective full-clip
+    TD extraction timing.
+
+    The caller is responsible for applying any desired causal prefilter before
+    calling this function. This helper only controls the TD frame timing.
+    """
+    dtype = resolve_np_dtype(process_dtype)
+    x = np.asarray(x, dtype=dtype).reshape(-1)
+
+    out: Dict[str, list[float]] = {name: [] for name in TD_FEATURE_NAMES}
+
+    for t in range(int(n_frames)):
+        start = int(t * hop)
+        end = int(start + frame_len)
+
+        frame_x = x[start:end]
+
+        # Zero-pad final partial frame if needed
+        if frame_x.size < frame_len:
+            frame_pad = np.zeros(frame_len, dtype=dtype)
+
+            if frame_x.size > 0:
+                frame_pad[: frame_x.size] = frame_x
+
+            frame_x = frame_pad
+
+        td_one = extract_td_features_inline(
+            x=frame_x,
+            fs=fs,
+            frame_len=frame_len,
+            hop=hop,
+            operating_band=operating_band,
+            mode_bands=mode_bands,
+            td_input_mode=td_input_mode,
+            td_input_band=td_input_band,
+            bp_order=bp_order,
+            subframe_len=subframe_len,
+            subframe_hop=subframe_hop,
+            block_energy_len=block_energy_len,
+            block_energy_hop=block_energy_hop,
+            block_energy_post_pre_blocks=block_energy_post_pre_blocks,
+            block_energy_smooth_enable=block_energy_smooth_enable,
+            envelope_features_enable=envelope_features_enable,
+            process_dtype=process_dtype,
+            eps=eps,
+        )
+
+        for name in TD_FEATURE_NAMES:
+            vals = np.asarray(td_one.get(name, []), dtype=dtype).reshape(-1)
+            out[name].append(float(vals[-1]) if vals.size else 0.0)
+
+    return {name: np.asarray(values, dtype=dtype) for name, values in out.items()}
+
+
 # --- Raw spectral-shape features for diagnostics ---
 def extract_raw_spectral_shape_features_inline(
     *,
-    x: Optional[np.ndarray] = None,
     fs: int,
     n_fft: int,
     hop: int,
@@ -558,7 +656,7 @@ def extract_raw_spectral_shape_features_inline(
     """
     Extract spectral-shape features from the raw linear power spectrum.
 
-    Prefer passing raw_power and freqs from the caller to avoid a second STFT.
+    raw_power (F, T) and freqs (F,) must be provided by the caller.
     These features intentionally use raw linear power, not the detector input P.
     The detector P may already be log(P(t)) - log(N_lag(t)), which is useful for
     novelty/flux detection but not ideal for answering where the original energy
@@ -570,39 +668,17 @@ def extract_raw_spectral_shape_features_inline(
         z = np.zeros(0, dtype=dtype)
         return {k: z for k in RAW_SPECTRAL_FEATURE_NAMES}
 
-    if raw_power is not None:
-        if freqs is None:
-            raise ValueError("freqs must be provided when raw_power is provided")
-        power = np.asarray(raw_power, dtype=np.float64)
-        freqs = np.asarray(freqs, dtype=np.float64).reshape(-1)
-        if power.ndim != 2:
-            raise ValueError(f"raw_power must be 2-D, got shape={power.shape}")
-        if power.shape[0] != freqs.size:
-            raise ValueError(
-                f"raw_power.shape[0] ({power.shape[0]}) must match freqs.size ({freqs.size})"
-            )
-    else:
-        if x is None:
-            return _empty_raw_spectral_features()
-        x = np.asarray(x, dtype=dtype).reshape(-1)
-        if x.size == 0:
-            return _empty_raw_spectral_features()
+    if raw_power is None or freqs is None:
+        return _empty_raw_spectral_features()
 
-        n_fft = int(max(8, n_fft))
-        hop = int(max(1, hop))
-        noverlap = max(0, n_fft - hop)
-
-        freqs, _, zxx = spsig.stft(
-            x,
-            fs=int(fs),
-            window="hann",
-            nperseg=n_fft,
-            noverlap=noverlap,
-            nfft=n_fft,
-            boundary=None,
-            padded=False,
+    power = np.asarray(raw_power, dtype=np.float64)
+    freqs = np.asarray(freqs, dtype=np.float64).reshape(-1)
+    if power.ndim != 2:
+        raise ValueError(f"raw_power must be 2-D, got shape={power.shape}")
+    if power.shape[0] != freqs.size:
+        raise ValueError(
+            f"raw_power.shape[0] ({power.shape[0]}) must match freqs.size ({freqs.size})"
         )
-        power = np.asarray(np.abs(zxx) ** 2, dtype=np.float64)
 
     if power.size == 0 or power.shape[1] == 0:
         return _empty_raw_spectral_features()
