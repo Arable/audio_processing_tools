@@ -1084,7 +1084,6 @@ class RainFrameClassifierMixin:
                         "td_block_energy_crest": td_block_energy_crest,
                         "td_block_peak_width_50": td_block_peak_width_50,
                         "td_block_post_pre_energy_ratio": td_block_post_pre_energy_ratio,
-                        "td_gate_mask": td_gate_mask,
                     }
                 )
 
@@ -1096,8 +1095,6 @@ class RainFrameClassifierMixin:
                         {
                             "td_crest_factor": td_crest_factor,
                             "td_kurtosis": td_kurtosis,
-                            "td_vote_count": td_vote_count,
-                            "td_soft_score": td_soft_score,
                         }
                     )
 
