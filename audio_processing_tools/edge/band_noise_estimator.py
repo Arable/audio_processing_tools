@@ -34,6 +34,25 @@ def hz_to_bin(f_hz: float, fs: float, n_fft: int) -> int:
     return int(np.clip(np.round(f_hz * n_fft / fs), 0, n_fft // 2))
 
 
+def legacy_band_bins(lo_hz: float, hi_hz: float, fs: float, n_fft: int) -> Tuple[int, int]:
+    """
+    Band edges matching disdrometer_legacy.h's FFT_LOW_INDEX/FFT_HIGH_INDEX
+    macros exactly (integer-division DF, not hz_to_bin's round-to-nearest):
+        DF = fs // n_fft
+        low_bin  = (lo_hz // DF) + 1
+        high_bin = hi_hz // DF
+    Used only for M_band_fft/E_band_fft's band_hz edges, so the unsuppressed
+    FFT-domain reference is comparable to the legacy (non-suppressed)
+    drop_energy_level path for a valid with/without-noise-suppression
+    side-by-side. Not used for the rain-band/primary-band bins in
+    NoiseFrameDetector, which have no legacy counterpart to match.
+    """
+    df = int(fs) // int(n_fft)
+    low_bin = (int(lo_hz) // df) + 1
+    high_bin = int(hi_hz) // df
+    return low_bin, high_bin
+
+
 def db_to_ratio(db: float) -> float:
     # power ratio
     return 10.0 ** (db / 10.0)
@@ -328,6 +347,7 @@ class BandNoiseFrameOut:
     fft_rain_frame: bool
     # --- Optional diagnostics (added for debugging/analysis, default to 0.0 for backward compatibility)
     M_band_fft: float = 0.0
+    M_clean_fft: float = 0.0
     E_band_fft: float = 0.0
     E_hpf: float = 0.0
 
@@ -534,10 +554,11 @@ class BandNoiseEstimator:
         # Compute number of subframes S to match subhop and usable frame
         self.S = 1 + (self.N - self.sub_len) // self.subhop
 
-        # FFT bin mask for primary-band diagnostics.
-        freqs = np.fft.rfftfreq(self.N, d=1.0 / cfg.fs).astype(self.dtype, copy=False)
+        # FFT bins for the configured output band. Uses legacy_band_bins (not
+        # hz_to_bin) so M_band_fft/E_band_fft line up with the legacy
+        # (non-suppressed) drop_energy_level band - see legacy_band_bins doc.
         lo, hi = cfg.band_hz
-        self.band_mask = (freqs >= lo) & (freqs <= hi)
+        self.band_b0, self.band_b1 = legacy_band_bins(lo, hi, cfg.fs, self.N)
 
         # Filters
         self.hpf_sos = self._design_hpf(cfg)
@@ -820,8 +841,9 @@ class BandNoiseEstimator:
         X = np.fft.rfft(x, n=cfg.det.n_fft)
         P_fft = X.real * X.real + X.imag * X.imag
         mag = np.abs(X)
-        Mb_fft = float(np.sum(mag[self.band_mask]))
-        Eb_fft = float(np.sum(P_fft[self.band_mask]))
+        band_slice = slice(self.band_b0, self.band_b1 + 1)
+        Mb_fft = float(np.sum(mag[band_slice]))
+        Eb_fft = float(np.sum(P_fft[band_slice]))
 
         # BPF for time-domain band subframe energies (subE)
         assert self.bpf_zi is not None
@@ -954,6 +976,7 @@ class BandNoiseEstimator:
         G_mag = float(np.sqrt(np.clip(G_pow, 0.0, 1.0)))
         G_mag = float(np.clip(G_mag, cfg.gain_floor, 1.0))
         M_clean = float(Mb * G_mag)
+        M_clean_fft = float(Mb_fft * G_mag)
 
         # Return output, including diagnostics
         return BandNoiseFrameOut(
@@ -968,6 +991,7 @@ class BandNoiseEstimator:
             M_clean=M_clean,
             fft_rain_frame=bool(fft_rain_frame),
             M_band_fft=Mb_fft,
+            M_clean_fft=M_clean_fft,
             E_band_fft=Eb_fft,
             E_hpf=E_hpf_frame,
             noise_energy_sum=float(self.energy_stats.noise_energy_sum),

@@ -168,6 +168,7 @@ class BandNoiseEstimatorProcessor:
                 "noise_effective_q": np.zeros(0, dtype=dtype),
                 "M_clean": np.zeros(0, dtype=dtype),
                 "M_band_fft": np.zeros(0, dtype=dtype),
+                "M_clean_fft": np.zeros(0, dtype=dtype),
                 "E_band_fft": np.zeros(0, dtype=dtype),
                 "E_hpf": np.zeros(0, dtype=dtype),
                 "config": cfg,
@@ -187,6 +188,7 @@ class BandNoiseEstimatorProcessor:
         M_clean = np.zeros(n_frames, dtype=dtype)
         noise_effective_q = np.zeros(n_frames, dtype=dtype)
         M_band_fft = np.zeros(n_frames, dtype=dtype)
+        M_clean_fft = np.zeros(n_frames, dtype=dtype)
         E_band_fft = np.zeros(n_frames, dtype=dtype)
         E_hpf = np.zeros(n_frames, dtype=dtype)
 
@@ -215,6 +217,7 @@ class BandNoiseEstimatorProcessor:
             M_clean[i] = out.M_clean
             noise_effective_q[i] = out.noise_effective_q
             M_band_fft[i] = out.M_band_fft
+            M_clean_fft[i] = out.M_clean_fft
             E_band_fft[i] = out.E_band_fft
             E_hpf[i] = out.E_hpf
 
@@ -267,6 +270,7 @@ class BandNoiseEstimatorProcessor:
             "M_clean": M_clean,
             "noise_effective_q": noise_effective_q,
             "M_band_fft": M_band_fft,
+            "M_clean_fft": M_clean_fft,
             "E_band_fft": E_band_fft,
             "E_hpf": E_hpf,
 
