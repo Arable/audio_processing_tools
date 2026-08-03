@@ -21,9 +21,15 @@ EPS = 1e-12
 #       M_clean = M_band * G_mag
 #
 #   FFT power is used by NoiseFrameDetector for the rain/noise-frame decision.
-#   FFT-domain metrics (M_band_fft, E_band_fft) are retained as diagnostics and are
-#   not directly comparable to time-domain energies without Parseval normalization.
+#   M_clean_fft is the suppressed FFT magnitude sum:
+#       M_clean_fft = M_band_fft * G_mag
 #
+#   Since G_mag is a single non-negative scalar per frame, this is exactly
+#   equivalent to applying G_mag uniformly to every FFT bin in the band and
+#   then summing the resulting magnitudes.
+#
+#   FFT-domain magnitude and power metrics are not directly comparable to
+#   time-domain energies without the appropriate FFT/window normalization.
 # -----------------------------------------------------------------------------
 
 
@@ -32,6 +38,25 @@ EPS = 1e-12
 # ----------------------------
 def hz_to_bin(f_hz: float, fs: float, n_fft: int) -> int:
     return int(np.clip(np.round(f_hz * n_fft / fs), 0, n_fft // 2))
+
+
+def legacy_band_bins(lo_hz: float, hi_hz: float, fs: float, n_fft: int) -> Tuple[int, int]:
+    """
+    Band edges matching disdrometer_legacy.h's FFT_LOW_INDEX/FFT_HIGH_INDEX
+    macros exactly (integer-division DF, not hz_to_bin's round-to-nearest):
+        DF = fs // n_fft
+        low_bin  = (lo_hz // DF) + 1
+        high_bin = hi_hz // DF
+    Used only for M_band_fft/E_band_fft's band_hz edges, so the unsuppressed
+    FFT-domain reference is comparable to the legacy (non-suppressed)
+    drop_energy_level path for a valid with/without-noise-suppression
+    side-by-side. Not used for the rain-band/primary-band bins in
+    NoiseFrameDetector, which have no legacy counterpart to match.
+    """
+    df = int(fs) // int(n_fft)
+    low_bin = (int(lo_hz) // df) + 1
+    high_bin = int(hi_hz) // df
+    return low_bin, high_bin
 
 
 def db_to_ratio(db: float) -> float:
@@ -321,13 +346,15 @@ class BandNoiseFrameOut:
     subE: np.ndarray  # shape (S,)
     # rain mask used for estimator (True = rain => excluded from noise learning)
     rain_submask: np.ndarray  # shape (S,)
-    # Gain and noise-suppressed amplitude-like output for the configured primary band.
+    # Scalar gain and suppressed time-domain output.
     G_mag: float
     M_clean: float
     # Detector / diagnostic outputs.
     fft_rain_frame: bool
-    # --- Optional diagnostics (added for debugging/analysis, default to 0.0 for backward compatibility)
+    # Raw and suppressed FFT magnitude sums.
     M_band_fft: float = 0.0
+    M_clean_fft: float = 0.0
+
     E_band_fft: float = 0.0
     E_hpf: float = 0.0
 
@@ -522,7 +549,8 @@ class BandNoiseEstimator:
     - After W_min valid samples, outputs a quantile+EMA noise estimate per subframe
     - Noise per frame = estimated subframe noise energy * number of subframes
     - Computes Wiener-like gain from E_band and N_E
-    - Always returns M_clean, the noise-suppressed amplitude-like output for the configured primary band
+    - Returns M_clean, the suppressed time-domain BPF amplitude
+    - Returns M_clean_fft, the suppressed FFT magnitude sum
     """
     def __init__(self, cfg: BandNoiseEstimatorConfig):
         cfg.validate()
@@ -534,10 +562,11 @@ class BandNoiseEstimator:
         # Compute number of subframes S to match subhop and usable frame
         self.S = 1 + (self.N - self.sub_len) // self.subhop
 
-        # FFT bin mask for primary-band diagnostics.
-        freqs = np.fft.rfftfreq(self.N, d=1.0 / cfg.fs).astype(self.dtype, copy=False)
+        # FFT bins for the configured output band. Uses legacy_band_bins (not
+        # hz_to_bin) so M_band_fft/E_band_fft line up with the legacy
+        # (non-suppressed) drop_energy_level band - see legacy_band_bins doc.
         lo, hi = cfg.band_hz
-        self.band_mask = (freqs >= lo) & (freqs <= hi)
+        self.band_b0, self.band_b1 = legacy_band_bins(lo, hi, cfg.fs, self.N)
 
         # Filters
         self.hpf_sos = self._design_hpf(cfg)
@@ -808,20 +837,20 @@ class BandNoiseEstimator:
             elif subEhpf.size > self.S:
                 subEhpf = subEhpf[:self.S]
 
-        # FFT spectrum used for two purposes:
-        #   1) FFT-domain rain/noise-frame decision inside NoiseFrameDetector
-        #   2) FFT-domain diagnostics M_band_fft/E_band_fft
+        # FFT spectrum used for three purposes:
+        #   1) FFT-domain rain/noise-frame decision
+        #   2) Raw FFT metrics M_band_fft/E_band_fft
+        #   3) Suppressed FFT magnitude sum M_clean_fft
         #
-        # The FFT decision is important for protecting the noise estimator: when it
-        # fires, the full frame is treated as rain and excluded from normal noise
-        # learning. The FFT diagnostic magnitudes below are not used for suppression
-        # because FFT-domain scaling is not directly comparable to time-domain BPF
-        # energy without careful Parseval normalization.
+        # G_mag is estimated from time-domain BPF energy and applied uniformly
+        # to the FFT magnitude sum over the configured band.
+  
         X = np.fft.rfft(x, n=cfg.det.n_fft)
         P_fft = X.real * X.real + X.imag * X.imag
         mag = np.abs(X)
-        Mb_fft = float(np.sum(mag[self.band_mask]))
-        Eb_fft = float(np.sum(P_fft[self.band_mask]))
+        band_slice = slice(self.band_b0, self.band_b1 + 1)
+        Mb_fft = float(np.sum(mag[band_slice]))
+        Eb_fft = float(np.sum(P_fft[band_slice]))
 
         # BPF for time-domain band subframe energies (subE)
         assert self.bpf_zi is not None
@@ -954,6 +983,7 @@ class BandNoiseEstimator:
         G_mag = float(np.sqrt(np.clip(G_pow, 0.0, 1.0)))
         G_mag = float(np.clip(G_mag, cfg.gain_floor, 1.0))
         M_clean = float(Mb * G_mag)
+        M_clean_fft = float(Mb_fft * G_mag)
 
         # Return output, including diagnostics
         return BandNoiseFrameOut(
@@ -968,6 +998,7 @@ class BandNoiseEstimator:
             M_clean=M_clean,
             fft_rain_frame=bool(fft_rain_frame),
             M_band_fft=Mb_fft,
+            M_clean_fft=M_clean_fft,
             E_band_fft=Eb_fft,
             E_hpf=E_hpf_frame,
             noise_energy_sum=float(self.energy_stats.noise_energy_sum),
