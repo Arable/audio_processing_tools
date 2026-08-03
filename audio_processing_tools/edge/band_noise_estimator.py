@@ -526,6 +526,18 @@ class BandNoiseEstimatorConfig:
         lo, hi = self.band_hz
         if not (0 < lo < hi < 0.5 * self.fs):
             raise ValueError("band_hz out of range")
+        if int(self.fs) // int(self.frame_len) <= 0:
+            raise ValueError(
+                f"fs={self.fs} must be >= frame_len={self.frame_len} so legacy_band_bins' "
+                "frequency resolution (fs // frame_len) is nonzero"
+            )
+        legacy_lo_bin, legacy_hi_bin = legacy_band_bins(lo, hi, self.fs, self.frame_len)
+        max_bin = self.frame_len // 2
+        if not (0 <= legacy_lo_bin <= legacy_hi_bin <= max_bin):
+            raise ValueError(
+                f"band_hz={self.band_hz} maps to legacy FFT bins ({legacy_lo_bin}, {legacy_hi_bin}), "
+                f"which fall outside the valid rfft range [0, {max_bin}] for frame_len={self.frame_len}"
+            )
         # Validate smoothing alpha
         if not (0.0 < self.ema_alpha <= 1.0):
             raise ValueError("ema_alpha must be in (0, 1]")
