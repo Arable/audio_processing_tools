@@ -1278,7 +1278,7 @@ class RainDetectorProcessor(BaseProcessor):
 
         frame_class = np.asarray(out.get("frame_class", []), dtype=np.int8)
         frame_is_rain = frame_class == FrameClass.RAIN
-        clip_rain_min_frames = int(params_local.get("clip_rain_min_frames", 1))
+        clip_rain_min_frames = int(params_local.get("clip_rain_min_frames", 4))
         clip_rain_min_frames = max(1, clip_rain_min_frames)
         rain_frame_count = int(np.sum(frame_is_rain))
         clip_rain_fraction = float(np.mean(frame_is_rain)) if frame_is_rain.size else 0.0

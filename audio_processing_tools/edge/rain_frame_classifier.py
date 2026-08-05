@@ -884,12 +884,12 @@ class RainFrameClassifierMixin:
         td_soft_score = np.nan_to_num(td_soft_score, nan=0.0, posinf=0.0, neginf=0.0)
         # FD rain decision thresholds are applied in log1p space.
         # min_support_count refers to support bands {1,2,3}.
-        primary_flux_min = float(self._dget("new_rain_primary_flux_min", 1.8))
-        legacy_mode12_flux_min = float(self._dget("new_rain_mode12_flux_min", 2.6))
+        primary_flux_min = float(self._dget("new_rain_primary_flux_min", 2.19))
+        legacy_mode12_flux_min = float(self._dget("new_rain_mode12_flux_min", 2.63))
         mode1_flux_min = float(self._dget("new_rain_mode1_flux_min", legacy_mode12_flux_min))
-        mode2_flux_min = float(self._dget("new_rain_mode2_flux_min", legacy_mode12_flux_min))
-        mode3_flux_min = float(self._dget("new_rain_mode3_flux_min", 3.0))
-        min_support_count = int(self._dget("new_rain_min_support_count", 2))
+        mode2_flux_min = float(self._dget("new_rain_mode2_flux_min", 2.57))
+        mode3_flux_min = float(self._dget("new_rain_mode3_flux_min", 2.45))
+        min_support_count = int(self._dget("new_rain_min_support_count", 3))
 
         primary_mode_flux = np.nan_to_num(normalized_mode_flux_by_mode[0], nan=0.0, posinf=0.0, neginf=0.0)
         support_mode_flux_1 = np.nan_to_num(normalized_mode_flux_by_mode[1], nan=0.0, posinf=0.0, neginf=0.0)
@@ -907,8 +907,8 @@ class RainFrameClassifierMixin:
 
         # TD gate: require minimum crest factor and optionally reject overly spiky
         # frames using an upper threshold on kurtosis.
-        td_gate_threshold = float(self._dget("td_gate_threshold", 3.7))
-        td_kurtosis_upper_threshold = self._dget("td_kurtosis_upper_threshold", None)
+        td_gate_threshold = float(self._dget("td_gate_threshold", 3.4))
+        td_kurtosis_upper_threshold = self._dget("td_kurtosis_upper_threshold", 12.0)
         td_gate_value = td_crest_factor
         td_gate_mask = td_gate_value > td_gate_threshold
         if td_kurtosis_upper_threshold is not None:
@@ -1288,15 +1288,15 @@ class RainFrameClassifierState:
         mode_flux_norm_min: float = 1.0,
         mode_weights=None,
         # TD gate
-        td_gate_threshold: float = 3.7,
-        td_kurtosis_upper_threshold=None,
+        td_gate_threshold: float = 3.4,
+        td_kurtosis_upper_threshold=12.0,
         # FD decision thresholds
-        new_rain_primary_flux_min: float = 1.8,
-        new_rain_mode12_flux_min: float = 2.6,
+        new_rain_primary_flux_min: float = 2.19,
+        new_rain_mode12_flux_min: float = 2.63,
         new_rain_mode1_flux_min: Optional[float] = None,
-        new_rain_mode2_flux_min: Optional[float] = None,
-        new_rain_mode3_flux_min: float = 3.0,
-        new_rain_min_support_count: int = 2,
+        new_rain_mode2_flux_min: Optional[float] = 2.57,
+        new_rain_mode3_flux_min: float = 2.45,
+        new_rain_min_support_count: int = 3,
         # Noise label
         noise_hi: float = 0.80,
         mode_flux_noise_max: float = 1.5,
@@ -2175,7 +2175,7 @@ class RainFrameClassifierState:
         RainFrameClassifierMixin, mirroring its config exactly.
         """
         dget = mixin._dget
-        legacy_mode12 = float(dget("new_rain_mode12_flux_min", 2.6))
+        legacy_mode12 = float(dget("new_rain_mode12_flux_min", 2.63))
         return cls(
             freqs=freqs,
             mode_bands=dget("mode_bands"),
@@ -2190,14 +2190,14 @@ class RainFrameClassifierState:
             mode_flux_norm_q=float(np.clip(dget("mode_flux_norm_q", 20.0), 0.0, 100.0)),
             mode_flux_norm_min=float(dget("mode_flux_norm_min", 1.0)),
             mode_weights=dget("mode_weights", None),
-            td_gate_threshold=float(dget("td_gate_threshold", 3.7)),
-            td_kurtosis_upper_threshold=dget("td_kurtosis_upper_threshold", None),
-            new_rain_primary_flux_min=float(dget("new_rain_primary_flux_min", 1.8)),
+            td_gate_threshold=float(dget("td_gate_threshold", 3.4)),
+            td_kurtosis_upper_threshold=dget("td_kurtosis_upper_threshold", 12.0),
+            new_rain_primary_flux_min=float(dget("new_rain_primary_flux_min", 2.19)),
             new_rain_mode12_flux_min=legacy_mode12,
             new_rain_mode1_flux_min=float(dget("new_rain_mode1_flux_min", legacy_mode12)),
-            new_rain_mode2_flux_min=float(dget("new_rain_mode2_flux_min", legacy_mode12)),
-            new_rain_mode3_flux_min=float(dget("new_rain_mode3_flux_min", 3.0)),
-            new_rain_min_support_count=int(dget("new_rain_min_support_count", 2)),
+            new_rain_mode2_flux_min=float(dget("new_rain_mode2_flux_min", 2.57)),
+            new_rain_mode3_flux_min=float(dget("new_rain_mode3_flux_min", 2.45)),
+            new_rain_min_support_count=int(dget("new_rain_min_support_count", 3)),
             noise_hi=float(dget("noise_hi", 0.80)),
             mode_flux_noise_max=float(dget("mode_flux_noise_max", 1.5)),
             td_input_mode=str(dget("td_input_mode", "default")).lower(),
