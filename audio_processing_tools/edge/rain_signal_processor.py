@@ -15,6 +15,7 @@ from audio_processing_tools.edge.rain_frame_classifier import (
     RainFrameClassifierState,
 )
 from audio_processing_tools.edge.noise_tracker import CausalNoiseTracker
+from audio_processing_tools.edge.rain_estimator import estimate_rain_from_audio
 
 
 @dataclass
@@ -1256,6 +1257,7 @@ class RainDetectorProcessor(BaseProcessor):
         keep_state_spectra = bool(params_local.get("keep_state_spectra", False))
         keep_state_debug = bool(params_local.get("keep_state_debug", False))
         keep_state_features = bool(params_local.get("keep_state_features", True))
+        estimate_clip_rain = bool(params_local.get("estimate_clip_rain", False))
 
         params_local.setdefault("compute_output_audio", keep_state_audio)
         params_local.setdefault("return_filtered_audio", keep_state_audio)
@@ -1287,6 +1289,22 @@ class RainDetectorProcessor(BaseProcessor):
         else:
             median_rain_conf = 0.0
 
+        rain_estimate: Optional[Dict[str, Any]] = None
+        if estimate_clip_rain:
+            rain_estimate = estimate_rain_from_audio(
+                audio_data,
+                fs=sample_rate,
+            )
+            weighted_dsd_sum = float(rain_estimate.get("weighted_dsd_sum", 0.0))
+            precip_regressor_mm = float(rain_estimate.get("precip_mm", 0.0))
+            rain_energy_sum = float(rain_estimate.get("rain_energy_sum", 0.0))
+            rain_energy_frame_count = int(rain_estimate.get("rain_energy_frame_count", 0))
+        else:
+            weighted_dsd_sum = 0.0
+            precip_regressor_mm = 0.0
+            rain_energy_sum = 0.0
+            rain_energy_frame_count = 0
+
         # Promote clip confidence toward 1.0 when rain is sustained well beyond the
         # minimum frame threshold required to call the clip rainy.
         abundance_ref = max(2 * clip_rain_min_frames, 1)
@@ -1294,6 +1312,12 @@ class RainDetectorProcessor(BaseProcessor):
         clip_rain_conf = float(max(median_rain_conf, abundance_conf))
         freqs = out.get("freqs", None)
         noise_psd = out.get("noise_psd", None)
+
+        precip_mm = precip_regressor_mm if clip_is_rain else 0.0
+        rain_energy_sum_accepted = rain_energy_sum if clip_is_rain else 0.0
+        rejected_weighted_dsd_sum = 0.0 if clip_is_rain else weighted_dsd_sum
+        rejected_precip_mm = 0.0 if clip_is_rain else precip_regressor_mm
+        rejected_rain_energy_sum = 0.0 if clip_is_rain else rain_energy_sum
 
         metrics: Dict[str, Any] = {
             "rain_frame_fraction": clip_rain_fraction,  # backward-compatible name
@@ -1305,6 +1329,21 @@ class RainDetectorProcessor(BaseProcessor):
             "clip_rain_min_frames": clip_rain_min_frames,
             "latency_s": latency,
         }
+
+        if estimate_clip_rain:
+            metrics.update(
+                {
+                    "weighted_dsd_sum": weighted_dsd_sum,
+                    "precip_regressor_mm": precip_regressor_mm,
+                    "precip_mm": precip_mm,
+                    "rain_energy_sum": rain_energy_sum,
+                    "rain_energy_sum_accepted": rain_energy_sum_accepted,
+                    "rain_energy_frame_count": rain_energy_frame_count,
+                    "rejected_weighted_dsd_sum": rejected_weighted_dsd_sum,
+                    "rejected_precip_mm": rejected_precip_mm,
+                    "rejected_rain_energy_sum": rejected_rain_energy_sum,
+                }
+            )
 
         if (
             noise_psd is not None
@@ -1336,6 +1375,23 @@ class RainDetectorProcessor(BaseProcessor):
             "latency_s": latency,
             "processor": self.name,
         }
+
+        if estimate_clip_rain:
+            state.update(
+                {
+                    "weighted_dsd_sum": weighted_dsd_sum,
+                    "precip_regressor_mm": precip_regressor_mm,
+                    "precip_mm": precip_mm,
+                    "rain_energy_sum": rain_energy_sum,
+                    "rain_energy_sum_accepted": rain_energy_sum_accepted,
+                    "rain_energy_frame_count": rain_energy_frame_count,
+                    "rejected_weighted_dsd_sum": rejected_weighted_dsd_sum,
+                    "rejected_precip_mm": rejected_precip_mm,
+                    "rejected_rain_energy_sum": rejected_rain_energy_sum,
+                }
+            )
+            if rain_estimate is not None:
+                state["rain_estimate"] = rain_estimate
 
         if keep_state_features:
             state["features"] = out.get("features")
