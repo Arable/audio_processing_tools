@@ -145,6 +145,7 @@ class BandNoiseEstimatorProcessor:
                 "mode": self.mode,
                 "n_frames": 0,
                 "M_clean_med": np.nan,
+                "M_clean_fft_med": np.nan,
                 "noise_E_med": np.nan,
                 "gain_med": np.nan,
                 "noise_effective_q_last": np.nan,
@@ -168,6 +169,7 @@ class BandNoiseEstimatorProcessor:
                 "noise_effective_q": np.zeros(0, dtype=dtype),
                 "M_clean": np.zeros(0, dtype=dtype),
                 "M_band_fft": np.zeros(0, dtype=dtype),
+                "M_clean_fft": np.zeros(0, dtype=dtype),
                 "E_band_fft": np.zeros(0, dtype=dtype),
                 "E_hpf": np.zeros(0, dtype=dtype),
                 "config": cfg,
@@ -187,6 +189,7 @@ class BandNoiseEstimatorProcessor:
         M_clean = np.zeros(n_frames, dtype=dtype)
         noise_effective_q = np.zeros(n_frames, dtype=dtype)
         M_band_fft = np.zeros(n_frames, dtype=dtype)
+        M_clean_fft = np.zeros(n_frames, dtype=dtype)
         E_band_fft = np.zeros(n_frames, dtype=dtype)
         E_hpf = np.zeros(n_frames, dtype=dtype)
 
@@ -215,6 +218,7 @@ class BandNoiseEstimatorProcessor:
             M_clean[i] = out.M_clean
             noise_effective_q[i] = out.noise_effective_q
             M_band_fft[i] = out.M_band_fft
+            M_clean_fft[i] = out.M_clean_fft
             E_band_fft[i] = out.E_band_fft
             E_hpf[i] = out.E_hpf
 
@@ -238,8 +242,9 @@ class BandNoiseEstimatorProcessor:
             "processor": self.name,
             "mode": self.mode,  # kept for backward compatibility
             "n_frames": int(n_frames),
-            "M_clean_med": float(np.median(M_clean)) if n_frames else np.nan,
-            "noise_E_med": float(np.median(N_E)) if n_frames else np.nan,
+            "M_clean_med": float(np.median(M_clean)),
+            "M_clean_fft_med": float(np.median(M_clean_fft)),
+            "noise_E_med": float(np.median(N_E)),
             "gain_med": float(np.median(G_mag)) if n_frames else np.nan,
             "noise_effective_q_last": float(noise_effective_q[-1]) if n_frames else np.nan,
             "noise_effective_q_med": float(np.median(noise_effective_q)) if n_frames else np.nan,
@@ -258,7 +263,6 @@ class BandNoiseEstimatorProcessor:
             "N_E": N_E,
             "N_E_raw": N_E_raw,
             "subE": subE,
-            
             "N_sub": N_sub,
             "rain_submask": rain_submask,
             "fft_rain_frame": fft_rain_frame,
@@ -267,6 +271,7 @@ class BandNoiseEstimatorProcessor:
             "M_clean": M_clean,
             "noise_effective_q": noise_effective_q,
             "M_band_fft": M_band_fft,
+            "M_clean_fft": M_clean_fft,
             "E_band_fft": E_band_fft,
             "E_hpf": E_hpf,
 
