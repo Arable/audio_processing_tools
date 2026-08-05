@@ -907,7 +907,7 @@ class RainFrameClassifierMixin:
 
         # TD gate: require minimum crest factor and optionally reject overly spiky
         # frames using an upper threshold on kurtosis.
-        td_gate_threshold = float(self._dget("td_gate_threshold", 3.5))
+        td_gate_threshold = float(self._dget("td_gate_threshold", 3.7))
         td_kurtosis_upper_threshold = self._dget("td_kurtosis_upper_threshold", None)
         td_gate_value = td_crest_factor
         td_gate_mask = td_gate_value > td_gate_threshold
@@ -1288,7 +1288,7 @@ class RainFrameClassifierState:
         mode_flux_norm_min: float = 1.0,
         mode_weights=None,
         # TD gate
-        td_gate_threshold: float = 3.5,
+        td_gate_threshold: float = 3.7,
         td_kurtosis_upper_threshold=None,
         # FD decision thresholds
         new_rain_primary_flux_min: float = 1.8,
@@ -2190,7 +2190,7 @@ class RainFrameClassifierState:
             mode_flux_norm_q=float(np.clip(dget("mode_flux_norm_q", 20.0), 0.0, 100.0)),
             mode_flux_norm_min=float(dget("mode_flux_norm_min", 1.0)),
             mode_weights=dget("mode_weights", None),
-            td_gate_threshold=float(dget("td_gate_threshold", 3.5)),
+            td_gate_threshold=float(dget("td_gate_threshold", 3.7)),
             td_kurtosis_upper_threshold=dget("td_kurtosis_upper_threshold", None),
             new_rain_primary_flux_min=float(dget("new_rain_primary_flux_min", 1.8)),
             new_rain_mode12_flux_min=legacy_mode12,
