@@ -21,9 +21,15 @@ EPS = 1e-12
 #       M_clean = M_band * G_mag
 #
 #   FFT power is used by NoiseFrameDetector for the rain/noise-frame decision.
-#   FFT-domain metrics (M_band_fft, E_band_fft) are retained as diagnostics and are
-#   not directly comparable to time-domain energies without Parseval normalization.
+#   M_clean_fft is the suppressed FFT magnitude sum:
+#       M_clean_fft = M_band_fft * G_mag
 #
+#   Since G_mag is a single non-negative scalar per frame, this is exactly
+#   equivalent to applying G_mag uniformly to every FFT bin in the band and
+#   then summing the resulting magnitudes.
+#
+#   FFT-domain magnitude and power metrics are not directly comparable to
+#   time-domain energies without the appropriate FFT/window normalization.
 # -----------------------------------------------------------------------------
 
 
@@ -340,14 +346,15 @@ class BandNoiseFrameOut:
     subE: np.ndarray  # shape (S,)
     # rain mask used for estimator (True = rain => excluded from noise learning)
     rain_submask: np.ndarray  # shape (S,)
-    # Gain and noise-suppressed amplitude-like output for the configured primary band.
+    # Scalar gain and suppressed time-domain output.
     G_mag: float
     M_clean: float
     # Detector / diagnostic outputs.
     fft_rain_frame: bool
-    # --- Optional diagnostics (added for debugging/analysis, default to 0.0 for backward compatibility)
+    # Raw and suppressed FFT magnitude sums.
     M_band_fft: float = 0.0
     M_clean_fft: float = 0.0
+
     E_band_fft: float = 0.0
     E_hpf: float = 0.0
 
@@ -519,6 +526,18 @@ class BandNoiseEstimatorConfig:
         lo, hi = self.band_hz
         if not (0 < lo < hi < 0.5 * self.fs):
             raise ValueError("band_hz out of range")
+        if int(self.fs) // int(self.frame_len) <= 0:
+            raise ValueError(
+                f"fs={self.fs} must be >= frame_len={self.frame_len} so legacy_band_bins' "
+                "frequency resolution (fs // frame_len) is nonzero"
+            )
+        legacy_lo_bin, legacy_hi_bin = legacy_band_bins(lo, hi, self.fs, self.frame_len)
+        max_bin = self.frame_len // 2
+        if not (0 <= legacy_lo_bin <= legacy_hi_bin <= max_bin):
+            raise ValueError(
+                f"band_hz={self.band_hz} maps to legacy FFT bins ({legacy_lo_bin}, {legacy_hi_bin}), "
+                f"which fall outside the valid rfft range [0, {max_bin}] for frame_len={self.frame_len}"
+            )
         # Validate smoothing alpha
         if not (0.0 < self.ema_alpha <= 1.0):
             raise ValueError("ema_alpha must be in (0, 1]")
@@ -542,7 +561,8 @@ class BandNoiseEstimator:
     - After W_min valid samples, outputs a quantile+EMA noise estimate per subframe
     - Noise per frame = estimated subframe noise energy * number of subframes
     - Computes Wiener-like gain from E_band and N_E
-    - Always returns M_clean, the noise-suppressed amplitude-like output for the configured primary band
+    - Returns M_clean, the suppressed time-domain BPF amplitude
+    - Returns M_clean_fft, the suppressed FFT magnitude sum
     """
     def __init__(self, cfg: BandNoiseEstimatorConfig):
         cfg.validate()
@@ -829,15 +849,14 @@ class BandNoiseEstimator:
             elif subEhpf.size > self.S:
                 subEhpf = subEhpf[:self.S]
 
-        # FFT spectrum used for two purposes:
-        #   1) FFT-domain rain/noise-frame decision inside NoiseFrameDetector
-        #   2) FFT-domain diagnostics M_band_fft/E_band_fft
+        # FFT spectrum used for three purposes:
+        #   1) FFT-domain rain/noise-frame decision
+        #   2) Raw FFT metrics M_band_fft/E_band_fft
+        #   3) Suppressed FFT magnitude sum M_clean_fft
         #
-        # The FFT decision is important for protecting the noise estimator: when it
-        # fires, the full frame is treated as rain and excluded from normal noise
-        # learning. The FFT diagnostic magnitudes below are not used for suppression
-        # because FFT-domain scaling is not directly comparable to time-domain BPF
-        # energy without careful Parseval normalization.
+        # G_mag is estimated from time-domain BPF energy and applied uniformly
+        # to the FFT magnitude sum over the configured band.
+  
         X = np.fft.rfft(x, n=cfg.det.n_fft)
         P_fft = X.real * X.real + X.imag * X.imag
         mag = np.abs(X)

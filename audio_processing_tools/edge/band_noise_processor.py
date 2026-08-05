@@ -145,6 +145,7 @@ class BandNoiseEstimatorProcessor:
                 "mode": self.mode,
                 "n_frames": 0,
                 "M_clean_med": np.nan,
+                "M_clean_fft_med": np.nan,
                 "noise_E_med": np.nan,
                 "gain_med": np.nan,
                 "noise_effective_q_last": np.nan,
@@ -241,8 +242,9 @@ class BandNoiseEstimatorProcessor:
             "processor": self.name,
             "mode": self.mode,  # kept for backward compatibility
             "n_frames": int(n_frames),
-            "M_clean_med": float(np.median(M_clean)) if n_frames else np.nan,
-            "noise_E_med": float(np.median(N_E)) if n_frames else np.nan,
+            "M_clean_med": float(np.median(M_clean)),
+            "M_clean_fft_med": float(np.median(M_clean_fft)),
+            "noise_E_med": float(np.median(N_E)),
             "gain_med": float(np.median(G_mag)) if n_frames else np.nan,
             "noise_effective_q_last": float(noise_effective_q[-1]) if n_frames else np.nan,
             "noise_effective_q_med": float(np.median(noise_effective_q)) if n_frames else np.nan,
@@ -261,7 +263,6 @@ class BandNoiseEstimatorProcessor:
             "N_E": N_E,
             "N_E_raw": N_E_raw,
             "subE": subE,
-            
             "N_sub": N_sub,
             "rain_submask": rain_submask,
             "fft_rain_frame": fft_rain_frame,
