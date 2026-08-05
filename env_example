@@ -1,0 +1,17 @@
+AWS_REGION = "us-east-1"
+
+AWS_ACCESS_KEY_ID = 
+AWS_SECRET_ACCESS_KEY = 
+
+DB_HOST="application-db-ro.prod.arable.cloud" # or DB of choice
+DB_PORT=5432
+DB_NAME="arable"
+DB_USER=
+DB_PASSWORD=
+
+# Optionally, if SSH access is required
+SSH_HOST="3.94.250.13"
+SSH_PORT=22
+SSH_USER=
+SSH_PRIVATE_KEY=
+SSH_PASSWORD=
