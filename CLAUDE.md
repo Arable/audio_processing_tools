@@ -6,7 +6,7 @@
 **Active branch:** `feature/frame_level_rain_processing`  
 **Golden regression repo:** `/Users/vikrantoak/source1/data-science-scratch/golden_regression`  
 **Goal:** Refactor rain detector from batch/clip-level to per-frame (O(n_fft) memory) for embedded CM7 deployment.  
-**Status:** Core streaming path complete and validated. Most pending check-ins from the May session are now committed (see below). `td_gate_threshold` was raised 2.5→3.5 on 2026-08-05 — **golden-regression re-validation against this new threshold is still outstanding** before this branch merges to `main`.
+**Status:** Core streaming path complete and validated. Most pending check-ins from the May session are now committed (see below). `td_gate_threshold` was raised 2.5→3.7 on 2026-08-05 (briefly, incorrectly, committed as 3.5 first, then corrected to 3.7 — see session log) — **golden-regression re-validation against this threshold is still outstanding** before this branch merges to `main`.
 
 ---
 
@@ -46,10 +46,12 @@ K ≈ 67 bins (400–3500 Hz, n_fft=256, fs=11162). **Reduction: 670×.**
 
 **Bugs found and fixed on `feature/frame_level_rain_processing` itself:**
 - `estimate_clip_rain` (new, uncommitted `rain_signal_processor.py` feature) silently returned 0.0/0 for `precip_mm`/`rain_energy_sum`/`rain_energy_frame_count` because `edge/rain_estimator.py` was a stale pre-fix version missing those return keys. Fixed by replacing it with the corrected implementation (was sitting duplicated as `rain_estimator-1.py`); verified end-to-end.
-- `RainFrameClassifierState.from_mixin()` still defaulted `td_gate_threshold` to **2.5** after the Mixin and `State.__init__` were raised to **3.5** — an uncommitted, internally-inconsistent edit that would have made `run_frame_level_comparison`/`run_streaming_comparison`/`run_nowinsor_replay` report false streaming-vs-batch divergence. Fixed so all three call sites agree at 3.5.
+- `RainFrameClassifierState.from_mixin()` still defaulted `td_gate_threshold` to **2.5** after the Mixin and `State.__init__` were raised to **3.5** — an uncommitted, internally-inconsistent edit that would have made `run_frame_level_comparison`/`run_streaming_comparison`/`run_nowinsor_replay` report false streaming-vs-batch divergence. Fixed so all three call sites agreed (initially at 3.5).
+- Cross-repo porting-gap review (`mark3-firmware-trunk` `sp/noise_cancel_algo`, `edge` repo `sp/noise_cancel_model`) surfaced that C's `noisecl_td_gate_thr` is hardcoded to **3.7**, not 3.5. Checked `data-science-scratch/golden_regression/scripts/generate_baseline.py` (branch `frame-level-processing`) — its canonical `detector_params` also uses `td_gate_threshold: 3.7`. So 3.5 was itself a stale/wrong value; corrected to **3.7** everywhere (Mixin, `State.__init__`, `from_mixin()`) in a follow-up commit the same day.
+- Also found real, unresolved numeric divergences from the golden-regression canonical params that are NOT yet reconciled in code: `flux_modes_winsor_enable` (golden regression uses `False`; a separate, unrelated uncommitted param sketch had `True`), `td_soft_enable` (golden regression uses `False`), and the rain-decision scheme itself — golden regression's canonical script uses `new_rain_primary_flux_min`/`new_rain_mode1_flux_min`/`new_rain_mode2_flux_min`/`new_rain_mode3_flux_min`/`new_rain_min_support_count`, not `mode_flux_rain_min`/`primary_flux_sanity_min` (the latter two don't exist anywhere in the current codebase).
 
 **Still outstanding:**
-- Golden-regression re-validation at `td_gate_threshold=3.5` (see Status above) — not yet run.
+- Golden-regression re-validation at `td_gate_threshold=3.7` (see Status above) — not yet run.
 - `sp/noise_algo_test` (Santhosh Palethadka, no PR, last commit 2026-04-14) converts `band_noise_estimator.py`'s internals to `float32` throughout and adds a C-library (`libband_noise_pylib.so`) parity test harness — overlaps with the same file we've been editing; worth syncing with him before it's rebased, to avoid conflicting float32 vs float64 assumptions.
 - `audio_processing_tools/backend/` (old `spectral_features.py`/`spectral_visualize.py`, unreferenced anywhere) — left untouched, disposition still undecided.
 - `audio_processing_tools.code-workspace`, `framework_results.csv`, `framework_states_rain.csv`, `status_output` — intentionally left untracked (editor config / run artifacts).
@@ -129,7 +131,7 @@ Validated in `comparison_offline_and_causal_frame.ipynb` on 5k clips:
 
 ### `audio_processing_tools` repo
 
-All items below were committed on 2026-08-05 (`f75730d`, `72f7a4e`, `d6c8372`, `9b02e8b`, plus this CLAUDE.md update): `alac_utils.py` (debug print removal), `rain_signal_processor.py` + `rain_estimator.py` (`estimate_clip_rain`, bug fixed), `rain_frame_classifier.py` (`td_gate_threshold`→3.5 + `from_mixin()` fix + `rain_energy_summary`), `env_example`, `smoke_test_framework.py`, `run_rain_noise_analysis.py`, `frame_classifier_feature_analysis.py`, `CLAUDE.md`.
+All items below were committed on 2026-08-05 (`f75730d`, `72f7a4e`, `d6c8372`, `1d97317`, `9b02e8b`, plus this CLAUDE.md update): `alac_utils.py` (debug print removal), `rain_signal_processor.py` + `rain_estimator.py` (`estimate_clip_rain`, bug fixed), `rain_frame_classifier.py` (`td_gate_threshold`→3.7, corrected from an initial wrong 3.5 + `from_mixin()` fix + `rain_energy_summary`), `env_example`, `smoke_test_framework.py`, `run_rain_noise_analysis.py`, `frame_classifier_feature_analysis.py`, `CLAUDE.md`.
 
 `feature_extraction.py` and `noise_tracker.py` were already committed in earlier commits (`23f365f`, `5551aed`, `7cf3cde`) and needed no further changes today.
 
