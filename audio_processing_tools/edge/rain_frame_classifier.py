@@ -1942,9 +1942,11 @@ class RainFrameClassifierState:
         chunk : array, shape (~hop,)
             Completing hop of raw audio for STFT frame t.
         is_rain : bool, optional
-            Whether the previous frame was classified as rain.  Used to gate
-            the noise tracker (rain frames do not update the noise baseline
-            outside warm-up).  Pass the frame_class from the previous call.
+            Whether the previous frame's frame_class was FrameClass.RAIN —
+            compare explicitly (e.g. ``prev_result["frame_class"] == FrameClass.RAIN``),
+            do not pass the raw frame_class value, since bool(FrameClass.UNCERTAIN)
+            is truthy. Used to gate the noise tracker (rain frames do not update
+            the noise baseline outside warm-up).
         frame_time : float, optional
             Absolute time in seconds.  Defaults to frame_idx * hop / fs.
 
@@ -2037,6 +2039,8 @@ class RainFrameClassifierState:
             raise ValueError(f"P has {P.shape[0]} frequency bins; expected {self._freqs.shape[0]}")
 
         T = P.shape[1]
+        if T == 0:
+            return {}
         if frame_times is not None:
             frame_times = np.asarray(frame_times, dtype=dtype).reshape(-1)
             if frame_times.size < T:
