@@ -294,6 +294,7 @@ class RainFrameClassifierMixin:
         detector_frame_times: Optional[np.ndarray] = None,
         input_audio: Optional[np.ndarray] = None,
         raw_power: Optional[np.ndarray] = None,
+        noise_psd: Optional[np.ndarray] = None,
         work_dtype: Optional[Any] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """
@@ -335,12 +336,16 @@ class RainFrameClassifierMixin:
         feature_dump_sparse_enable = bool(self._dget("feature_dump_sparse_enable", False))
         feature_dump_clip_summary_enable = bool(self._dget("feature_dump_clip_summary_enable", False))
         feature_dump_sparse_gate_feature = (
-            str(self._dget("feature_dump_sparse_gate_feature", "td_block_energy_crest")).strip().lower()
+            str(self._dget("feature_dump_sparse_gate_feature", "td_crest_factor")).strip().lower()
         )
         feature_dump_sparse_gate_threshold = float(self._dget("feature_dump_sparse_gate_threshold", 3.5))
 
         clip_spectral_occupancy_enable = bool(self._dget("clip_spectral_occupancy_enable", False))
         clip_spectral_occupancy_dtype = resolve_np_dtype(self._dget("clip_spectral_occupancy_dtype", "float32"))
+        rain_energy_summary_enable = bool(self._dget("rain_energy_summary_enable", False))
+        rain_energy_summary_band = self._dget("rain_energy_summary_band", (400.0, 700.0))
+        rain_energy_summary_lo = float(rain_energy_summary_band[0])
+        rain_energy_summary_hi = float(rain_energy_summary_band[1])
 
         op_band = self._dget("operating_band", (400.0, 3500.0))
         op_lo, op_hi = float(op_band[0]), float(op_band[1])
@@ -902,7 +907,7 @@ class RainFrameClassifierMixin:
 
         # TD gate: require minimum crest factor and optionally reject overly spiky
         # frames using an upper threshold on kurtosis.
-        td_gate_threshold = float(self._dget("td_gate_threshold", 2.5))
+        td_gate_threshold = float(self._dget("td_gate_threshold", 3.5))
         td_kurtosis_upper_threshold = self._dget("td_kurtosis_upper_threshold", None)
         td_gate_value = td_crest_factor
         td_gate_mask = td_gate_value > td_gate_threshold
@@ -963,6 +968,35 @@ class RainFrameClassifierMixin:
         frame_class[(noise_conf >= noise_hi) & weak_mode_flux & (~is_rain)] = FrameClass.NOISE
         frame_class[is_rain] = FrameClass.RAIN
 
+        rain_energy_summary: Dict[str, float] = {}
+        if rain_energy_summary_enable:
+            rain_band_mask_energy = (freqs >= rain_energy_summary_lo) & (freqs <= rain_energy_summary_hi)
+            if np.any(rain_band_mask_energy):
+                rain_band_energy_t = np.sum(P[rain_band_mask_energy, :], axis=0)
+                stft_rain_band_energy_sum = float(np.sum(rain_band_energy_t))
+
+                stft_noise_band_energy_sum = 0.0
+                stft_rain_minus_noise_energy_sum = 0.0
+                if noise_psd is not None:
+                    noise_psd_arr = np.asarray(noise_psd)
+                    if noise_psd_arr.shape == P.shape:
+                        noise_band_energy_t = np.sum(noise_psd_arr[rain_band_mask_energy, :], axis=0)
+                        stft_noise_band_energy_sum = float(np.sum(noise_band_energy_t))
+                        stft_rain_minus_noise_energy_sum = float(
+                            np.sum(np.maximum(rain_band_energy_t - noise_band_energy_t, 0.0))
+                        )
+
+                rain_energy_summary = {
+                    "stft_rain_band_energy_sum": stft_rain_band_energy_sum,
+                    "stft_noise_band_energy_sum": stft_noise_band_energy_sum,
+                    "stft_rain_minus_noise_energy_sum": stft_rain_minus_noise_energy_sum,
+                }
+            else:
+                rain_energy_summary = {
+                    "stft_rain_band_energy_sum": 0.0,
+                    "stft_noise_band_energy_sum": 0.0,
+                    "stft_rain_minus_noise_energy_sum": 0.0,
+                }
         det_debug = {
             "mode_flux_score": mode_flux_score,
             "mode_flux_score_gated": mode_flux_score_gated,
@@ -1009,8 +1043,11 @@ class RainFrameClassifierMixin:
             "td_prefilter_mode": td_prefilter_mode,
             "td_feature_timing_mode": td_feature_timing_mode,
             "clip_spectral_occupancy_enable": clip_spectral_occupancy_enable,
+            "rain_energy_summary_enable": rain_energy_summary_enable,
         }
 
+        if rain_energy_summary_enable:
+            det_debug["rain_energy_summary"] = rain_energy_summary
         # Registry-driven raw spectral debug wiring.
         det_debug.update(aligned_raw_spectral)
 
@@ -1251,7 +1288,7 @@ class RainFrameClassifierState:
         mode_flux_norm_min: float = 1.0,
         mode_weights=None,
         # TD gate
-        td_gate_threshold: float = 2.5,
+        td_gate_threshold: float = 3.5,
         td_kurtosis_upper_threshold=None,
         # FD decision thresholds
         new_rain_primary_flux_min: float = 1.8,
@@ -2153,7 +2190,7 @@ class RainFrameClassifierState:
             mode_flux_norm_q=float(np.clip(dget("mode_flux_norm_q", 20.0), 0.0, 100.0)),
             mode_flux_norm_min=float(dget("mode_flux_norm_min", 1.0)),
             mode_weights=dget("mode_weights", None),
-            td_gate_threshold=float(dget("td_gate_threshold", 2.5)),
+            td_gate_threshold=float(dget("td_gate_threshold", 3.5)),
             td_kurtosis_upper_threshold=dget("td_kurtosis_upper_threshold", None),
             new_rain_primary_flux_min=float(dget("new_rain_primary_flux_min", 1.8)),
             new_rain_mode12_flux_min=legacy_mode12,
