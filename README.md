@@ -86,9 +86,9 @@ audio_processing_tools/
 ├── parse.py                        # Mark-3 binary format parser
 ├── fetch.py                        # S3/remote audio fetching
 ├── db_tools.py                     # Database utilities
+├── noise_processor.py              # Noise processing
 ├── edge/                           # Edge device processing
 │   ├── dsp_rain_detection.py      # Rain detection DSP algorithms
-│   ├── noise_processor.py         # Noise processing
 │   └── parameter_tuning/          # Parameter optimization tools
 └── postprocess/                    # Result formatting utilities
     ├── rain.py                     # Rain detection post-processing
