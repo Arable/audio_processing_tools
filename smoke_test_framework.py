@@ -16,6 +16,7 @@ This test:
     - Writes small CSVs with results and state
 """
 
+import os
 from pathlib import Path
 from typing import Dict, Any
 
@@ -76,8 +77,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1) Configure input folder and basic params
     # ------------------------------------------------------------------
-    TEST_VECTOR_PATH ='/Users/vikrantoak/Downloads/tv_sets/label_data' 
-    InputType = "LocalPath"
+    TEST_VECTOR_PATH = os.environ.get(
+        "SMOKE_TEST_VECTOR_PATH", "/Users/vikrantoak/Downloads/tv_sets/label_data"
+    )
+    InputType = os.environ.get("SMOKE_TEST_INPUT_TYPE", "LocalPath")
 
     if not Path(TEST_VECTOR_PATH).exists():
         raise SystemExit(

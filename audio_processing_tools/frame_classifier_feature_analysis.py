@@ -408,9 +408,6 @@ def threshold_sweep(
 
     return pd.DataFrame(rows)
 
-import numpy as np
-import pandas as pd
-
 
 def build_frame_tuning_df(
     results_df,
