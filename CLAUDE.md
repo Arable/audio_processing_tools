@@ -26,14 +26,27 @@ K ≈ 67 bins (400–3500 Hz, n_fft=256, fs=11162). **Reduction: 670×.**
 
 | File | Role |
 |------|------|
-| `audio_processing_tools/edge/rain_signal_processor.py` | Top-level processor. STFT `center=False` line 753, ISTFT `center=False` line 1140. Comparison flags: `run_frame_level_comparison`, `run_streaming_comparison`, `run_nowinsor_replay` in `NoiseProcessorConfig`. |
+| `audio_processing_tools/edge/rain_signal_processor.py` | Top-level processor. STFT `center=False` line 754, ISTFT `center=False` line 1141. Comparison flags: `run_frame_level_comparison`, `run_streaming_comparison`, `run_nowinsor_replay` in `NoiseProcessorConfig`. |
 | `audio_processing_tools/edge/rain_frame_classifier.py` | `RainFrameClassifierMixin` (batch path) + `RainFrameClassifierState` (streaming path). `process_audio_frame()` is the main per-frame entry point. |
 | `audio_processing_tools/edge/feature_extraction.py` | `extract_td_features_inline`, `extract_raw_spectral_shape_features_inline`. RS function requires `raw_power` (F,T) + `freqs` (F,) — `x` parameter removed. |
 | `audio_processing_tools/edge/noise_tracker.py` | `CausalNoiseTracker` — standalone stateful noise PSD tracker. Has `_seeded` flag (auto-seeds from first frame). |
 | `data-science-scratch/golden_regression/scripts/generate_baseline.py` | Canonical validation script — replaces notebook. Runs processing + frame-level, streaming, and regression checks. |
 | `audio_processing_tools/edge/rain_estimator.py` | `estimate_rain_from_audio()` — per-clip DSD-based rain-rate estimate (drop-size histogram → regression model → `precip_mm`). Wired into `RainDetectorProcessor.run()` behind `estimate_clip_rain` flag (2026-08-05). |
+| `band_noise_suppression.md` | Writeup: noise suppression in `band_noise_estimator.py`/`band_noise_processor.py` (rain-measurement DSD path). Standalone — not yet wired into `RainDetectorProcessor` or `rain_estimator.py`. |
+| `frame_level_rain_streaming.md` | Writeup: what's new in the streaming refactor across `noise_tracker.py`/`rain_frame_classifier.py`/`feature_extraction.py`/`rain_signal_processor.py`. Delta doc — see `edge/README.md` for the underlying algorithm. |
 
 ---
+
+## Session log — 2026-08-06
+
+**PR #4 review pass (own PR, `codeant-ai[bot]` + GitHub Copilot reviewer comments):**
+- codeant-ai's `is_rain`-as-bool and `replay_clip()` T=0 IndexError findings were valid — fixed in `0c99223`.
+- codeant-ai's claimed `NoiseProcessor._run_spectral_noise()` KeyError regression was rejected as pre-existing/out-of-scope (formatting-only diff at that location); codeant-ai saved a customized review instruction acknowledging it.
+- Copilot's `reverse_binning_func` missing-paren/SyntaxError claim was checked against HEAD (`ast.parse()`, manual read) and found false — replied with evidence, no fix needed.
+- Copilot's `frame_times` claim was real: `extract_td_features_causal_frame_inline()` took `frame_times` from each single-frame `extract_td_features_inline()` call, which always restarts at `[0]` — fixed in `b70066c` to compute the absolute offset (`t * hop / fs`) directly.
+- Copilot's `estimate_clip_rain` "not actually gated by clip_is_rain" claim was true but intentional (rejected clips still need DSD sums for `rejected_precip_mm`/`rejected_rain_energy_sum` diagnostics) — reworded the PR description rather than changing behavior.
+
+**New docs + full markdown review pass:** wrote `band_noise_suppression.md` and `frame_level_rain_streaming.md` (see Key files above), then ran an adversarial review of all six repo `.md` files (this file, root `README.md`, `rain_algorithm_technical_assessment.md`, `edge/README.md`, plus the two new docs) against current source. Fixed: root `README.md`'s broken Quick Start import and stale package-structure diagram; `rain_algorithm_technical_assessment.md` §5.3's rain-frame-classifier mechanism description (was: z-score/soft-confidence/hold-expansion — none of which exist; now: causal low-quantile normalization + hard threshold vote, matching `_rain_frame_decision()`); `edge/README.md`'s "lagged PSD" claim (gain computation is same-frame `N(t)` by default, `use_lagged_noise_psd` defaults `False` — only detector normalization is unconditionally lagged), wrong mode-flag name (`disable_suppression` → `suppressor_bypass`), and the oversubtraction formula (omitted the `noise_conf > 0.7` threshold remap); this file's off-by-one `center=False` line numbers (753/1140 → 754/1141). Also fixed two inaccuracies found in the newly-written `band_noise_suppression.md` itself (overstated per-frame telemetry-array claim; overstated default EMA smoothing — `ema_alpha=1.0` default means none happens out of the box).
 
 ## Session log — 2026-08-05
 
@@ -78,7 +91,7 @@ K ≈ 67 bins (400–3500 Hz, n_fft=256, fs=11162). **Reduction: 670×.**
 - `replay_clip()`: RS power from per-frame `np.fft.rfft` loop (center=False) — no more `spsig.stft`.
 
 ### `center=False` STFT
-STFT line 753 and ISTFT line 1140 both `center=False`. Frame t covers `x[t*hop : t*hop+n_fft]`. Invalidated all prior baselines (regenerated, see below).
+STFT line 754 and ISTFT line 1141 both `center=False`. Frame t covers `x[t*hop : t*hop+n_fft]`. Invalidated all prior baselines (regenerated, see below).
 
 ---
 

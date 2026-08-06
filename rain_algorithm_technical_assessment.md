@@ -271,9 +271,9 @@ The DSD histogram from the edge is transmitted to the cloud, where it's converte
 
 ## 5. The Noise Suppression System (In Development)
 
-A noise suppression pipeline is under active development across three modules. This system is designed to estimate and compensate for background noise, primarily wind, before or alongside rain detection.
+A noise suppression pipeline spans three modules. This system is designed to estimate and compensate for background noise, primarily wind, before or alongside rain detection. As of the `feature/frame_level_rain_processing` branch, the detector/suppressor path below has been refactored to a per-frame streaming implementation (`RainFrameClassifierState`, `CausalNoiseTracker`) validated against this batch path at 1.0000 frame-class agreement — see `frame_level_rain_streaming.md` and `CLAUDE.md` for that refactor; the mechanism described below is unchanged by it.
 
-### 5.1 Spectral Noise Processor (`spectral_noise_processor.py`)
+### 5.1 Spectral Noise Processor (`rain_signal_processor.py`, class `SpectralNoiseProcessor`)
 
 This implements a **spectral subtraction** approach (Boll, 1979) with adaptive confidence weighting:
 
@@ -310,13 +310,13 @@ This is a complementary, more targeted noise estimator focused on the [400, 700]
 
 The classifier used within the noise processor is distinct from the detection algorithm's approach. It uses:
 
-1. **Spectral flux in configured mode bands**: Frame-to-frame positive differences (half-wave rectified) in log-compressed power, computed separately for the primary mode and all modes combined.
-2. **Rolling robust z-scores** (median + MAD): The flux values are normalized using a rolling median and median absolute deviation, producing z-scores that are robust to outliers.
-3. **Soft confidence**: Z-scores are scaled to [0, 1] confidences. The final confidence is the minimum of the primary-mode and multi-mode confidences (an AND gate: both must agree).
-4. **Peak structure check**: Spectral peaks in the frame must fall within mode bands (minimum 2 of the top 6 peaks).
-5. **Hold expansion**: Rain-classified frames are extended forward by a configurable number of frames to protect the decay tail of resonance ringing.
+1. **Spectral flux per mode band**: Positive differences (half-wave rectified) between the current frame and the frame two STFT hops back (t vs. t‑2, not t vs. t‑1), computed separately per configured resonance mode and combined with mode weights into a total flux.
+2. **Causal low-quantile baseline normalization**: Each mode's flux is normalized against its own causal low-quantile baseline tracker (`CausalLowQuantileTracker`) — the score is `max(flux - baseline, 0) / (baseline + floor)`, an excess-over-baseline ratio, not a z-score (no median/MAD statistics are used).
+3. **Time-domain gate**: A separate TD gate (`td_crest_factor > td_gate_threshold`, optionally AND'd with `td_kurtosis <= td_kurtosis_upper_threshold`) multiplies the normalized flux scores before they're compared to thresholds — zeroing them out on frames that don't look impulsive in the time domain.
+4. **Hard threshold vote, not a soft confidence**: `is_rain = primary_ok AND (support_hits >= min_support_count)`, where `primary_ok` requires the primary mode's log1p-transformed flux to clear its own threshold, and `support_hits` counts how many of the 3 support modes independently clear their own thresholds (default: at least 3 of 3). `rain_conf` is returned as a binary 0.0/1.0, not a continuous confidence — deliberately, so it stays aligned with the hard frame-count decision used for clip-level aggregation.
+5. Spectral peak structure (position, prominence, bandwidth relative to mode bands) is computed and exported as a diagnostic/feature-dump signal for offline tuning, but does not gate the runtime `is_rain` decision. There is no hold-expansion or decay-tail-protection mechanism in the current code.
 
-**Assessment:** This classifier is more sophisticated than the detection algorithm's novelty-based approach. The z-score normalization is a substantial improvement over the fixed-threshold SNR in the detection algorithm. The AND-gate requirement (both primary and multi-mode flux must be high) is a good safeguard against narrowband interference. The peak structure check directly tests the "rain excites resonance modes" hypothesis. This classifier could potentially replace or complement the detection algorithm's spectral novelty stage.
+**Assessment:** This classifier is more sophisticated than the detection algorithm's novelty-based approach. The causal low-quantile normalization adapts each mode's baseline independently, which is a substantial improvement over the fixed-threshold SNR in the detection algorithm. The multi-mode support-count requirement (≥3 of 3 support modes, on top of the primary) is a good safeguard against narrowband interference resembling a single mode. Because the final decision is a hard vote rather than a blended confidence, small threshold miscalibrations produce a hard flip in frame class rather than a graded confidence — worth keeping in mind when tuning thresholds against noisy validation labels.
 
 ---
 
