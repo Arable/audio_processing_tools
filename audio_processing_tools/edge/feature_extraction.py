@@ -592,7 +592,8 @@ def extract_td_features_causal_frame_inline(
     dtype = resolve_np_dtype(process_dtype)
     x = np.asarray(x, dtype=dtype).reshape(-1)
 
-    out: Dict[str, list[float]] = {name: [] for name in TD_FEATURE_NAMES}
+    per_frame_names = [name for name in TD_FEATURE_NAMES if name != "frame_times"]
+    out: Dict[str, list[float]] = {name: [] for name in per_frame_names}
 
     for t in range(int(n_frames)):
         start = int(t * hop)
@@ -630,11 +631,16 @@ def extract_td_features_causal_frame_inline(
             eps=eps,
         )
 
-        for name in TD_FEATURE_NAMES:
+        for name in per_frame_names:
             vals = np.asarray(td_one.get(name, []), dtype=dtype).reshape(-1)
             out[name].append(float(vals[-1]) if vals.size else 0.0)
 
-    return {name: np.asarray(values, dtype=dtype) for name, values in out.items()}
+    result = {name: np.asarray(values, dtype=dtype) for name, values in out.items()}
+    # extract_td_features_inline() always sees a single-frame slice here, so its own
+    # frame_times output would restart at 0 every call — compute the absolute offset
+    # (t * hop / fs) directly instead of taking it from td_one.
+    result["frame_times"] = (np.arange(int(n_frames), dtype=dtype) * hop) / float(fs)
+    return result
 
 
 # --- Raw spectral-shape features for diagnostics ---
