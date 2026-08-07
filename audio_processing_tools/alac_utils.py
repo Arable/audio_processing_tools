@@ -209,7 +209,6 @@ def write_caff_desc_chunk(output_file, audio_format):
 
     # Bits per channel
     struct.pack_into(">I", desc, 28, audio_format.mBitsPerChannel)
-    print(audio_format.mBitsPerChannel)
 
     # Now write these 32 bytes
     output_file.write(desc)

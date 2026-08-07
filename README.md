@@ -44,7 +44,7 @@ Support for multiple input types:
 ## Quick Start
 
 ```python
-from audio_processing_tools import process_audio_batches_v2
+from audio_processing_tools.audio_processing_framework import process_audio_batches_v2
 from audio_processing_tools.processors import RainProcessor, NoiseProcessor
 from audio_processing_tools.postprocess.rain import postprocess_rain
 
@@ -87,13 +87,33 @@ audio_processing_tools/
 ├── fetch.py                        # S3/remote audio fetching
 ├── db_tools.py                     # Database utilities
 ├── noise_processor.py              # Noise processing
-├── edge/                           # Edge device processing
-│   ├── dsp_rain_detection.py      # Rain detection DSP algorithms
+├── alac_utils.py                   # ALAC audio codec helpers
+├── transform.py                    # Signal transform utilities
+├── labeler.py                      # Clip labeling helpers
+├── visualize_audio.py              # Audio/spectrogram plotting
+├── visualize_noise_output.py       # Noise-processor output plotting
+├── frame_classifier_feature_analysis.py  # Frame-classifier feature analysis
+├── edge/                           # Edge device processing (see edge/README.md)
+│   ├── dsp_rain_detection.py      # Legacy clip-level rain detection DSP algorithm
+│   ├── rain_signal_processor.py   # Frame-level detector + suppressor pipeline
+│   ├── rain_frame_classifier.py   # Batch + streaming rain frame classifier
+│   ├── feature_extraction.py      # TD/spectral feature extraction (batch + causal-frame)
+│   ├── noise_tracker.py           # Standalone causal noise PSD tracker
+│   ├── band_noise_estimator.py    # Primary-band DSD noise suppression estimator
+│   ├── band_noise_processor.py    # Batch adapter for band_noise_estimator
+│   ├── rain_estimator.py          # Per-clip drop-size-distribution rain-rate estimate
+│   ├── time_domain_detector.py    # Time-domain detection helpers
 │   └── parameter_tuning/          # Parameter optimization tools
+├── backend/                        # Unreferenced legacy spectral utilities (disposition undecided)
+├── host_analysis/                  # Host-side analysis tooling
 └── postprocess/                    # Result formatting utilities
     ├── rain.py                     # Rain detection post-processing
     └── noise.py                    # Noise estimation post-processing
 ```
+
+See `edge/README.md` for the detector/suppressor architecture and
+`rain_algorithm_technical_assessment.md` for a detailed technical
+assessment of the rain detection algorithm.
 
 ## Documentation
 

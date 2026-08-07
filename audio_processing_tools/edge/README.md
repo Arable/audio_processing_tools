@@ -106,20 +106,29 @@ A critical design feature is the use of lagged noise PSD:
 
 N_lag(t) = N(t-1)
 
-This is used in two places:
+This is used in one place unconditionally, and optionally in a second:
 
-A. Detector input normalization
+A. Detector input normalization (always on by default)
 
 log(P(t)) - log(N_lag(t))
 
-B. Gain computation
+`detector_use_noise_norm` defaults to True, and the lag here is
+unconditional (implemented via np.roll on the noise-PSD array) —
+independent of any other config flag.
 
-G(t) uses N_lag(t) instead of N(t)
+B. Gain computation (opt-in, off by default)
 
+G(t) uses N_lag(t) instead of N(t) only when `use_lagged_noise_psd=True`.
+
+This flag defaults to **False** — out of the box, gain computation uses
+the *same-frame* N(t), not a lagged estimate. Only the detector-side
+normalization (A) is lagged unconditionally. Enable
+`use_lagged_noise_psd` explicitly if you also want the suppression gain
+itself to use N(t-1).
 
 ⸻
 
-🎯 Why Lagged PSD Matters
+🎯 Why Lagged PSD Matters (for detector normalization)
 
 Problem (without lag)
 
@@ -344,7 +353,11 @@ Properties
 
 Adaptive Oversubtraction
 
-oversub = base + noise_conf * (max - base)
+noise_conf only starts ramping suppression above a fixed threshold (0.7);
+below it, oversubtraction stays at `base`:
+
+eff_noise = clip((noise_conf - 0.7) / (1 - 0.7), 0, 1)
+oversub   = base + eff_noise * (max - base)
 
 Typical:
 	•	base = 1.0
@@ -457,7 +470,7 @@ flat params > nested params > defaults
 Mode	Description
 Full	Detection + suppression
 classifier_only_mode	Feature extraction only
-disable_suppression	Detector only
+suppressor_bypass	Detector only (keeps detector normalization active, skips final PSD/gain/ISTFT)
 
 
 ⸻
@@ -476,6 +489,15 @@ disable_suppression	Detector only
 	•	Threshold-based decision logic
 	•	PSD tracking may lag under rapidly changing noise conditions
 	•	Potential overfitting on small datasets
+
+Note: this document describes the batch/offline detector+suppressor
+(`SpectralNoiseProcessor`). A per-frame streaming implementation
+(`RainFrameClassifierState`, standalone `CausalNoiseTracker`) also exists
+for embedded deployment — see `frame_level_rain_streaming.md`. One
+behavioral difference not covered above: the streaming path's causal
+detector normalization uses the *same-frame* N(t) from `CausalNoiseTracker.update()`,
+whereas this batch path's detector normalization (section A above) uses an
+unconditionally lagged N(t-1) via `np.roll`.
 
 ⸻
 
