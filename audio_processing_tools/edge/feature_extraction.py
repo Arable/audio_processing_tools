@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 import numpy as np
 import scipy.signal as spsig
 from scipy.stats import kurtosis
@@ -64,7 +64,7 @@ def resolve_np_dtype(process_dtype: str) -> Any:
 
 
 # --- Helper for clip-level spectral occupancy ---
-def default_spectral_occupancy_bands() -> Tuple[Tuple[str, float, float], ...]:
+def default_spectral_occupancy_bands() -> tuple[tuple[str, float, float], ...]:
     """Default semantic frequency bands for clip-level spectral occupancy."""
     return (
         ("dc", 0.0, 43.6015625),
@@ -91,10 +91,10 @@ def compute_clip_spectral_occupancy_stats(
     raw_power: np.ndarray,
     freqs: np.ndarray,
     frame_class: np.ndarray,
-    bands: Optional[Tuple[Tuple[str, float, float], ...]] = None,
+    bands: tuple[tuple[str, float, float], ...] | None = None,
     dtype: Any = np.float32,
     eps: float = 1e-12,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Compute compact clip-level spectral occupancy summaries.
 
@@ -141,7 +141,7 @@ def compute_clip_spectral_occupancy_stats(
     def _empty() -> np.ndarray:
         return np.zeros(n_bands, dtype=dtype)
 
-    def _stats(arr: np.ndarray, mask: np.ndarray, prefix: str) -> Dict[str, np.ndarray]:
+    def _stats(arr: np.ndarray, mask: np.ndarray, prefix: str) -> dict[str, np.ndarray]:
         if arr.shape[1] == 0 or not np.any(mask):
             return {
                 f"{prefix}_mean": _empty(),
@@ -159,7 +159,7 @@ def compute_clip_spectral_occupancy_stats(
             f"{prefix}_max": np.asarray(np.max(vals, axis=1), dtype=dtype),
         }
 
-    out: Dict[str, Any] = {
+    out: dict[str, Any] = {
         "band_names": np.asarray([name for name, _, _ in bands], dtype=object),
         "band_lo_hz": np.asarray([lo for _, lo, _ in bands], dtype=dtype),
         "band_hi_hz": np.asarray([hi for _, _, hi in bands], dtype=dtype),
@@ -179,26 +179,26 @@ def extract_td_features_inline(
     fs: int,
     frame_len: int,
     hop: int,
-    operating_band: Tuple[float, float],
-    mode_bands: Optional[Tuple[Tuple[float, float], ...]],
+    operating_band: tuple[float, float],
+    mode_bands: tuple[tuple[float, float], ...] | None,
     td_input_mode: str,
-    td_input_band: Optional[Tuple[float, float]],
+    td_input_band: tuple[float, float] | None,
     bp_order: int,
     subframe_len: int,
     subframe_hop: int,
     block_energy_len: int,
-    block_energy_hop: Optional[int],
+    block_energy_hop: int | None,
     block_energy_post_pre_blocks: int,
     block_energy_smooth_enable: bool,
     envelope_features_enable: bool,
     process_dtype: str = "float32",
     eps: float = 1e-9,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Inline TD feature extraction for detector use without a labeller-class dependency."""
     dtype = resolve_np_dtype(process_dtype)
     x = np.asarray(x, dtype=dtype).reshape(-1)
 
-    def _bandpass(sig: np.ndarray, band: Tuple[float, float]) -> np.ndarray:
+    def _bandpass(sig: np.ndarray, band: tuple[float, float]) -> np.ndarray:
         if sig.size == 0:
             return sig.copy()
         nyq = 0.5 * float(fs)
@@ -232,7 +232,7 @@ def extract_td_features_inline(
             writeable=False,
         )
 
-    def _subframe_energy(sig: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _subframe_energy(sig: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if sig.size == 0:
             return np.zeros(0, dtype=dtype), np.zeros(0, dtype=dtype)
         B = int(max(1, subframe_len))
@@ -252,7 +252,7 @@ def extract_td_features_inline(
         times = (starts / float(fs)).astype(dtype, copy=False)
         return energy, times
 
-    def _block_energy_peak_features(sig: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _block_energy_peak_features(sig: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if sig.size == 0:
             z = np.zeros(0, dtype=dtype)
             return z, z, z
@@ -371,7 +371,7 @@ def extract_td_features_inline(
         sub_vals: np.ndarray,
         *,
         enable_envelope_features: bool,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         env = np.asarray(sub_vals, dtype=dtype).reshape(-1)
         N = env.size
         if N == 0:
@@ -557,21 +557,21 @@ def extract_td_features_causal_frame_inline(
     fs: int,
     frame_len: int,
     hop: int,
-    operating_band: Tuple[float, float],
-    mode_bands: Optional[Tuple[Tuple[float, float], ...]],
+    operating_band: tuple[float, float],
+    mode_bands: tuple[tuple[float, float], ...] | None,
     td_input_mode: str,
-    td_input_band: Optional[Tuple[float, float]],
+    td_input_band: tuple[float, float] | None,
     bp_order: int,
     subframe_len: int,
     subframe_hop: int,
     block_energy_len: int,
-    block_energy_hop: Optional[int],
+    block_energy_hop: int | None,
     block_energy_post_pre_blocks: int,
     block_energy_smooth_enable: bool,
     envelope_features_enable: bool,
     process_dtype: str = "float32",
     eps: float = 1e-9,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """
     Causal frame-aligned TD feature extraction.
 
@@ -593,7 +593,7 @@ def extract_td_features_causal_frame_inline(
     x = np.asarray(x, dtype=dtype).reshape(-1)
 
     per_frame_names = [name for name in TD_FEATURE_NAMES if name != "frame_times"]
-    out: Dict[str, list[float]] = {name: [] for name in per_frame_names}
+    out: dict[str, list[float]] = {name: [] for name in per_frame_names}
 
     for t in range(int(n_frames)):
         start = int(t * hop)
@@ -649,16 +649,16 @@ def extract_raw_spectral_shape_features_inline(
     fs: int,
     n_fft: int,
     hop: int,
-    operating_band: Tuple[float, float],
-    rain_band: Tuple[float, float] = (400.0, 800.0),
-    low_band: Tuple[float, float] = (0.0, 200.0),
-    mode_bands: Optional[Tuple[Tuple[float, float], ...]] = None,
+    operating_band: tuple[float, float],
+    rain_band: tuple[float, float] = (400.0, 800.0),
+    low_band: tuple[float, float] = (0.0, 200.0),
+    mode_bands: tuple[tuple[float, float], ...] | None = None,
     rolloff_fraction: float = 0.85,
     process_dtype: str = "float32",
     eps: float = 1e-12,
-    raw_power: Optional[np.ndarray] = None,
-    freqs: Optional[np.ndarray] = None,
-) -> Dict[str, np.ndarray]:
+    raw_power: np.ndarray | None = None,
+    freqs: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
     """
     Extract spectral-shape features from the raw linear power spectrum.
 
@@ -670,7 +670,7 @@ def extract_raw_spectral_shape_features_inline(
     """
     dtype = resolve_np_dtype(process_dtype)
 
-    def _empty_raw_spectral_features() -> Dict[str, np.ndarray]:
+    def _empty_raw_spectral_features() -> dict[str, np.ndarray]:
         z = np.zeros(0, dtype=dtype)
         return {k: z for k in RAW_SPECTRAL_FEATURE_NAMES}
 
