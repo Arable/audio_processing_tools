@@ -394,7 +394,6 @@ def get_input_data(
         Files shorter than the required duration are skipped.
     """
     dir_content: Dict[str, Dict[str, Any]] = {}
-    required_samples = int(Fs * check_duration)
 
     if InputType == "LocalPath":
         # Local filesystem
@@ -454,10 +453,6 @@ def get_input_data(
             # Ensure even length for int16 PCM interpretation
             if len(raw) % 2:
                 raw = raw[:-1]
-
-            if len(raw) < 2 * required_samples:
-                # Not enough samples for the requested duration
-                continue
 
             try:
                 # Parse Mark-3 container and normalize
