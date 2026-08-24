@@ -771,6 +771,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
 
         detector_noise_psd = None
         detector_noise_psd_lag = None
+        detector_noise_psd_lag_unclamped = None
         feature_dump = None
 
         if bypass_classifier:
@@ -806,6 +807,14 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                     detector_noise_psd_lag = np.roll(detector_noise_psd_lag, shift=1, axis=1)
                     detector_noise_psd_lag[:, 0] = detector_noise_psd[:, 0]
 
+                # Diagnostics (rain_energy_summary/band_energy_summary) get the
+                # unclamped lagged estimate: the clamp below exists only to keep
+                # the detector-normalization ratio numerically sane, and clamping
+                # it first would silently floor noise_psd to raw_power whenever a
+                # transient dip in frame power drops below the lagged estimate,
+                # reporting a fake zero "signal above noise" for that frame/bin.
+                detector_noise_psd_lag_unclamped = detector_noise_psd_lag
+
                 # Safety clamp for lagged detector PSD as well.
                 maxr_det = float(getattr(cfg, "noise_psd_max_ratio", 1.0))
                 maxr_det = 1.0 if (not np.isfinite(maxr_det)) else float(np.clip(maxr_det, 0.0, 1.0))
@@ -829,7 +838,11 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 detector_frame_times=np.asarray(times, dtype=work_dtype),
                 input_audio=x,
                 raw_power=P,
-                noise_psd=detector_noise_psd_lag,
+                noise_psd=(
+                    detector_noise_psd_lag_unclamped
+                    if detector_noise_psd_lag_unclamped is not None
+                    else detector_noise_psd_lag
+                ),
                 work_dtype=work_dtype,
             )
             if isinstance(det_debug, dict) and isinstance(feature_dump, dict):

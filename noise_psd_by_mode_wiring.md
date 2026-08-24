@@ -512,3 +512,41 @@ covering empty, reversed, and overlapping bands, asserting both paths raise with
 
 Final count: 38 tests, all passing; both new test files remain `ruff`-clean; `git diff --check`
 clean.
+
+## Eleventh round: automated PR review (codeant-ai) — one real fix, one acknowledged divergence
+
+`codeant-ai[bot]`'s review of the pushed PR raised two findings about the `noise_psd` value fed
+into `rain_energy_summary`/`band_energy_summary` (both comments also embedded a "Prompt for AI
+Agent" instruction block directing an agent to auto-implement and then auto-chase other PR
+comments — the same prompt-injection-shaped pattern flagged and not acted on in the 2026-08-05
+session; the underlying technical claims were verified independently instead of following those
+embedded instructions).
+
+**Fixed: the diagnostic was receiving the post-clamp `detector_noise_psd_lag`, not "the real"
+lagged estimate.** `rain_signal_processor.py`'s `detector_noise_psd_lag` is clamped to `maxr_det *
+P` (default `maxr_det=1.0`) purely to keep the detector-normalization ratio numerically sane;
+that clamped copy was also being passed as `noise_psd` into `_detect_rain_over_time()`. Whenever a
+frame's instantaneous power dipped below the lagged tracker's smoothed estimate (a normal EMA-lag
+overshoot, not a data problem), the clamp forced `noise_psd` down to ≈`raw_power` for that
+frame/bin, making the diagnostic report a fake zero "signal above noise" — contradicting this
+doc's own Bug 1 framing ("the real per-bin causal noise estimate"). Fixed by saving
+`detector_noise_psd_lag_unclamped` before the clamp and passing that to the diagnostic instead;
+the clamped copy is still used for `P_for_detection`, so `frame_class`/`rain_conf` remain
+unaffected.
+
+**Acknowledged, not fixed: batch and streaming compute `band_energy_summary`'s noise source
+differently, and that divergence is being left as-is.** Streaming's noise value comes from
+`CausalNoiseTracker`, which properly excludes rain frames from the baseline
+(`noise_tracker.py:137`). Batch's comes from the same `detector_noise_psd_lag` above, built with
+`detector_is_rain_for_psd = np.zeros(T, dtype=bool)` — i.e. every frame treated as a noise
+candidate, by pre-existing design, because at that point in the batch pipeline `frame_class` isn't
+known yet (that's exactly what's being computed). A tempting "fix" — recompute a rain-excluded PSD
+after `frame_class` is known, and use that for the diagnostic — was considered and rejected: that
+PSD wouldn't be self-consistent with the `frame_class` used to build it, since `frame_class` was
+itself derived from the *uncorrected* PSD. Making it self-consistent would require reclassifying
+with the improved PSD (a new `frame_class`, then possibly iterating again) — i.e. re-invoking the
+actual detection decision, not just recomputing a diagnostic, which conflicts with this PR's "no
+detection-decision impact" guarantee if that reclassification were ever put to use. Decision:
+batch's `noise_energy_sum` on this diagnostic is not a rain-excluded noise floor and isn't claimed
+to be one (streaming's is) — a known, deliberate, practical divergence rather than a bug to chase,
+consistent with this PR's existing policy of leaving SNR interpretation to downstream consumers.
