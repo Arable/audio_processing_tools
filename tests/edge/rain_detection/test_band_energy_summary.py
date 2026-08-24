@@ -282,6 +282,80 @@ def test_band_energy_summary_disabled_returns_empty_dict(detector_params, determ
     assert state.get_band_energy_summary() == {}
 
 
+def test_band_energy_summary_disabled_leaves_masks_and_accumulators_unallocated(detector_params):
+    """band_energy_summary_enable=False must not allocate the mask matrices/accumulators at all.
+
+    Regression test for the fix where __init__ built the (n_bands x n_bins)
+    mask matrices and accumulator arrays unconditionally, spending ~5x this
+    class's documented streaming-state memory budget even when the feature
+    is off (the default) — checking output alone (returns {}) doesn't catch
+    that, since the accumulators can exist, be unused, and still return {}.
+    """
+    state = _build_state(detector_params, enable_summary=False)
+    assert state._band_energy_full_mask_matrix is None
+    assert state._band_energy_covered_mask_matrix is None
+    assert state._band_total_energy_sum is None
+    assert state._band_covered_total_energy_sum is None
+    assert state._band_noise_energy_sum is None
+    assert state._band_energy_coverage_fraction is None
+
+
+def test_band_energy_summary_enabled_allocates_masks_and_accumulators(detector_params):
+    """band_energy_summary_enable=True must allocate one row/entry per configured band."""
+    state = _build_state(detector_params, enable_summary=True)
+    n_bands = len(state._band_energy_names)
+    assert n_bands > 0
+    assert state._band_energy_full_mask_matrix.shape[0] == n_bands
+    assert state._band_energy_covered_mask_matrix.shape[0] == n_bands
+    assert state._band_total_energy_sum.shape == (n_bands,)
+    assert state._band_covered_total_energy_sum.shape == (n_bands,)
+    assert state._band_noise_energy_sum.shape == (n_bands,)
+
+
+@pytest.mark.parametrize(
+    "bad_bands",
+    [
+        [],
+        [("backwards", 1000.0, 400.0)],
+        [("a", 400.0, 1000.0), ("b", 900.0, 3500.0)],
+    ],
+)
+def test_invalid_bands_raise_identically_in_batch_and_streaming_even_when_disabled(detector_params, bad_bands):
+    """An invalid band_energy_summary_bands override must be rejected identically in both paths.
+
+    Even while band_energy_summary_enable=False, the batch path
+    (_detect_rain_over_time) always calls normalize_bands() unconditionally,
+    so the streaming constructor must too, rather than silently accepting
+    what batch would reject.
+    """
+    freqs = _freqs()
+    params = dict(detector_params)
+    params["band_energy_summary_enable"] = False
+    params["band_energy_summary_bands"] = bad_bands
+
+    with pytest.raises(ValueError):
+        RainFrameClassifierState.from_mixin(_StreamMixin(params), freqs)
+
+    detector = _BatchDetector(params)
+    raw_power = np.random.default_rng(0).random((len(freqs), 3))
+    with pytest.raises(ValueError):
+        detector._detect_rain_over_time(raw_power, freqs, raw_power=raw_power)
+
+
+def test_empty_custom_band_energy_summary_bands_raises_at_construction(detector_params):
+    """An empty band_energy_summary_bands override must fail loudly at construction.
+
+    Otherwise it crashes later inside process_audio_frame() with an
+    unrelated matmul shape error.
+    """
+    freqs = _freqs()
+    params = dict(detector_params)
+    params["band_energy_summary_enable"] = True
+    params["band_energy_summary_bands"] = []
+    with pytest.raises(ValueError, match="must not be empty"):
+        RainFrameClassifierState.from_mixin(_StreamMixin(params), freqs)
+
+
 def test_per_frame_band_energy_not_exposed_unless_requested(detector_params, deterministic_audio):
     """Enabling accumulation alone must not bloat every frame's result dict."""
     state = _build_state(detector_params, enable_summary=True, expose_per_frame=False)

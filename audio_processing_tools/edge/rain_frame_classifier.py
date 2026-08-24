@@ -1085,9 +1085,7 @@ class RainFrameClassifierMixin:
                 for i, (band_name, band_lo, band_hi) in enumerate(band_energy_summary_bands):
                     full_mask = _full_width_band_mask(band_lo, band_hi, is_last_band=(i == n_bands - 1))
                     covered_mask = full_mask & band_mask
-                    total_bins = int(np.sum(full_mask))
-                    covered_bins = int(np.sum(covered_mask))
-                    coverage_fraction = float(covered_bins) / float(total_bins) if total_bins > 0 else 0.0
+                    coverage_fraction = band_coverage_fraction(full_mask, covered_mask)
                     band_energy_summary[f"{band_name}_total_energy_sum"] = _band_sum(raw_power, full_mask)
                     band_energy_summary[f"{band_name}_covered_total_energy_sum"] = _band_sum(
                         raw_power, covered_mask
@@ -1669,34 +1667,48 @@ class RainFrameClassifierState:
         # coverage fraction), not a per-frame history.
         self._band_energy_summary_enable = bool(band_energy_summary_enable)
         self._band_energy_expose_per_frame = bool(band_energy_summary_expose_per_frame)
-        self._band_energy_bands = normalize_bands(band_energy_summary_bands)
-        self._band_energy_names = tuple(name for name, _, _ in self._band_energy_bands)
-        n_energy_bands = len(self._band_energy_bands)
-        self._band_energy_full_masks = [
-            band_freq_mask(self._freqs, lo, hi, is_last_band=(i == n_energy_bands - 1))
-            for i, (_, lo, hi) in enumerate(self._band_energy_bands)
-        ]
-        self._band_energy_masks = [
-            band_freq_mask(self._freqs_band, lo, hi, is_last_band=(i == n_energy_bands - 1))
-            for i, (_, lo, hi) in enumerate(self._band_energy_bands)
-        ]
-        self._band_energy_coverage_fraction = np.array(
-            [
-                band_coverage_fraction(self._band_energy_full_masks[i], self._band_energy_masks[i])
-                for i in range(n_energy_bands)
-            ],
-            dtype=np.float64,
-        )
-        # Precomputed 0/1 matrices for vectorized per-frame accumulation.
-        # process_audio_frame() is the O(1)-memory embedded path; a per-band
-        # Python loop calling np.sum() 3*n_bands times per frame would cost 48
-        # separate reductions per frame for the default 16 bands instead of 3
-        # matrix-vector products against these static, once-built matrices.
-        self._band_energy_full_mask_matrix = np.array(self._band_energy_full_masks, dtype=np.float64)
-        self._band_energy_covered_mask_matrix = np.array(self._band_energy_masks, dtype=np.float64)
-        self._band_total_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
-        self._band_covered_total_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
-        self._band_noise_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
+        # Validated unconditionally (matching the batch path's
+        # _detect_rain_over_time, which always calls normalize_bands()
+        # regardless of band_energy_summary_enable) so an invalid
+        # band_energy_summary_bands override fails the same way in both
+        # paths, even while the feature itself is off — only the expensive
+        # mask/matrix allocation below is actually gated by the enable flag.
+        band_energy_bands = normalize_bands(band_energy_summary_bands)
+        self._band_energy_names = ()
+        self._band_energy_coverage_fraction = None
+        self._band_energy_full_mask_matrix = None
+        self._band_energy_covered_mask_matrix = None
+        self._band_total_energy_sum = None
+        self._band_covered_total_energy_sum = None
+        self._band_noise_energy_sum = None
+        if self._band_energy_summary_enable:
+            self._band_energy_names = tuple(name for name, _, _ in band_energy_bands)
+            n_energy_bands = len(band_energy_bands)
+            band_energy_full_masks = [
+                band_freq_mask(self._freqs, lo, hi, is_last_band=(i == n_energy_bands - 1))
+                for i, (_, lo, hi) in enumerate(band_energy_bands)
+            ]
+            band_energy_masks = [
+                band_freq_mask(self._freqs_band, lo, hi, is_last_band=(i == n_energy_bands - 1))
+                for i, (_, lo, hi) in enumerate(band_energy_bands)
+            ]
+            self._band_energy_coverage_fraction = np.array(
+                [
+                    band_coverage_fraction(band_energy_full_masks[i], band_energy_masks[i])
+                    for i in range(n_energy_bands)
+                ],
+                dtype=np.float64,
+            )
+            # Precomputed 0/1 matrices for vectorized per-frame accumulation.
+            # process_audio_frame() is the O(1)-memory embedded path; a per-band
+            # Python loop calling np.sum() 3*n_bands times per frame would cost 48
+            # separate reductions per frame for the default 16 bands instead of 3
+            # matrix-vector products against these static, once-built matrices.
+            self._band_energy_full_mask_matrix = np.array(band_energy_full_masks, dtype=np.float64)
+            self._band_energy_covered_mask_matrix = np.array(band_energy_masks, dtype=np.float64)
+            self._band_total_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
+            self._band_covered_total_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
+            self._band_noise_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
 
     # ------------------------------------------------------------------
     # State management
@@ -1716,9 +1728,10 @@ class RainFrameClassifierState:
         self._combined_tracker.reset()
         for tracker in self._mode_trackers:
             tracker.reset()
-        self._band_total_energy_sum[:] = 0.0
-        self._band_covered_total_energy_sum[:] = 0.0
-        self._band_noise_energy_sum[:] = 0.0
+        if self._band_energy_summary_enable:
+            self._band_total_energy_sum[:] = 0.0
+            self._band_covered_total_energy_sum[:] = 0.0
+            self._band_noise_energy_sum[:] = 0.0
 
     def get_band_energy_summary(self) -> Dict[str, float]:
         """

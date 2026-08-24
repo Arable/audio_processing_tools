@@ -105,10 +105,26 @@ def normalize_bands(
     be a worse surprise than a clear, immediate error. Any already-sorted list
     (the overwhelmingly common case, since these are naturally ascending
     frequency ranges) is entirely unaffected.
+
+    Also requires each band to be non-reversed (lo < hi) and the sequence to
+    be non-overlapping (hi of band i <= lo of band i+1): sorted-by-lo alone
+    permits overlapping ranges, which band_freq_mask's non-overlapping-sequence
+    assumption doesn't guard against on its own — an overlap would silently
+    double-count every bin in the shared region into both bands.
+
+    Also requires at least one band: an empty sequence has no natural "last
+    band" to receive the closed-interval Nyquist-adjacent bin, and callers
+    that build one static mask matrix per band (e.g.
+    RainFrameClassifierState's streaming accumulator) would get a
+    zero-row matrix that can't be matrix-multiplied against a per-frame
+    power vector — reject it here rather than let it fail downstream with an
+    unrelated shape-mismatch error.
     """
     if bands is None:
         bands = default_spectral_occupancy_bands()
     normalized = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
+    if not normalized:
+        raise ValueError("bands must not be empty")
     los = [lo for _, lo, _ in normalized]
     if los != sorted(los):
         raise ValueError(
@@ -116,6 +132,15 @@ def normalize_bands(
             "half-open-except-last convention requires the last band in "
             f"iteration order to cover the top of the spectrum); got los={los!r}"
         )
+    for name, lo, hi in normalized:
+        if not lo < hi:
+            raise ValueError(f"band {name!r} has reversed/zero-width bounds: lo={lo!r}, hi={hi!r}")
+    for (name_a, _, hi_a), (name_b, lo_b, _) in zip(normalized, normalized[1:], strict=False):
+        if hi_a > lo_b:
+            raise ValueError(
+                f"bands must not overlap: {name_a!r} ends at {hi_a!r}, "
+                f"{name_b!r} starts at {lo_b!r}"
+            )
     return normalized
 
 

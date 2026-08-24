@@ -127,6 +127,47 @@ def test_normalize_bands_rejects_unsorted_custom_bands():
         normalize_bands(unsorted)
 
 
+def test_normalize_bands_rejects_overlapping_custom_bands():
+    """A sorted-by-lo but overlapping custom bands list must be rejected.
+
+    Sorted-ascending-by-lo alone doesn't guarantee non-overlap: band_freq_mask
+    assumes a contiguous, non-overlapping sequence, so an overlap would
+    silently double-count every bin in the shared region into both bands —
+    the same failure class the unsorted-bands check targets, reachable via a
+    different path.
+    """
+    overlapping = [("a", 400.0, 1000.0), ("b", 900.0, 3500.0)]
+    with pytest.raises(ValueError, match="must not overlap"):
+        normalize_bands(overlapping)
+
+
+def test_normalize_bands_accepts_touching_and_gapped_custom_bands():
+    """Bands that exactly touch (hi == next lo) or leave a gap are both fine — only overlap is rejected."""
+    touching = [("a", 400.0, 1000.0), ("b", 1000.0, 3500.0)]
+    assert normalize_bands(touching) == (("a", 400.0, 1000.0), ("b", 1000.0, 3500.0))
+
+    gapped = [("a", 400.0, 900.0), ("b", 1000.0, 3500.0)]
+    assert normalize_bands(gapped) == (("a", 400.0, 900.0), ("b", 1000.0, 3500.0))
+
+
+def test_normalize_bands_rejects_reversed_or_zero_width_band():
+    """A band whose lo is not strictly less than hi must be rejected, not silently masked as empty."""
+    with pytest.raises(ValueError, match="reversed/zero-width"):
+        normalize_bands([("backwards", 1000.0, 400.0)])
+    with pytest.raises(ValueError, match="reversed/zero-width"):
+        normalize_bands([("zero_width", 500.0, 500.0)])
+
+
+def test_normalize_bands_rejects_empty_sequence():
+    """An empty bands list must be rejected at construction.
+
+    Otherwise it produces a zero-row mask matrix that fails downstream with
+    an unrelated matmul shape-mismatch error.
+    """
+    with pytest.raises(ValueError, match="must not be empty"):
+        normalize_bands([])
+
+
 def test_normalize_bands_accepts_already_sorted_custom_bands():
     """An already-ascending custom bands list must pass through unchanged."""
     sorted_bands = [("mid", 436.015625, 2790.5), ("top", 2790.5, 3575.328125)]
