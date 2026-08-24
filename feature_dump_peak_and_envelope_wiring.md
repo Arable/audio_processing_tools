@@ -1,7 +1,9 @@
 # Feature-Dump Wiring: Peak Summary + TD Envelope
 
 **File:** `edge/rain_frame_classifier.py`
-**Branch:** `main` (both fixes applied; peak-summary verified against real data, td-envelope not yet smoke-tested)
+**Branch:** `main` (both fixes applied, committed as `f501362`; peak-summary verified against real data, td-envelope not yet smoke-tested)
+
+**Addendum (2026-08-24):** a separate, unrelated correctness bug was found and fixed in the underlying `td_fall_time_sec`/`td_fall_slope` computation itself (`feature_extraction.py:427`, commit `d76f2b4`) — `fall_dt` was measuring peak→10% instead of 90%→10%, asymmetric with `rise_dt`. Relevant here because it means the six `td_*` fields this doc's Fix 2 exposes are now numerically correct, not just wired up. See `CLAUDE.md` session log 2026-08-24 for detail.
 
 ## Scope of this doc
 
