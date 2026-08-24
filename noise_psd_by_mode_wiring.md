@@ -407,3 +407,38 @@ exactly (the integration-level regression test for the confirmed bug above).
 Final count: 26 tests in `tests/edge/rain_detection/`, all passing; both new test files remain
 `ruff`-clean; no new lint findings introduced in the modified source files (`ruff check
 --select F,E9` shows only the same 2 pre-existing, unrelated findings from before this diff).
+
+## Seventh round: PR review on GitHub — sorting itself was the wrong fix
+
+A review of the pushed PR (Codex) flagged that the sixth round's fix — `normalize_bands()`
+**silently sorting** bands ascending by `lo` — was itself a compatibility risk, not just for the
+new `band_energy_summary_bands` parameter but for the *existing*
+`compute_clip_spectral_occupancy_stats()`, which now routes through the same helper.
+`compute_clip_spectral_occupancy_stats()` is an established function with callers outside this
+repo (this doc's own history references `rain_anomaly_analysis`); previously, callers who passed
+a custom `bands=` list got output arrays (`band_names`, `rain_log_power_mean`,
+`no_rain_power_ratio_p90`, etc.) in exactly the order they supplied. Silently re-sorting that list
+would reorder those output arrays without warning — a worse surprise for any caller relying on
+positional alignment than the original boundary-bin bug being fixed.
+
+**Fix:** `normalize_bands()` now **validates** that `bands` is sorted ascending by `lo` and raises
+`ValueError` if not, instead of silently re-sorting. This is strictly safer than the sixth round's
+fix even for the original bug: silent reordering could *also* surprise a caller of the brand-new
+`band_energy_summary_bands` parameter who listed bands in a specific (non-ascending) order for
+their own reasons. Any already-ascending list — the default, and the overwhelmingly likely shape
+of any real caller's list, since these are naturally frequency ranges — is completely unaffected;
+only a genuinely out-of-order list now fails loudly at construction time instead of either
+silently reordering (six-round fix) or silently mis-masking (original bug).
+
+**Tests updated:** the sixth round's "sorts unsorted bands" test became
+`test_normalize_bands_rejects_unsorted_custom_bands` (expects `ValueError`); added
+`test_normalize_bands_accepts_already_sorted_custom_bands` and
+`test_sorted_custom_bands_conserve_total_energy` (the boundary-energy-conservation check, now
+using an already-sorted list since that's the only case that should succeed); added
+`test_unsorted_band_energy_summary_bands_raises`, an integration-level check that
+`RainFrameClassifierState.from_mixin()` itself raises for an unsorted
+`band_energy_summary_bands` override, not just the `normalize_bands()` unit.
+
+Final count: 28 tests in `tests/edge/rain_detection/`, all passing; both new test files remain
+`ruff`-clean; no new lint findings in the modified source files beyond the same 2 pre-existing,
+unrelated ones.

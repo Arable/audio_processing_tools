@@ -90,20 +90,33 @@ def normalize_bands(
     bands: tuple[tuple[str, float, float], ...] | None,
 ) -> tuple[tuple[str, float, float], ...]:
     """
-    Normalize a band-definition sequence to (str, float, float) triples,
-    sorted ascending by lo. None defaults to default_spectral_occupancy_bands().
+    Normalize a band-definition sequence to (str, float, float) triples.
+    None defaults to default_spectral_occupancy_bands().
 
-    Sorting is required, not cosmetic: band_freq_mask's half-open-except-last
-    convention assumes "last in iteration order" means "covers the top of the
-    spectrum" — an unsorted caller-supplied bands list would otherwise silently
-    drop the true top-edge bin from every band (none of them get is_last_band's
-    closed upper bound) and double-count whichever bin ends up sitting at the
-    boundary between the (wrongly-ordered) last two bands.
+    Requires bands to already be sorted ascending by lo and raises ValueError
+    if not, rather than silently re-sorting: band_freq_mask's
+    half-open-except-last convention assumes "last in iteration order" means
+    "covers the top of the spectrum", so an out-of-order list would otherwise
+    silently drop the true top-edge bin and double-count a boundary bin.
+    compute_clip_spectral_occupancy_stats() is an existing, externally-consumed
+    function whose callers may rely on positional order between a
+    caller-supplied bands list and its output arrays (band_names,
+    rain_log_power_mean, etc.) — silently reordering those callers' input would
+    be a worse surprise than a clear, immediate error. Any already-sorted list
+    (the overwhelmingly common case, since these are naturally ascending
+    frequency ranges) is entirely unaffected.
     """
     if bands is None:
         bands = default_spectral_occupancy_bands()
     normalized = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
-    return tuple(sorted(normalized, key=lambda b: b[1]))
+    los = [lo for _, lo, _ in normalized]
+    if los != sorted(los):
+        raise ValueError(
+            "bands must be sorted ascending by lo (band_freq_mask's "
+            "half-open-except-last convention requires the last band in "
+            f"iteration order to cover the top of the spectrum); got los={los!r}"
+        )
+    return normalized
 
 
 def band_coverage_fraction(full_mask: np.ndarray, covered_mask: np.ndarray) -> float:

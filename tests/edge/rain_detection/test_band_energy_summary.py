@@ -325,6 +325,16 @@ def test_band_energy_summary_bands_are_overridable(detector_params, deterministi
     }
 
 
+def test_unsorted_band_energy_summary_bands_raises(detector_params):
+    """An unsorted custom bands list must fail loudly at construction, not silently reorder/corrupt."""
+    freqs = _freqs()
+    params = dict(detector_params)
+    params["band_energy_summary_enable"] = True
+    params["band_energy_summary_bands"] = [("high", 1000.0, 3500.0), ("low", 400.0, 1000.0)]
+    with pytest.raises(ValueError, match="sorted ascending"):
+        RainFrameClassifierState.from_mixin(_StreamMixin(params), freqs)
+
+
 def test_streaming_band_outside_operating_band_has_zero_coverage(detector_params, deterministic_audio):
     """A band fully below operating_band reports zero coverage in the streaming path too."""
     state = _build_state(detector_params, enable_summary=True, operating_band=(400.0, 3500.0))

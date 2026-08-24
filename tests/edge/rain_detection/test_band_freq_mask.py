@@ -8,6 +8,7 @@ not a hypothetical edge case.
 """
 
 import numpy as np
+import pytest
 
 from audio_processing_tools.edge.feature_extraction import (
     band_freq_mask,
@@ -109,17 +110,27 @@ def test_clip_spectral_occupancy_does_not_double_count_boundary_energy():
     assert inter_1_val > 0.0
 
 
-def test_normalize_bands_sorts_unsorted_custom_bands():
-    """A caller-supplied bands list out of ascending-lo order must be sorted.
+def test_normalize_bands_rejects_unsorted_custom_bands():
+    """A caller-supplied bands list out of ascending-lo order must be rejected.
 
     band_freq_mask's is_last_band convention assumes iteration order matches
     frequency order — the last band in the sequence is the one that gets the
-    closed upper bound. An unsorted list would otherwise silently drop the
-    true top-of-spectrum edge bin (no band gets treated as covering it) and
-    mis-assign whichever bin sits at the wrongly-ordered final boundary.
+    closed upper bound. Silently re-sorting an out-of-order list would risk
+    surprising an existing caller of compute_clip_spectral_occupancy_stats()
+    who relies on positional alignment between their supplied bands and its
+    output arrays (band_names, rain_log_power_mean, etc.) — so an out-of-order
+    list is rejected with a clear error instead, rather than silently
+    reordered or silently mis-masked.
     """
     unsorted = [("top", 2790.5, 3575.328125), ("mid", 436.015625, 2790.5)]
-    normalized = normalize_bands(unsorted)
+    with pytest.raises(ValueError, match="sorted ascending"):
+        normalize_bands(unsorted)
+
+
+def test_normalize_bands_accepts_already_sorted_custom_bands():
+    """An already-ascending custom bands list must pass through unchanged."""
+    sorted_bands = [("mid", 436.015625, 2790.5), ("top", 2790.5, 3575.328125)]
+    normalized = normalize_bands(sorted_bands)
     assert normalized == (
         ("mid", 436.015625, 2790.5),
         ("top", 2790.5, 3575.328125),
@@ -131,12 +142,14 @@ def test_normalize_bands_defaults_to_spectral_occupancy_bands():
     assert normalize_bands(None) == default_spectral_occupancy_bands()
 
 
-def test_unsorted_custom_bands_conserve_total_energy():
-    """Integration check: an unsorted custom bands list must not drop or double-count energy.
+def test_sorted_custom_bands_conserve_total_energy():
+    """Integration check: a sorted custom bands list must not drop or double-count energy.
 
     Regression test for the confirmed bug where an unsorted
-    band_energy_summary_bands override silently dropped the true top-of-
-    spectrum edge bin and double-counted an internal boundary bin.
+    band_energy_summary_bands override would have silently dropped the true
+    top-of-spectrum edge bin and double-counted an internal boundary bin —
+    now caught by normalize_bands() raising instead, so only the correctly
+    sorted (accepted) case needs to conserve energy exactly.
     """
     freqs = _freqs()
     T = 3
@@ -152,8 +165,8 @@ def test_unsorted_custom_bands_conserve_total_energy():
     assert freqs[boundary_idx] == 2790.5
     raw_power[boundary_idx, :] = 500.0
 
-    unsorted = [("top", 2790.5, 3575.328125), ("mid", 436.015625, 2790.5)]
-    normalized = normalize_bands(unsorted)
+    sorted_bands = [("mid", 436.015625, 2790.5), ("top", 2790.5, 3575.328125)]
+    normalized = normalize_bands(sorted_bands)
     n_bands = len(normalized)
     total_by_band = {}
     for i, (name, lo, hi) in enumerate(normalized):
