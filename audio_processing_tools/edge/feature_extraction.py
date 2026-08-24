@@ -424,7 +424,7 @@ def extract_td_features_inline(
             i_lo_fall = int(i_hi_fall + below_lo[0]) if below_lo.size else int(max(right.size - 1, 0))
 
             rise_dt = float(max(i_hi - i_lo, 0)) * dt_sec
-            fall_dt = float(max(i_lo_fall, 0)) * dt_sec
+            fall_dt = float(max(i_lo_fall - i_hi_fall, 0)) * dt_sec
             rise_time[p] = rise_dt
             fall_time[p] = fall_dt
 
