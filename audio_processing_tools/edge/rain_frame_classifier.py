@@ -10,10 +10,13 @@ from audio_processing_tools.edge.noise_tracker import CausalNoiseTracker
 from audio_processing_tools.edge.feature_extraction import (
     RAW_SPECTRAL_FEATURE_NAMES,
     TD_FEATURE_NAMES,
+    band_coverage_fraction,
+    band_freq_mask,
     compute_clip_spectral_occupancy_stats,
     extract_raw_spectral_shape_features_inline,
     extract_td_features_causal_frame_inline,
     extract_td_features_inline,
+    normalize_bands,
 )
 
 
@@ -346,7 +349,8 @@ class RainFrameClassifierMixin:
         rain_energy_summary_band = self._dget("rain_energy_summary_band", (400.0, 700.0))
         rain_energy_summary_lo = float(rain_energy_summary_band[0])
         rain_energy_summary_hi = float(rain_energy_summary_band[1])
-        mode_snr_summary_enable = bool(self._dget("mode_snr_summary_enable", False))
+        band_energy_summary_enable = bool(self._dget("band_energy_summary_enable", False))
+        band_energy_summary_bands = normalize_bands(self._dget("band_energy_summary_bands", None))
 
         op_band = self._dget("operating_band", (400.0, 3500.0))
         op_lo, op_hi = float(op_band[0]), float(op_band[1])
@@ -970,7 +974,7 @@ class RainFrameClassifierMixin:
         frame_class[is_rain] = FrameClass.RAIN
 
         # Shared noise_psd availability check for rain_energy_summary and
-        # mode_snr_summary below. noise_psd is only ever populated (by
+        # band_energy_summary below. noise_psd is only ever populated (by
         # _estimate_noise_psd_fft) inside cfg.operating_band — bins outside it are
         # left at 0.0, not "unavailable" — so both consumers additionally restrict
         # their band masks to band_mask (the operating-band mask) below, rather than
@@ -982,11 +986,32 @@ class RainFrameClassifierMixin:
             and noise_psd_arr.shape == raw_power.shape
         )
 
+        def _full_width_band_mask(lo: float, hi: float, *, is_last_band: bool = True) -> np.ndarray:
+            """band_freq_mask against the full freqs array — shared by
+            rain_energy_summary and band_energy_summary below (and matching
+            compute_clip_spectral_occupancy_stats's own convention) so a bin
+            sitting exactly on a shared boundary between two adjacent bands is
+            never double-counted. is_last_band=True (the default) is correct
+            for a standalone single band; band_energy_summary's loop over a
+            contiguous band sequence passes it explicitly per band."""
+            return band_freq_mask(freqs, lo, hi, is_last_band=is_last_band)
+
+        def _band_sum(arr: Optional[np.ndarray], mask: np.ndarray) -> float:
+            """Sum arr over frequency bins in mask, all frames. 0.0 if arr is
+            unavailable or mask selects no bins — never raises on empty coverage."""
+            if arr is None or not np.any(mask):
+                return 0.0
+            return float(np.sum(arr[mask, :]))
+
         rain_energy_summary: Dict[str, float] = {}
         if rain_energy_summary_enable:
-            rain_band_mask_energy = (
-                (freqs >= rain_energy_summary_lo) & (freqs <= rain_energy_summary_hi) & band_mask
-            )
+            # Restricted to band_mask: noise_psd is only ever estimated inside
+            # operating_band, so a bin outside it would otherwise read as a real
+            # (but always-zero) noise estimate, not "no data". Applied to both
+            # terms here (unlike band_energy_summary below) since this feature is
+            # specifically a rain-vs-noise energy comparison within one band, not
+            # an independent total-energy report.
+            rain_band_mask_energy = _full_width_band_mask(rain_energy_summary_lo, rain_energy_summary_hi) & band_mask
             if raw_power is not None and np.any(rain_band_mask_energy):
                 rain_band_energy_t = np.sum(raw_power[rain_band_mask_energy, :], axis=0)
                 stft_rain_band_energy_sum = float(np.sum(rain_band_energy_t))
@@ -1012,41 +1037,63 @@ class RainFrameClassifierMixin:
                     "stft_rain_minus_noise_energy_sum": 0.0,
                 }
 
-        # Clip-level (not per-frame) signal-to-noise ratio per mode band, from the
-        # real per-bin causal noise tracker (noise_psd), not a proxy. raw_power is
-        # observed signal+noise power, not signal power, so signal energy is
-        # recovered as raw_power - noise_psd (clipped at 0), not raw_power itself —
-        # otherwise this reports (S+N)/N rather than S/N and can never read as
-        # noise-only. No numeric value is emitted when noise_psd isn't actually
-        # available (e.g. detector_use_noise_norm=False): an artificially huge
-        # raw_power/eps ratio would silently contaminate downstream data.
-        mode_snr_summary: Dict[str, float] = {}
-        mode_snr_summary_error: Optional[str] = None
-        if mode_snr_summary_enable:
+        # Clip-level (not per-frame) per-band STFT energy sums, from the real
+        # per-bin causal noise tracker (noise_psd), not a proxy — total_energy_sum
+        # (raw_power, i.e. observed signal+noise, matching how rain frames are
+        # folded into clip_spectral_occupancy's S+N stats rather than split out)
+        # and noise_energy_sum (noise_psd) side by side, so any signal/noise
+        # comparison happens downstream rather than inside the detector. Uses the
+        # same 16 semantic bands as clip_spectral_occupancy (default_spectral_
+        # occupancy_bands()) by default, not the 5 detection mode_bands, so the
+        # two features are directly comparable band-for-band; override via
+        # band_energy_summary_bands.
+        #
+        # total_energy_sum is NOT restricted to operating_band: raw_power is a
+        # real measurement everywhere on the freq grid (same convention as
+        # clip_spectral_occupancy, which also doesn't restrict to operating_band),
+        # unlike noise_psd, which is only ever estimated inside operating_band and
+        # is exactly 0.0 outside it — not "no data". covered_total_energy_sum and
+        # noise_energy_sum ARE both restricted to the same covered_mask (band_mask
+        # intersection) for that reason — they must share the same frequency
+        # domain, or a downstream signal = covered_total - noise computation would
+        # silently include uncovered-region energy with no matching noise
+        # estimate, inflating "signal" by however much energy happens to sit in
+        # the untracked portion. total_energy_sum stays available separately for
+        # occupancy-style uses that want the full band regardless of operating_band.
+        # Since the 16 default bands span ~0-3575Hz while operating_band defaults
+        # to 400-3500Hz, a band can be fully, partially, or not-at-all inside
+        # operating_band; coverage_fraction (covered bins / total bins in the
+        # band) makes that explicit per band rather than leaving "0.0" ambiguous
+        # between "measured as zero" and "not measured here" — e.g. dc/wind_1
+        # read coverage_fraction=0.0 by default.
+        #
+        # These are STFT-domain sums (sum of |FFT|^2 over bins and frames), not
+        # physical energy in joules: with n_fft=256/hop=128 (50% overlap), each
+        # sample is counted in two overlapping analysis frames, and the absolute
+        # scale otherwise depends on window shape, n_fft, and hop — only relative/
+        # ratio comparisons across clips or bands are meaningful, not the absolute
+        # magnitude.
+        band_energy_summary: Dict[str, float] = {}
+        band_energy_summary_error: Optional[str] = None
+        if band_energy_summary_enable:
             if not have_noise_psd:
-                mode_snr_summary_error = (
-                    "raw_power and a matching-shape noise_psd are required for mode_snr_summary"
+                band_energy_summary_error = (
+                    "raw_power and a matching-shape noise_psd are required for band_energy_summary"
                 )
             else:
-                for i, (mode_lo, mode_hi) in enumerate(mode_bands):
-                    # Restricted to band_mask: noise_psd is only ever estimated inside
-                    # operating_band, so a mode band bin outside it would otherwise read
-                    # as a real (but always-zero) noise estimate, not "no data".
-                    mode_mask_full = (freqs >= mode_lo) & (freqs <= mode_hi) & band_mask
-                    if not np.any(mode_mask_full):
-                        mode_snr_summary[f"mode_signal_energy_sum_{i}"] = 0.0
-                        mode_snr_summary[f"mode_noise_energy_sum_{i}"] = 0.0
-                        mode_snr_summary[f"mode_snr_{i}"] = 0.0
-                        mode_snr_summary[f"mode_snr_db_{i}"] = float(10.0 * np.log10(eps))
-                        continue
-                    total_energy_sum = float(np.sum(raw_power[mode_mask_full, :]))
-                    noise_energy_sum = float(np.sum(noise_psd_arr[mode_mask_full, :]))
-                    signal_energy_sum = max(total_energy_sum - noise_energy_sum, 0.0)
-                    snr = signal_energy_sum / max(noise_energy_sum, eps)
-                    mode_snr_summary[f"mode_signal_energy_sum_{i}"] = signal_energy_sum
-                    mode_snr_summary[f"mode_noise_energy_sum_{i}"] = noise_energy_sum
-                    mode_snr_summary[f"mode_snr_{i}"] = snr
-                    mode_snr_summary[f"mode_snr_db_{i}"] = float(10.0 * np.log10(max(snr, eps)))
+                n_bands = len(band_energy_summary_bands)
+                for i, (band_name, band_lo, band_hi) in enumerate(band_energy_summary_bands):
+                    full_mask = _full_width_band_mask(band_lo, band_hi, is_last_band=(i == n_bands - 1))
+                    covered_mask = full_mask & band_mask
+                    total_bins = int(np.sum(full_mask))
+                    covered_bins = int(np.sum(covered_mask))
+                    coverage_fraction = float(covered_bins) / float(total_bins) if total_bins > 0 else 0.0
+                    band_energy_summary[f"{band_name}_total_energy_sum"] = _band_sum(raw_power, full_mask)
+                    band_energy_summary[f"{band_name}_covered_total_energy_sum"] = _band_sum(
+                        raw_power, covered_mask
+                    )
+                    band_energy_summary[f"{band_name}_noise_energy_sum"] = _band_sum(noise_psd_arr, covered_mask)
+                    band_energy_summary[f"{band_name}_coverage_fraction"] = coverage_fraction
 
         det_debug = {
             "mode_flux_score": mode_flux_score,
@@ -1095,17 +1142,17 @@ class RainFrameClassifierMixin:
             "td_feature_timing_mode": td_feature_timing_mode,
             "clip_spectral_occupancy_enable": clip_spectral_occupancy_enable,
             "rain_energy_summary_enable": rain_energy_summary_enable,
-            "mode_snr_summary_enable": mode_snr_summary_enable,
+            "band_energy_summary_enable": band_energy_summary_enable,
         }
 
         if rain_energy_summary_enable:
             det_debug["rain_energy_summary"] = rain_energy_summary
 
-        if mode_snr_summary_enable:
-            if mode_snr_summary_error is not None:
-                det_debug["mode_snr_summary_error"] = mode_snr_summary_error
+        if band_energy_summary_enable:
+            if band_energy_summary_error is not None:
+                det_debug["band_energy_summary_error"] = band_energy_summary_error
             else:
-                det_debug["mode_snr_summary"] = mode_snr_summary
+                det_debug["band_energy_summary"] = band_energy_summary
         # Registry-driven raw spectral debug wiring.
         det_debug.update(aligned_raw_spectral)
 
@@ -1238,8 +1285,8 @@ class RainFrameClassifierMixin:
             if feature_dump_clip_summary_enable and clip_spectral_occupancy:
                 fd_clip_summary["clip_spectral_occupancy"] = clip_spectral_occupancy
 
-            if feature_dump_clip_summary_enable and mode_snr_summary:
-                fd_clip_summary["mode_snr_summary"] = mode_snr_summary
+            if feature_dump_clip_summary_enable and band_energy_summary:
+                fd_clip_summary["band_energy_summary"] = band_energy_summary
 
             # Keep backward-compatible flat feature_dump structure.
             # The downstream flattening loader supports both flat and 3-tier formats.
@@ -1417,6 +1464,12 @@ class RainFrameClassifierState:
         noise_tracker_adaptive_q_enable: bool = False,
         noise_tracker_adaptive_q_min: float = 0.10,
         noise_tracker_adaptive_q_alpha: float = 0.95,
+        # Clip-level per-band STFT energy accumulators (process_audio_frame only).
+        # Defaults to the same 16 semantic bands as clip_spectral_occupancy, not
+        # the detection mode_bands, so the two features are directly comparable.
+        band_energy_summary_enable: bool = False,
+        band_energy_summary_bands=None,
+        band_energy_summary_expose_per_frame: bool = False,
     ):
         dtype = resolve_np_dtype(process_dtype)
         self._dtype = dtype
@@ -1588,6 +1641,63 @@ class RainFrameClassifierState:
             dtype=dtype,
         )
 
+        # Clip-level per-band STFT energy accumulators, updated by
+        # process_audio_frame() (the self-contained frame-level entry point that
+        # actually has both P_t/P_band_t and N_band_t available together each
+        # frame). Defaults to the same 16 semantic bands as clip_spectral_
+        # occupancy, not the 5 detection mode_bands.
+        #
+        # total_energy uses masks against self._freqs (full width, matching P_t):
+        # raw power is a real measurement everywhere, same convention as
+        # clip_spectral_occupancy. noise_energy uses masks against
+        # self._freqs_band (already operating_band-restricted, matching N_band_t
+        # / P_band_t) since noise is only ever estimated inside operating_band —
+        # so a band outside operating_band naturally gets an empty noise mask
+        # without needing a separate coverage-gap guard, unlike the batch path's
+        # full-width arrays. band_energy_coverage_fraction (covered bins / total
+        # bins per band) is static per band — computed once here, not per frame —
+        # and makes partial/no operating_band coverage explicit rather than
+        # leaving a 0.0 noise sum ambiguous between "measured as zero" and "not
+        # measured here".
+        #
+        # Both mask sets use band_freq_mask's half-open-except-last convention so
+        # a bin sitting exactly on a shared boundary between two adjacent bands
+        # (guaranteed for every boundary in the default 16 bands, given this
+        # module's fs/n_fft) is never double-counted.
+        #
+        # O(1) memory: three length-n_bands arrays (two running sums + one static
+        # coverage fraction), not a per-frame history.
+        self._band_energy_summary_enable = bool(band_energy_summary_enable)
+        self._band_energy_expose_per_frame = bool(band_energy_summary_expose_per_frame)
+        self._band_energy_bands = normalize_bands(band_energy_summary_bands)
+        self._band_energy_names = tuple(name for name, _, _ in self._band_energy_bands)
+        n_energy_bands = len(self._band_energy_bands)
+        self._band_energy_full_masks = [
+            band_freq_mask(self._freqs, lo, hi, is_last_band=(i == n_energy_bands - 1))
+            for i, (_, lo, hi) in enumerate(self._band_energy_bands)
+        ]
+        self._band_energy_masks = [
+            band_freq_mask(self._freqs_band, lo, hi, is_last_band=(i == n_energy_bands - 1))
+            for i, (_, lo, hi) in enumerate(self._band_energy_bands)
+        ]
+        self._band_energy_coverage_fraction = np.array(
+            [
+                band_coverage_fraction(self._band_energy_full_masks[i], self._band_energy_masks[i])
+                for i in range(n_energy_bands)
+            ],
+            dtype=np.float64,
+        )
+        # Precomputed 0/1 matrices for vectorized per-frame accumulation.
+        # process_audio_frame() is the O(1)-memory embedded path; a per-band
+        # Python loop calling np.sum() 3*n_bands times per frame would cost 48
+        # separate reductions per frame for the default 16 bands instead of 3
+        # matrix-vector products against these static, once-built matrices.
+        self._band_energy_full_mask_matrix = np.array(self._band_energy_full_masks, dtype=np.float64)
+        self._band_energy_covered_mask_matrix = np.array(self._band_energy_masks, dtype=np.float64)
+        self._band_total_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
+        self._band_covered_total_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
+        self._band_noise_energy_sum = np.zeros(n_energy_bands, dtype=np.float64)
+
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
@@ -1606,6 +1716,54 @@ class RainFrameClassifierState:
         self._combined_tracker.reset()
         for tracker in self._mode_trackers:
             tracker.reset()
+        self._band_total_energy_sum[:] = 0.0
+        self._band_covered_total_energy_sum[:] = 0.0
+        self._band_noise_energy_sum[:] = 0.0
+
+    def get_band_energy_summary(self) -> Dict[str, float]:
+        """
+        Clip-level per-band STFT energy sums accumulated so far via
+        process_audio_frame() calls since the last reset().
+
+        Returns {} if band_energy_summary_enable is False — the accumulators
+        aren't updated in that case, so returning a dict of stale zeros would
+        be indistinguishable from a real all-silent clip.
+
+        {name}_total_energy_sum (full frequency grid, all frames, S+N together
+        — no rain-frame exclusion, matching how rain frames are folded into
+        clip_spectral_occupancy's stats rather than split out) is a running sum
+        for each of self._band_energy_bands (the same 16 semantic bands as
+        clip_spectral_occupancy by default), regardless of operating_band
+        coverage — useful for occupancy-style comparisons across the whole band.
+
+        {name}_covered_total_energy_sum and {name}_noise_energy_sum are BOTH
+        restricted to the same operating_band-intersected region (noise is only
+        ever estimated inside operating_band) — they share one frequency domain
+        on purpose, so a downstream SNR-style computation
+        (``signal = max(covered_total_energy_sum - noise_energy_sum, 0.0)``)
+        never mixes energy from a region with no noise estimate into "signal".
+        total_energy_sum alone is NOT domain-matched to noise_energy_sum for a
+        partially-covered band and must not be used for that computation.
+
+        {name}_coverage_fraction (covered bins / total bins in the band) makes a
+        band's operating_band coverage explicit — 0.0 means "not measured here",
+        not "measured as silent".
+
+        These are STFT-domain sums (sum of |FFT|^2 over bins and frames), not
+        physical energy in joules: with 50% frame overlap (n_fft=256, hop=128),
+        each audio sample is counted in two overlapping analysis frames, and the
+        absolute scale otherwise depends on window shape, n_fft, and hop — only
+        relative/ratio comparisons across clips or bands are meaningful.
+        """
+        if not self._band_energy_summary_enable:
+            return {}
+        summary: Dict[str, float] = {}
+        for i, name in enumerate(self._band_energy_names):
+            summary[f"{name}_total_energy_sum"] = float(self._band_total_energy_sum[i])
+            summary[f"{name}_covered_total_energy_sum"] = float(self._band_covered_total_energy_sum[i])
+            summary[f"{name}_noise_energy_sum"] = float(self._band_noise_energy_sum[i])
+            summary[f"{name}_coverage_fraction"] = float(self._band_energy_coverage_fraction[i])
+        return summary
 
     def seed_audio(self, chunk: np.ndarray) -> None:
         """
@@ -2060,6 +2218,30 @@ class RainFrameClassifierState:
             10.0 * np.log10(P_band_t + eps) - 10.0 * np.log10(N_band_t + eps)
         )
 
+        # 3b) Accumulate clip-level per-band STFT energy sums (O(1): running
+        # totals, not a per-frame history). total_energy sums P_t (full-width,
+        # every bin is a real measurement) over self._band_energy_full_masks.
+        # covered_total_energy and noise_energy BOTH sum over the same
+        # self._band_energy_masks (operating_band-restricted: P_band_t/N_band_t
+        # are already restricted to it) — they must share one frequency domain,
+        # or signal = covered_total - noise would silently include energy from a
+        # region with no matching noise estimate for a partially-covered band.
+        # All frames count toward total_energy, including rain frames (S+N
+        # together) — see get_band_energy_summary().
+        frame_band_total_energy: Optional[np.ndarray] = None
+        frame_band_covered_total_energy: Optional[np.ndarray] = None
+        frame_band_noise_energy: Optional[np.ndarray] = None
+        if self._band_energy_summary_enable:
+            # Matrix-vector products against the static, once-built mask
+            # matrices — not a per-band Python loop of np.sum() calls, which
+            # would cost 3*n_bands reductions every single frame.
+            frame_band_total_energy = self._band_energy_full_mask_matrix @ P_t
+            frame_band_covered_total_energy = self._band_energy_covered_mask_matrix @ P_band_t
+            frame_band_noise_energy = self._band_energy_covered_mask_matrix @ N_band_t
+            self._band_total_energy_sum += frame_band_total_energy
+            self._band_covered_total_energy_sum += frame_band_covered_total_energy
+            self._band_noise_energy_sum += frame_band_noise_energy
+
         # 4) TD and raw-spectral features from the rolling buffers.
         # Pass P_t so extract_raw_spectral_shape_features_inline reuses the
         # already-computed FFT frame instead of running a second STFT.
@@ -2072,6 +2254,15 @@ class RainFrameClassifierState:
         result["noise_floor_db"] = float(
             10.0 * np.log10(float(np.mean(N_band_t)) + eps)
         )
+        # Per-frame band energy breakdown is a diagnostic (used to validate the
+        # O(1) accumulator against a naive frame-by-frame sum) — kept out of the
+        # production per-frame payload unless explicitly requested, since it adds
+        # 3*n_bands keys to every single frame's result.
+        if self._band_energy_summary_enable and self._band_energy_expose_per_frame:
+            for i, name in enumerate(self._band_energy_names):
+                result[f"{name}_total_energy"] = float(frame_band_total_energy[i])
+                result[f"{name}_covered_total_energy"] = float(frame_band_covered_total_energy[i])
+                result[f"{name}_noise_energy"] = float(frame_band_noise_energy[i])
         return result
 
     # ------------------------------------------------------------------
@@ -2317,4 +2508,7 @@ class RainFrameClassifierState:
             noise_tracker_adaptive_q_enable=bool(dget("adaptive_q_enable", False)),
             noise_tracker_adaptive_q_min=float(dget("adaptive_q_min", 0.10)),
             noise_tracker_adaptive_q_alpha=float(dget("adaptive_q_alpha", 0.95)),
+            band_energy_summary_enable=bool(dget("band_energy_summary_enable", False)),
+            band_energy_summary_bands=dget("band_energy_summary_bands", None),
+            band_energy_summary_expose_per_frame=bool(dget("band_energy_summary_expose_per_frame", False)),
         )

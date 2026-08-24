@@ -167,40 +167,243 @@ stand-in before this fix existed.
 **Bug 1** was applied exactly as drafted: `rain_signal_processor.py`'s
 `_detect_rain_over_time()` call now passes `noise_psd=detector_noise_psd_lag`.
 
-**Bug 2 shipped as a clip-level summary, not the drafted per-frame `fd_dense` array.** The
-downstream use case (per-band SNR, once per clip) doesn't need a `(5, T)` diagnostic — a single
-`mode_snr_summary` dict, gated by a new `mode_snr_summary_enable` flag (default `False`), is
-computed once per clip and reaches `det_debug["mode_snr_summary"]` and, when
-`feature_dump_clip_summary_enable=True`, `feature_dump["mode_snr_summary"]` (the `fd_clip_summary`
-tier, alongside `clip_spectral_occupancy` — not `fd_dense`). Per mode band `i`:
-`mode_signal_energy_sum_i`, `mode_noise_energy_sum_i`, `mode_snr_i` (linear), `mode_snr_db_i`.
+**Bug 2 shipped as a clip-level energy summary, not the drafted per-frame `fd_dense` array, and
+not an SNR.** First draft computed an SNR (`mode_snr_summary`, `mode_signal_energy_sum_i` /
+`mode_noise_energy_sum_i` / `mode_snr_i` / `mode_snr_db_i`). Feedback from a second review round
+was to drop the SNR entirely and just report the two energy sums directly — matching how
+`clip_spectral_occupancy` already folds rain frames' signal+noise together rather than trying to
+split them out — and let any signal/noise comparison happen downstream, not inside the detector.
+Renamed `mode_snr_summary` → **`mode_band_energy_summary`**
+(`mode_band_energy_summary_enable`, default `False`), reporting only
+`mode_total_energy_sum_i` (`raw_power`, i.e. S+N, all frames including rain) and
+`mode_noise_energy_sum_i` (`noise_psd`) per mode band `i` — no ratio, no dB, no signal-only term.
+Reaches `det_debug["mode_band_energy_summary"]` and, when `feature_dump_clip_summary_enable=True`,
+`feature_dump["mode_band_energy_summary"]` (the `fd_clip_summary` tier, alongside
+`clip_spectral_occupancy` — not `fd_dense`).
 
-A code review (human + Claude, 2026-08-24) found three issues in the first draft of this fix,
-all corrected before commit:
+**These are STFT-domain sums, not physical energy.** `mode_total_energy_sum_i`/
+`mode_noise_energy_sum_i` are sums of `|FFT|^2` over bins and frames — not joules. With
+`n_fft=256`/`hop=128` (50% overlap), each audio sample is counted in two overlapping analysis
+frames, and the absolute scale otherwise depends on window shape, `n_fft`, and `hop`. Only
+relative/ratio comparisons across clips or mode bands are meaningful, not the absolute magnitude.
+Documented in both implementations' docstrings/comments, not just here.
+
+**Implemented in both the batch path and the actual streaming/embedded path.**
+`_detect_rain_over_time()` (`RainFrameClassifierMixin`, offline/batch/reference) computes the
+summary once over a full clip's `raw_power`/`noise_psd` arrays. `RainFrameClassifierState` (the
+causal, frame-by-frame class intended for CM7 embedded deployment — see this file's Status table)
+now also maintains it: `process_audio_frame()` — the fully self-contained frame-level entry point
+that computes its own FFT frame and its own `CausalNoiseTracker` estimate each call — accumulates
+two length-`n_modes` running sums (`O(1)` memory, no per-frame history) via
+`self._mode_masks` (already `operating_band`-restricted by construction, so no coverage-gap
+guard is needed there the way the batch path needed one — see below). `get_mode_band_energy_summary()`
+returns the accumulated clip-level dict; `reset()` zeroes it between clips. `process_frame()` and
+`replay_clip()` don't get accumulators — neither has both the raw per-bin power and the noise
+estimate available internally (callers supply an already-noise-normalized spectrum to those two).
+
+A code review (human + Claude, two rounds, 2026-08-24) found and fixed, before commit:
 
 - **`rain_energy_summary` was activated into a dimensionally-inconsistent path.** Once Bug 1's
   fix makes `noise_psd` non-`None` in production, the existing `rain_energy_summary_enable`
   block's `rain_band_energy_t - noise_band_energy_t` mixed `P` (dB-scale once
   `detector_use_noise_norm` normalizes it) with `noise_psd` (linear) — physically meaningless.
-  Fixed by switching that block to `raw_power` (linear, matching `noise_psd`'s scale), the same
-  reasoning already applied to the new SNR feature; added a `raw_power is not None` guard.
-- **`mode_snr_*` was computing `(S+N)/N`, not `S/N`.** `raw_power` is observed signal+noise
-  power, not signal power alone. Fixed by recovering signal energy as
-  `max(raw_power_sum - noise_energy_sum, 0.0)` before dividing, so a noise-only clip reads near
-  the `eps` floor instead of floor-clamped-at-1×.
-  (`detector_noise_psd_lag`'s own clamp against `maxr_det * P` means the naive ratio could never
-  fall below ~1 by construction — that clamp is fine for the detector-normalization path it was
-  built for, but made the naive `raw_power/noise_psd` ratio meaningless as an "SNR".)
-- **Missing/invalid `noise_psd` produced an artificially huge (but finite) SNR** via
-  `signal_energy_sum / max(0.0, eps)`. Fixed to emit no numeric summary at all in that case —
-  `det_debug["mode_snr_summary_error"]` is set instead, and nothing is written to `feature_dump`
-  — rather than risk silently contaminating persisted training data with a fake large value.
+  Fixed by switching that block to `raw_power` (linear, matching `noise_psd`'s scale); added a
+  `raw_power is not None` guard.
+- **The first SNR draft was computing `(S+N)/N`, not `S/N`** (fixed, then made moot by dropping
+  the SNR computation entirely per the second review round above).
+- **Missing/invalid `noise_psd` produced an artificially huge (but finite) SNR/ratio.** Fixed by
+  emitting no numeric summary at all in that case — `det_debug["mode_band_energy_summary_error"]`
+  is set instead, and nothing is written to `feature_dump` — rather than risk silently
+  contaminating persisted training data with a fake large value.
+- **Automated follow-up review caught a coverage-gap variant of the same bug**, specific to the
+  batch path: a mode band's mask was built against the full `freqs` array without checking it
+  was actually inside `operating_band`. `_estimate_noise_psd_fft` only ever fills `noise_psd`
+  inside `operating_band`, leaving everything else at exactly `0.0` — so a mode band only
+  partially/not covered by `operating_band` would silently divide by that leftover zero. Fixed by
+  intersecting the batch path's per-mode and `rain_energy_summary` band masks with `band_mask`
+  (the operating-band mask), so an out-of-coverage band now falls into the existing "no data"
+  zero branch. Verified with `operating_band=(400,1000)` against `mode_bands` reaching to
+  3350Hz. (The streaming path's `self._mode_masks` are inherently `operating_band`-restricted by
+  construction, so this specific bug doesn't apply there.)
 
-Verified with synthetic data covering: a real signal+noise clip (SNR reads sensibly above 0dB,
-distinct from the old `(S+N)/N` numbers), a noise-only clip (SNR reads at the `eps` floor, not an
-inflated ≥1 ratio), and `noise_psd=None` (no `mode_snr_summary` in `det_debug` or `feature_dump`,
-`mode_snr_summary_error` present instead).
+Verified with synthetic data (batch path) and a streaming-path test (renamed in the next round
+below to `tests/edge/rain_detection/test_band_energy_summary.py`): the streaming accumulator
+equals summing the per-frame energy values `process_audio_frame()` itself returns, the summary is
+all-zero and carries no per-frame keys when the flag is off, and `reset()` zeroes the
+accumulators between clips.
+
+## Widened to the 16 clip_spectral_occupancy bands (same day, third round)
+
+Renamed once more, `mode_band_energy_summary` → **`band_energy_summary`**
+(`band_energy_summary_enable`), and switched its default band set from the 5 detection
+`mode_bands` to the same **16 semantic bands** `clip_spectral_occupancy` already uses
+(`default_spectral_occupancy_bands()`: `dc`, `wind_1`, `wind_2`, `mode_1`, `inter_1`, `mode_2`,
+`inter_2a/2b`, `mode_3`, `inter_3a/3b`, `mode_4`, `inter_4a/4b/4c`, `mode_5`) — so the two features
+are directly comparable band-for-band. Output keys are now named per band
+(`{band_name}_total_energy_sum` / `{band_name}_noise_energy_sum`, e.g. `mode_1_total_energy_sum`)
+rather than indexed (`mode_total_energy_sum_0`). Overridable via `band_energy_summary_bands`
+(same shape as `clip_spectral_occupancy_bands`), in both the batch path and
+`RainFrameClassifierState` (constructor param + wired through `from_mixin()`).
+
+The streaming class's `self._band_energy_masks` are built once in `__init__` against
+`self._freqs_band` (already `operating_band`-restricted, same pattern as `self._mode_masks`), so
+the coverage-gap guard the batch path needed (`_full_width_band_mask`'s `& band_mask`) isn't a
+separate concern there — an out-of-`operating_band` band mask is simply empty by construction.
+
+Renamed `get_mode_band_energy_summary()` → `get_band_energy_summary()`; per-frame keys renamed
+`mode_total_energy_{i}`/`mode_noise_energy_{i}` → `{name}_total_energy`/`{name}_noise_energy`.
+Test file renamed to `tests/edge/rain_detection/test_band_energy_summary.py`, plus a new test
+confirming a custom `band_energy_summary_bands` override replaces the default 16 bands entirely.
 
 **Still outstanding:** the real-clip smoke test (`rain_anomaly_analysis`'s
-`query_rain_peaks_smoke`) — should specifically check rain, dry/noise, and low-SNR clips, not
-just confirm plausible-looking values appear.
+`query_rain_peaks_smoke`) — should specifically check rain, dry/noise, and low-signal clips, not
+just confirm plausible-looking values appear. Downstream SNR (if wanted) is now the caller's
+responsibility — see the fifth round below for which two fields are actually safe to pair for
+that computation on a partially-covered band.
+
+## Fourth round: independent (Codex) review — two required correctness fixes
+
+An independent review (Codex) of the third round found two real bugs, both fixed before commit:
+
+**1. Boundary bins were double-counted.** `compute_clip_spectral_occupancy_stats()` already used
+half-open `[lo, hi)` for every band except the last (closed `[lo, hi]`), so adjacent bands never
+double-count a bin sitting exactly on a shared boundary. `band_energy_summary`'s masks (both
+batch and streaming) used `(freqs>=lo)&(freqs<=hi)` — closed on *both* ends — for every band. For
+this codebase's actual config (`fs=11162`, `n_fft=256`), **every single one of the 15 internal
+boundaries in the default 16 bands lands exactly on an FFT bin** (verified:
+`43.6015625 * k` for integer `k`, e.g. `654.0234375 = 43.6015625*15`) — not a hypothetical edge
+case, guaranteed on every clip. Fixed by extracting a shared `band_freq_mask(freqs, lo, hi, *,
+is_last_band)` helper into `feature_extraction.py` (half-open except the last band, closed) and
+using it in all three places: `compute_clip_spectral_occupancy_stats()` (pure refactor, same
+behavior), the batch `band_energy_summary`/`rain_energy_summary` masks, and the streaming
+`self._band_energy_masks`/`self._band_energy_full_masks`. Verified with a spike placed exactly on
+the `mode_1`/`inter_1` boundary bin: counted once (in `inter_1`, whose `lo` matches the boundary),
+not twice, not zero times.
+
+**2. Unavailable-band coverage was ambiguous.** The 16 default bands span ~0-3575Hz;
+`operating_band` defaults to 400-3500Hz — so `dc`/`wind_1` are fully outside, `wind_2`/`mode_5` are
+partially inside, and the rest are fully inside. Returning `0.0`/`0.0` for `noise_energy_sum`
+couldn't distinguish "genuinely near-zero noise, measured" from "never measured here at all."
+Fixed by:
+  - Adding `{name}_coverage_fraction` (covered bins / total bins in that band) to every band,
+    computed once from `band_mask`/`operating_band`, static per band — not per frame.
+  - Splitting `total_energy_sum` and `noise_energy_sum` to use *different* masks:
+    `total_energy_sum` is **not** restricted to `operating_band` (raw_power is a real measurement
+    everywhere on the freq grid — same convention `clip_spectral_occupancy` already uses, since it
+    doesn't restrict to `operating_band` either), while `noise_energy_sum` **is** restricted (noise
+    is only ever estimated inside `operating_band`). Previously both used the same
+    `operating_band`-restricted mask, which silently zeroed real, measured `total_energy_sum` for
+    bands like `dc` even though `raw_power` there is perfectly valid data.
+  - In the streaming class this meant adding a second mask set
+    (`self._band_energy_full_masks`, against the full `self._freqs`, used with `P_t`) alongside
+    the existing operating-band-restricted `self._band_energy_masks` (against `self._freqs_band`,
+    used with `N_band_t`).
+
+**Recommended fixes also applied:**
+  - `get_band_energy_summary()` now returns `{}` when `band_energy_summary_enable=False`, instead
+    of a dict of `2*n_bands` zeros indistinguishable from "measured and genuinely silent."
+  - Per-frame `{name}_total_energy`/`{name}_noise_energy` keys in `process_audio_frame()`'s result
+    are no longer added just because accumulation is enabled — a separate
+    `band_energy_summary_expose_per_frame` flag (default `False`) gates them, since they exist
+    mainly to let tests validate the `O(1)` accumulator against a naive per-frame sum, not for
+    production per-frame payloads (the clip accumulator itself remains `O(1)` regardless).
+
+**Tests added** (`tests/edge/rain_detection/test_band_freq_mask.py`,
+`tests/edge/rain_detection/test_band_energy_summary.py`, 17 new tests total): the every-boundary-
+is-an-exact-bin precondition, boundary-bin-counted-exactly-once, last-band-inclusive,
+`clip_spectral_occupancy` boundary integration; batch: all-16-bands-present, out-of-band
+coverage=0, partial coverage strictly between 0 and 1, missing-`noise_psd` error (not a fake
+summary), and an *independent* hand-computed expected sum (energy placed at a known frequency,
+expected value computed by hand, not by re-running the code under test); streaming: accumulator-
+equals-frame-sum, disabled-returns-empty-dict, per-frame-not-exposed-by-default, resets-between-
+clips, custom-bands-override, out-of-band/partial coverage; and a batch-vs-streaming coverage
+parity test. All 22 tests in the directory pass.
+
+## Fifth round: independent (Codex) review — one remaining blocker fixed
+
+A second review pass on the fourth round found the two-mask design still left `total_energy_sum`
+and `noise_energy_sum` domain-mismatched for a *partially*-covered band (as opposed to the
+already-handled fully-uncovered case). For `mode_5` (3139-3575Hz) against the default
+`operating_band` (400-3500Hz): `total_energy_sum` covers 3139-3575Hz but `noise_energy_sum` only
+covers 3139-3500Hz — so `signal = total_energy_sum - noise_energy_sum` would silently fold in
+3500-3575Hz energy that has no matching noise estimate at all, inflating "signal" by whatever
+happens to sit in that untracked sliver. `coverage_fraction` flags that the band is partial but
+can't numerically correct for it, since energy isn't uniformly spread across bins.
+
+**Fix:** added a third field, `{name}_covered_total_energy_sum` — `raw_power`/`P_t` summed over
+the *same* `operating_band`-intersected mask as `noise_energy_sum`, so the two are always
+domain-matched. `{name}_total_energy_sum` (full band, unrestricted) stays available separately
+for occupancy-style uses. The safe downstream computation is now
+`signal = max(covered_total_energy_sum - noise_energy_sum, 0.0)`, never
+`total_energy_sum - noise_energy_sum`. Implemented in both the batch path (one extra `_band_sum`
+call reusing the existing `covered_mask`) and the streaming path (a third accumulator array,
+summing `P_band_t` — not `P_t` — over `self._band_energy_masks`, the same mask `noise_energy`
+already uses).
+
+**New regression test**
+(`test_batch_partial_band_energy_only_in_uncovered_region`): places energy exclusively in
+`mode_5`'s 3500-3575Hz uncovered remainder and asserts `total_energy_sum > 0` but
+`covered_total_energy_sum == 0` and `noise_energy_sum == 0` — proving the two are no longer
+conflatable. All other tests updated to also check the new field.
+
+**Test lint:** a genuine `ruff` finding (`F841`, an unused `n_bands` variable in
+`test_band_freq_mask.py`) was fixed; the codebase's `pyproject.toml` does enable docstring rules
+(`D`) even though there's no CI workflow enforcing them and the pre-existing source files aren't
+clean against them — both new test files were still brought to a clean `ruff check` pass, since
+they're new code with no existing-debt excuse.
+
+Final count: 23 tests in `tests/edge/rain_detection/` (5 original + 4 boundary-mask + 14
+band-energy-summary), all passing; both new test files `ruff`-clean.
+
+## Sixth round: final review before commit
+
+A final review (higher effort, whole diff) confirmed no remaining correctness bugs in the
+already-fixed paths, and found one new real bug plus several worthwhile cleanups — all fixed:
+
+**Real bug (confirmed by direct execution): unsorted custom `band_energy_summary_bands` silently
+dropped the top-of-spectrum edge bin and mis-assigned an internal boundary bin.**
+`band_freq_mask`'s half-open-except-last convention assumes iteration order matches frequency
+order (the *last* band in the sequence is the one whose upper bound is closed). The shipped
+default (`default_spectral_occupancy_bands()`) is hardcoded and already sorted, so production is
+unaffected — but a caller overriding `band_energy_summary_bands` with an out-of-order list (e.g.
+`[("top", 2790.5, 3575.328125), ("mid", 436.015625, 2790.5)]`) would have silently lost the true
+edge bin (neither band's mask would treat it as inclusive) and mis-handled the boundary between
+them. Fixed by adding `normalize_bands()` to `feature_extraction.py` — casts to `(str, float,
+float)` and **sorts ascending by `lo`** — used everywhere a bands list is normalized:
+`compute_clip_spectral_occupancy_stats()`, the batch `band_energy_summary_bands` normalization,
+and `RainFrameClassifierState.__init__`'s. Verified: the unsorted example above now conserves
+total energy exactly (`4500 = 3000 + 1500`, no drop, no double-count) instead of silently losing
+data.
+
+**Deduplication (addressing the reviewer's explicit "this exact bug class has now been
+independently fixed 5 times" concern):** in addition to `normalize_bands()` collapsing three
+copies of the same bands-normalization logic into one, added `band_coverage_fraction(full_mask,
+covered_mask)` to `feature_extraction.py`, replacing the batch and streaming paths' independently
+written (and previously divergent) coverage-fraction arithmetic with one shared implementation.
+
+**Performance (ties directly to this class's stated purpose — O(1)-memory embedded CM7
+deployment):** `process_audio_frame()`'s per-band accumulation was a Python loop calling
+`np.sum()` `3 * n_bands` times every single frame (48 calls/frame for the default 16 bands).
+Replaced with 3 matrix-vector products against precomputed static `(n_bands, F)` / `(n_bands, K)`
+0/1 mask matrices, built once in `__init__` — same O(1) memory characteristics, far fewer
+Python-level calls per frame.
+
+**Minor cleanup:** removed a redundant triple `is not None` check in the per-frame exposure gate
+that only restated the `band_energy_summary_enable` flag already guarding those same variables'
+assignment.
+
+**Not changed (reviewed and consciously deferred):** merging `band_energy_summary` into
+`compute_clip_spectral_occupancy_stats()` itself (a larger restructuring with no correctness
+benefit, given both are already independently tested and this diff has already been through six
+review rounds — deferred rather than risking new bugs for marginal duplication savings), and
+inlining the one-line `_full_width_band_mask` closure (subjective style preference, not a
+defect).
+
+**New regression tests** (`tests/edge/rain_detection/test_band_freq_mask.py`): `normalize_bands`
+sorts an unsorted custom list; `normalize_bands(None)` matches
+`default_spectral_occupancy_bands()`; an unsorted custom bands list conserves total energy
+exactly (the integration-level regression test for the confirmed bug above).
+
+Final count: 26 tests in `tests/edge/rain_detection/`, all passing; both new test files remain
+`ruff`-clean; no new lint findings introduced in the modified source files (`ruff check
+--select F,E9` shows only the same 2 pre-existing, unrelated findings from before this diff).

@@ -86,6 +86,56 @@ def default_spectral_occupancy_bands() -> tuple[tuple[str, float, float], ...]:
     )
 
 
+def normalize_bands(
+    bands: tuple[tuple[str, float, float], ...] | None,
+) -> tuple[tuple[str, float, float], ...]:
+    """
+    Normalize a band-definition sequence to (str, float, float) triples,
+    sorted ascending by lo. None defaults to default_spectral_occupancy_bands().
+
+    Sorting is required, not cosmetic: band_freq_mask's half-open-except-last
+    convention assumes "last in iteration order" means "covers the top of the
+    spectrum" — an unsorted caller-supplied bands list would otherwise silently
+    drop the true top-edge bin from every band (none of them get is_last_band's
+    closed upper bound) and double-count whichever bin ends up sitting at the
+    boundary between the (wrongly-ordered) last two bands.
+    """
+    if bands is None:
+        bands = default_spectral_occupancy_bands()
+    normalized = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
+    return tuple(sorted(normalized, key=lambda b: b[1]))
+
+
+def band_coverage_fraction(full_mask: np.ndarray, covered_mask: np.ndarray) -> float:
+    """
+    Fraction of full_mask's bins also present in covered_mask (covered_mask
+    must be a subset of full_mask, e.g. full_mask & operating_band_mask).
+    0.0 if full_mask selects no bins at all (a band with no bins on the freq
+    grid), not a division error.
+    """
+    total_bins = int(np.sum(full_mask))
+    if total_bins == 0:
+        return 0.0
+    covered_bins = int(np.sum(covered_mask))
+    return float(covered_bins) / float(total_bins)
+
+
+def band_freq_mask(freqs: np.ndarray, lo: float, hi: float, *, is_last_band: bool) -> np.ndarray:
+    """
+    Frequency-bin mask for one band in a contiguous, non-overlapping band
+    sequence: half-open [lo, hi) for every band except the last, which is
+    closed [lo, hi] so the final Nyquist-adjacent bin is still included.
+
+    A bin sitting exactly on a shared boundary (freqs[k] == hi of band i ==
+    lo of band i+1) must be counted in exactly one of the two adjacent bands,
+    not both — this is what enforces that. For a standalone single band (not
+    part of a sequence), pass is_last_band=True.
+    """
+    if is_last_band:
+        return (freqs >= lo) & (freqs <= hi)
+    return (freqs >= lo) & (freqs < hi)
+
+
 def compute_clip_spectral_occupancy_stats(
     *,
     raw_power: np.ndarray,
@@ -116,18 +166,13 @@ def compute_clip_spectral_occupancy_stats(
             f"raw_power.shape[1] ({raw_power.shape[1]}) must match frame_class.size ({frame_class.size})"
         )
 
-    if bands is None:
-        bands = default_spectral_occupancy_bands()
-    bands = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
+    bands = normalize_bands(bands)
     n_bands = len(bands)
     n_frames = raw_power.shape[1]
 
     band_power = np.zeros((n_bands, n_frames), dtype=np.float64)
     for i, (_, lo, hi) in enumerate(bands):
-        if i == n_bands - 1:
-            mask = (freqs >= lo) & (freqs <= hi)
-        else:
-            mask = (freqs >= lo) & (freqs < hi)
+        mask = band_freq_mask(freqs, lo, hi, is_last_band=(i == n_bands - 1))
         if np.any(mask):
             band_power[i, :] = np.sum(raw_power[mask, :], axis=0)
 
