@@ -346,6 +346,7 @@ class RainFrameClassifierMixin:
         rain_energy_summary_band = self._dget("rain_energy_summary_band", (400.0, 700.0))
         rain_energy_summary_lo = float(rain_energy_summary_band[0])
         rain_energy_summary_hi = float(rain_energy_summary_band[1])
+        mode_snr_summary_enable = bool(self._dget("mode_snr_summary_enable", False))
 
         op_band = self._dget("operating_band", (400.0, 3500.0))
         op_lo, op_hi = float(op_band[0]), float(op_band[1])
@@ -968,23 +969,36 @@ class RainFrameClassifierMixin:
         frame_class[(noise_conf >= noise_hi) & weak_mode_flux & (~is_rain)] = FrameClass.NOISE
         frame_class[is_rain] = FrameClass.RAIN
 
+        # Shared noise_psd availability check for rain_energy_summary and
+        # mode_snr_summary below. noise_psd is only ever populated (by
+        # _estimate_noise_psd_fft) inside cfg.operating_band — bins outside it are
+        # left at 0.0, not "unavailable" — so both consumers additionally restrict
+        # their band masks to band_mask (the operating-band mask) below, rather than
+        # trusting a band-shaped noise_psd_arr to mean band-covered noise data.
+        noise_psd_arr = np.asarray(noise_psd) if noise_psd is not None else None
+        have_noise_psd = (
+            raw_power is not None
+            and noise_psd_arr is not None
+            and noise_psd_arr.shape == raw_power.shape
+        )
+
         rain_energy_summary: Dict[str, float] = {}
         if rain_energy_summary_enable:
-            rain_band_mask_energy = (freqs >= rain_energy_summary_lo) & (freqs <= rain_energy_summary_hi)
-            if np.any(rain_band_mask_energy):
-                rain_band_energy_t = np.sum(P[rain_band_mask_energy, :], axis=0)
+            rain_band_mask_energy = (
+                (freqs >= rain_energy_summary_lo) & (freqs <= rain_energy_summary_hi) & band_mask
+            )
+            if raw_power is not None and np.any(rain_band_mask_energy):
+                rain_band_energy_t = np.sum(raw_power[rain_band_mask_energy, :], axis=0)
                 stft_rain_band_energy_sum = float(np.sum(rain_band_energy_t))
 
                 stft_noise_band_energy_sum = 0.0
                 stft_rain_minus_noise_energy_sum = 0.0
-                if noise_psd is not None:
-                    noise_psd_arr = np.asarray(noise_psd)
-                    if noise_psd_arr.shape == P.shape:
-                        noise_band_energy_t = np.sum(noise_psd_arr[rain_band_mask_energy, :], axis=0)
-                        stft_noise_band_energy_sum = float(np.sum(noise_band_energy_t))
-                        stft_rain_minus_noise_energy_sum = float(
-                            np.sum(np.maximum(rain_band_energy_t - noise_band_energy_t, 0.0))
-                        )
+                if have_noise_psd:
+                    noise_band_energy_t = np.sum(noise_psd_arr[rain_band_mask_energy, :], axis=0)
+                    stft_noise_band_energy_sum = float(np.sum(noise_band_energy_t))
+                    stft_rain_minus_noise_energy_sum = float(
+                        np.sum(np.maximum(rain_band_energy_t - noise_band_energy_t, 0.0))
+                    )
 
                 rain_energy_summary = {
                     "stft_rain_band_energy_sum": stft_rain_band_energy_sum,
@@ -997,6 +1011,43 @@ class RainFrameClassifierMixin:
                     "stft_noise_band_energy_sum": 0.0,
                     "stft_rain_minus_noise_energy_sum": 0.0,
                 }
+
+        # Clip-level (not per-frame) signal-to-noise ratio per mode band, from the
+        # real per-bin causal noise tracker (noise_psd), not a proxy. raw_power is
+        # observed signal+noise power, not signal power, so signal energy is
+        # recovered as raw_power - noise_psd (clipped at 0), not raw_power itself —
+        # otherwise this reports (S+N)/N rather than S/N and can never read as
+        # noise-only. No numeric value is emitted when noise_psd isn't actually
+        # available (e.g. detector_use_noise_norm=False): an artificially huge
+        # raw_power/eps ratio would silently contaminate downstream data.
+        mode_snr_summary: Dict[str, float] = {}
+        mode_snr_summary_error: Optional[str] = None
+        if mode_snr_summary_enable:
+            if not have_noise_psd:
+                mode_snr_summary_error = (
+                    "raw_power and a matching-shape noise_psd are required for mode_snr_summary"
+                )
+            else:
+                for i, (mode_lo, mode_hi) in enumerate(mode_bands):
+                    # Restricted to band_mask: noise_psd is only ever estimated inside
+                    # operating_band, so a mode band bin outside it would otherwise read
+                    # as a real (but always-zero) noise estimate, not "no data".
+                    mode_mask_full = (freqs >= mode_lo) & (freqs <= mode_hi) & band_mask
+                    if not np.any(mode_mask_full):
+                        mode_snr_summary[f"mode_signal_energy_sum_{i}"] = 0.0
+                        mode_snr_summary[f"mode_noise_energy_sum_{i}"] = 0.0
+                        mode_snr_summary[f"mode_snr_{i}"] = 0.0
+                        mode_snr_summary[f"mode_snr_db_{i}"] = float(10.0 * np.log10(eps))
+                        continue
+                    total_energy_sum = float(np.sum(raw_power[mode_mask_full, :]))
+                    noise_energy_sum = float(np.sum(noise_psd_arr[mode_mask_full, :]))
+                    signal_energy_sum = max(total_energy_sum - noise_energy_sum, 0.0)
+                    snr = signal_energy_sum / max(noise_energy_sum, eps)
+                    mode_snr_summary[f"mode_signal_energy_sum_{i}"] = signal_energy_sum
+                    mode_snr_summary[f"mode_noise_energy_sum_{i}"] = noise_energy_sum
+                    mode_snr_summary[f"mode_snr_{i}"] = snr
+                    mode_snr_summary[f"mode_snr_db_{i}"] = float(10.0 * np.log10(max(snr, eps)))
+
         det_debug = {
             "mode_flux_score": mode_flux_score,
             "mode_flux_score_gated": mode_flux_score_gated,
@@ -1044,10 +1095,17 @@ class RainFrameClassifierMixin:
             "td_feature_timing_mode": td_feature_timing_mode,
             "clip_spectral_occupancy_enable": clip_spectral_occupancy_enable,
             "rain_energy_summary_enable": rain_energy_summary_enable,
+            "mode_snr_summary_enable": mode_snr_summary_enable,
         }
 
         if rain_energy_summary_enable:
             det_debug["rain_energy_summary"] = rain_energy_summary
+
+        if mode_snr_summary_enable:
+            if mode_snr_summary_error is not None:
+                det_debug["mode_snr_summary_error"] = mode_snr_summary_error
+            else:
+                det_debug["mode_snr_summary"] = mode_snr_summary
         # Registry-driven raw spectral debug wiring.
         det_debug.update(aligned_raw_spectral)
 
@@ -1179,6 +1237,9 @@ class RainFrameClassifierMixin:
 
             if feature_dump_clip_summary_enable and clip_spectral_occupancy:
                 fd_clip_summary["clip_spectral_occupancy"] = clip_spectral_occupancy
+
+            if feature_dump_clip_summary_enable and mode_snr_summary:
+                fd_clip_summary["mode_snr_summary"] = mode_snr_summary
 
             # Keep backward-compatible flat feature_dump structure.
             # The downstream flattening loader supports both flat and 3-tier formats.

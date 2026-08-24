@@ -829,6 +829,7 @@ class SpectralNoiseProcessor(RainFrameClassifierMixin):
                 detector_frame_times=np.asarray(times, dtype=work_dtype),
                 input_audio=x,
                 raw_power=P,
+                noise_psd=detector_noise_psd_lag,
                 work_dtype=work_dtype,
             )
             if isinstance(det_debug, dict) and isinstance(feature_dump, dict):
