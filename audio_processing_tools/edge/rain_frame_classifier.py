@@ -1139,6 +1139,25 @@ class RainFrameClassifierMixin:
                     fd_dense["mode_flux_score"] = mode_flux_score
                     fd_dense["mode_flux_score_gated"] = mode_flux_score_gated
 
+                if peak_features_enable and feature_dump_include_peak_summary:
+                    fd_dense["peak_ratio"] = peak_ratio
+                    fd_dense["peak_gate_score"] = peak_gate_score
+                    fd_dense["peak_valid_count"] = peak_valid_count
+                    for i in range(peak_count_by_mode.shape[0]):
+                        fd_dense[f"peak_count_by_mode_{i}"] = peak_count_by_mode[i]
+
+                if td_envelope_features_enable and feature_dump_include_td_envelope:
+                    fd_dense.update(
+                        {
+                            "td_rise_time_sec": td_rise_time_sec,
+                            "td_fall_time_sec": td_fall_time_sec,
+                            "td_rise_slope": td_rise_slope,
+                            "td_fall_slope": td_fall_slope,
+                            "td_energy_envelope": td_energy_envelope,
+                            "td_peak_energy": td_peak_energy,
+                        }
+                    )
+
             if feature_dump_sparse_enable:
                 fd_sparse["sparse_frame_idx"] = sparse_frame_idx
 

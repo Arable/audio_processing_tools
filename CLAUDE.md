@@ -34,6 +34,7 @@ K ≈ 67 bins (400–3500 Hz, n_fft=256, fs=11162). **Reduction: 670×.**
 | `audio_processing_tools/edge/rain_estimator.py` | `estimate_rain_from_audio()` — per-clip DSD-based rain-rate estimate (drop-size histogram → regression model → `precip_mm`). Wired into `RainDetectorProcessor.run()` behind `estimate_clip_rain` flag (2026-08-05). |
 | `band_noise_suppression.md` | Writeup: noise suppression in `band_noise_estimator.py`/`band_noise_processor.py` (rain-measurement DSD path). Standalone — not yet wired into `RainDetectorProcessor` or `rain_estimator.py`. |
 | `frame_level_rain_streaming.md` | Writeup: what's new in the streaming refactor across `noise_tracker.py`/`rain_frame_classifier.py`/`feature_extraction.py`/`rain_signal_processor.py`. Delta doc — see `edge/README.md` for the underlying algorithm. |
+| `feature_dump_peak_and_envelope_wiring.md` | Writeup: `feature_dump_include_peak_summary`/`feature_dump_include_td_envelope` were dead flags — the data only ever reached `det_debug` (expensive, `keep_state_debug`-gated), never the lean `feature_dump`. Both fixes applied (`rain_frame_classifier.py` `fd_dense` block, ~line 1142-1159); peak-summary verified against real data, td-envelope not yet smoke-tested. |
 
 ---
 
