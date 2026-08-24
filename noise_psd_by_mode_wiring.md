@@ -442,3 +442,73 @@ using an already-sorted list since that's the only case that should succeed); ad
 Final count: 28 tests in `tests/edge/rain_detection/`, all passing; both new test files remain
 `ruff`-clean; no new lint findings in the modified source files beyond the same 2 pre-existing,
 unrelated ones.
+
+## Eighth round: independent fresh-eyes review (`/code-review`, high effort)
+
+A review with no prior context on this diff (deliberately run this way, since the PR had already
+been through seven rounds and needed genuinely independent eyes) found three more real issues:
+
+**`normalize_bands()` validated sort order but not overlap or reversed bounds.** A sorted-but-
+overlapping custom `bands` list (e.g. `[("a", 400.0, 1000.0), ("b", 900.0, 3500.0)]`) passed
+validation — `los=[400, 900]` is ascending — but `band_freq_mask` then double-counted every bin in
+the `[900, 1000)` overlap into both bands: the same double-counting failure class the sixth/seventh
+rounds targeted, just reachable via a different path that none of the 28 existing tests exercised.
+Fixed by adding explicit reversed/zero-width (`lo < hi`) and overlap (`hi_i <= lo_{i+1}`) checks
+to `normalize_bands()`.
+
+**`RainFrameClassifierState.__init__` unconditionally allocated the band-energy masks/matrices/
+accumulators**, even with `band_energy_summary_enable=False` (the default) — confirmed by direct
+instantiation to cost ~26KB (two `(16, F)`/`(16, K)` float64 mask matrices plus three accumulator
+arrays), roughly 5x this class's own documented ~5.4KB total streaming-state memory budget, spent
+on a feature that's off by default and never used in that case. Fixed by gating all of the
+allocation (and the corresponding `reset()` clears) behind `if self._band_energy_summary_enable:`.
+
+**The batch path's per-band coverage fraction duplicated `band_coverage_fraction()`'s logic
+inline** instead of calling the shared helper introduced in the sixth round (which the streaming
+path already used) — contradicted the sixth round's own stated goal of collapsing this exact
+arithmetic into one implementation. Fixed by calling the shared helper from both paths.
+
+Final count: 28 tests, all still passing (no new tests added yet at this point — see ninth round).
+
+## Ninth round: independent review (Codex) — a crash, a lint gap, and no tests for round 8
+
+**Real bug (confirmed by direct execution): an empty custom `band_energy_summary_bands=[]`
+passed `normalize_bands()`'s new validation but crashed downstream.** With streaming enabled, an
+empty bands list produces zero-row mask matrices; `process_audio_frame()`'s matrix multiply
+(`self._band_energy_full_mask_matrix @ P_t`) then fails with an unrelated `matmul` shape-mismatch
+error (`size 129 is different from 0`) instead of a clear validation error at construction time.
+Fixed by rejecting an empty sequence directly in `normalize_bands()`.
+
+**Lint: the eighth round's new overlap-check loop used a bare `zip()`, triggering ruff's B905**
+(`zip()` without an explicit `strict=`). The two iterables (`normalized` and `normalized[1:]`) are
+intentionally offset by one element — `strict=True` would always fail — so fixed with an explicit
+`strict=False`.
+
+**None of the eighth round's three fixes had dedicated regression tests** — confirmed by grep, only
+output-level tests existed (e.g. "disabled returns `{}`"), which wouldn't catch a regression of the
+memory-allocation fix specifically. Added 7 tests: overlapping/reversed/zero-width/empty bands
+rejected (`test_band_freq_mask.py`); disabled state leaves the mask matrices and accumulators as
+`None` (asserted directly on the attributes, not just output); enabled state allocates one
+row/entry per band; empty custom bands raise at construction (`test_band_energy_summary.py`).
+
+Final count: 35 tests, all passing; both new test files remain `ruff`-clean (including B905); no
+new lint findings in the modified source files.
+
+## Tenth round: independent review (Codex) — batch/streaming validation parity when disabled
+
+**Real bug (confirmed by direct execution): the streaming constructor only validated
+`band_energy_summary_bands` when the feature was enabled, while the batch path
+(`_detect_rain_over_time`) always calls `normalize_bands()` unconditionally.** Consequently the
+same invalid override (e.g. `band_energy_summary_bands=[]`) raised in batch but silently succeeded
+in streaming whenever `band_energy_summary_enable=False` — verified both ways: batch raised
+`ValueError: bands must not be empty`, streaming constructed with no error. Fixed by moving the
+`normalize_bands()` call in `RainFrameClassifierState.__init__` outside the
+`if self._band_energy_summary_enable:` guard, so validation always runs in both paths while only
+the expensive mask/matrix allocation stays gated.
+
+**New test:** a parametrized `test_invalid_bands_raise_identically_in_batch_and_streaming_even_when_disabled`
+covering empty, reversed, and overlapping bands, asserting both paths raise with
+`band_energy_summary_enable=False`.
+
+Final count: 38 tests, all passing; both new test files remain `ruff`-clean; `git diff --check`
+clean.
