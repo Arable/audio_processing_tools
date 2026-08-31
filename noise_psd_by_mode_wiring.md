@@ -550,3 +550,32 @@ detection-decision impact" guarantee if that reclassification were ever put to u
 batch's `noise_energy_sum` on this diagnostic is not a rain-excluded noise floor and isn't claimed
 to be one (streaming's is) — a known, deliberate, practical divergence rather than a bug to chase,
 consistent with this PR's existing policy of leaving SNR interpretation to downstream consumers.
+
+## Twelfth round: PR #5 merged, reverted, re-opened as PR #6; automated review found a real gap
+
+PR #5 was briefly merged (`d21ddef`) then reverted on `main` (`0b8dea0`) at the author's request to
+give the team (`QCaudron`, `colinahill`, requested reviewers on both PRs) time to actually review
+before it lands — GitHub doesn't allow reopening an already-merged PR, so the same branch/commits
+were re-opened as PR #6.
+
+`codeant-ai[bot]`'s review of PR #6 raised two findings (again with an embedded "Prompt for AI
+Agent" auto-chase block, not acted on — same pattern as the eleventh round, verified independently
+instead):
+
+**Fixed: `normalize_bands()` didn't reject duplicate band names.** It already validated sort order,
+non-reversed bounds, non-overlap, and non-empty, but two bands sharing a name (e.g. a mistyped
+`band_energy_summary_bands` override) passed validation and then silently overwrote each other's
+entries in the output dict — both `_detect_rain_over_time()` (batch) and `get_band_energy_summary()`
+(streaming) key their result dicts by `{name}_...`. Fixed by adding a duplicate-name check to
+`normalize_bands()` (shared by both paths and by `compute_clip_spectral_occupancy_stats()`), and
+added a duplicate-name case to the existing `test_invalid_bands_raise_identically_in_batch_and_streaming_even_when_disabled`
+parametrization.
+
+**Fixed: batch/streaming coverage-fraction parity test was too weak.**
+`test_batch_and_streaming_band_masks_agree_on_coverage` only compared `coverage_fraction > 0.0`
+between the two paths, not the actual fraction — a numeric mismatch could pass undetected. Changed
+to `pytest.approx` equality on the real values.
+
+Test count 38 → 39, all passing; no new ruff findings. Landed as `13e0f58`. PR #6's description
+left untouched (still the trimmed Scope/Summary/Test-plan form) — this round's detail lives here
+instead, per the same policy established in the eleventh round.
