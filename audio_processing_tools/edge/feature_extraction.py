@@ -112,6 +112,10 @@ def normalize_bands(
     assumption doesn't guard against on its own — an overlap would silently
     double-count every bin in the shared region into both bands.
 
+    Also requires unique band names: callers key their output dicts by name
+    (e.g. band_energy_summary's ``{name}_total_energy_sum``), so a duplicate
+    name would silently overwrite an earlier band's entries rather than error.
+
     Also requires at least one band: an empty sequence has no natural "last
     band" to receive the closed-interval Nyquist-adjacent bin, and callers
     that build one static mask matrix per band (e.g.
@@ -141,6 +145,14 @@ def normalize_bands(
                 f"bands must not overlap: {name_a!r} ends at {hi_a!r}, "
                 f"{name_b!r} starts at {lo_b!r}"
             )
+    names = [name for name, _, _ in normalized]
+    if len(set(names)) != len(names):
+        dupes = sorted({name for name in names if names.count(name) > 1})
+        raise ValueError(
+            f"band names must be unique (callers key output dicts like "
+            f"'{{name}}_total_energy_sum' by name, so a duplicate would silently "
+            f"overwrite an earlier band's entry): duplicated name(s) {dupes!r}"
+        )
     return normalized
 
 

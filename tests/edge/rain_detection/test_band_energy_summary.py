@@ -318,6 +318,7 @@ def test_band_energy_summary_enabled_allocates_masks_and_accumulators(detector_p
         [],
         [("backwards", 1000.0, 400.0)],
         [("a", 400.0, 1000.0), ("b", 900.0, 3500.0)],
+        [("dup", 400.0, 1000.0), ("dup", 1000.0, 3500.0)],
     ],
 )
 def test_invalid_bands_raise_identically_in_batch_and_streaming_even_when_disabled(detector_params, bad_bands):
@@ -452,6 +453,6 @@ def test_batch_and_streaming_band_masks_agree_on_coverage(detector_params):
     stream_summary = stream_state.get_band_energy_summary()
 
     for name, _, _ in default_spectral_occupancy_bands():
-        batch_covered = batch_summary[f"{name}_coverage_fraction"] > 0.0
-        stream_covered = stream_summary[f"{name}_coverage_fraction"] > 0.0
-        assert batch_covered == stream_covered, name
+        assert batch_summary[f"{name}_coverage_fraction"] == pytest.approx(
+            stream_summary[f"{name}_coverage_fraction"]
+        ), name
