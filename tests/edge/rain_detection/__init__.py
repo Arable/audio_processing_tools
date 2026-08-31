@@ -1,1 +1,0 @@
-"""Rain detector regression tests."""
