@@ -6,7 +6,7 @@
 **Active branch:** `feature/frame_level_rain_processing`  
 **Golden regression repo:** `/Users/vikrantoak/source1/data-science-scratch/golden_regression`  
 **Goal:** Refactor rain detector from batch/clip-level to per-frame (O(n_fft) memory) for embedded CM7 deployment.  
-**Status:** Core streaming path complete and validated. Most pending check-ins from the May session are now committed (see below). All FD/TD decision thresholds (`td_gate_threshold`, `td_kurtosis_upper_threshold`, `new_rain_primary_flux_min`, `new_rain_mode1/2/3_flux_min`, `new_rain_min_support_count`, `clip_rain_min_frames`) were reconciled on 2026-08-05 to match the parameter set Santhosh chose and deployed in `edge` repo's NoiseCL (`config_list.h` on `origin/sp/noise_cancel_model`) — see session log for the full value table and the intermediate wrong values (3.5, then 3.7) this went through before landing on the confirmed-deployed set. **`golden_regression/scripts/generate_baseline.py` still needs the same update** (tracked separately, not yet done) before re-running validation against this threshold set. `origin/main` is at `d76f2b4` (2026-08-24) — feature-dump dead-flag fixes + a `td_fall_time_sec`/`td_fall_slope` correctness fix, see session log. `origin/fix/noise-psd-mode-snr-summary` (PR #5, open, not yet merged) is at `730ace8` (2026-08-25) — see that session log entry and `noise_psd_by_mode_wiring.md` for the full 11-round review history.
+**Status:** Core streaming path complete and validated. Most pending check-ins from the May session are now committed (see below). All FD/TD decision thresholds (`td_gate_threshold`, `td_kurtosis_upper_threshold`, `new_rain_primary_flux_min`, `new_rain_mode1/2/3_flux_min`, `new_rain_min_support_count`, `clip_rain_min_frames`) were reconciled on 2026-08-05 to match the parameter set Santhosh chose and deployed in `edge` repo's NoiseCL (`config_list.h` on `origin/sp/noise_cancel_model`) — see session log for the full value table and the intermediate wrong values (3.5, then 3.7) this went through before landing on the confirmed-deployed set. **`golden_regression/scripts/generate_baseline.py` still needs the same update** (tracked separately, not yet done) before re-running validation against this threshold set. `origin/main` is at `d76f2b4` (2026-08-24) — feature-dump dead-flag fixes + a `td_fall_time_sec`/`td_fall_slope` correctness fix, see session log. PR #5 (`fix/noise-psd-mode-snr-summary`, `730ace8`) merged into `origin/main` on 2026-08-31 after the real-clip smoke test passed — see that session log entry and `noise_psd_by_mode_wiring.md` for the full 11-round review history.
 
 ---
 
@@ -38,6 +38,18 @@ K ≈ 67 bins (400–3500 Hz, n_fft=256, fs=11162). **Reduction: 670×.**
 
 ---
 
+## Session log — 2026-08-31
+
+**PR #5 merged.** Real-clip smoke test (`rain_anomaly_analysis`'s `query_rain_peaks_smoke`, 20 real
+clips from the ADSE DB, `raining=TRUE`, `exclude_catalogue=True`, pinned to this PR's `730ace8`)
+passed: 20/20 clips processed with no errors, `band_energy_summary` fully populated on every clip
+(64 keys = 16 bands × 4 fields, zero `band_energy_summary_error`), coverage-fraction math correct
+across full/partial/out-of-band cases (`mode_5` partial at `0.818`, `mode_1`–`mode_4`/`inter_*`
+full at `1.0`, `dc`/`wind_1`/`wind_2` at `0.0`), `rain_energy_sum` showing healthy non-degenerate
+variation (range ~0–609) instead of the pre-fix all-zero/clamped behavior, and clip-level detection
+(19/20) matching DB ground truth. This was the last outstanding item from the 2026-08-25 entry
+below — merged after it passed. `origin/main` is now at PR #5's merge commit.
+
 ## Session log — 2026-08-25
 
 **PR #5 (`fix/noise-psd-mode-snr-summary`, `band_energy_summary`) review completion.** Picked up
@@ -62,9 +74,8 @@ Test count in `tests/edge/rain_detection/`: 28 → 38, all passing. PR descripti
 a "Scope / firmware impact" section (explicitly: no `frame_class`/`rain_conf` impact, and
 `band_energy_summary`/`clip_spectral_occupancy` are **not approved for CM7 in their current
 form**), then trimmed back down to Scope/Summary/Test-plan once the round-by-round history grew
-large enough that it belonged in `noise_psd_by_mode_wiring.md` instead. PR #5 still open, not yet
-merged — the real-clip smoke test (`rain_anomaly_analysis`'s `query_rain_peaks_smoke`) is still the
-next step before merge.
+large enough that it belonged in `noise_psd_by_mode_wiring.md` instead. Real-clip smoke test
+completed and PR merged on 2026-08-31 — see that session log entry above.
 
 ## Session log — 2026-08-24
 
