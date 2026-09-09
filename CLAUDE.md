@@ -6,7 +6,7 @@
 **Active branch:** `feature/frame_level_rain_processing`  
 **Golden regression repo:** `/Users/vikrantoak/source1/data-science-scratch/golden_regression`  
 **Goal:** Refactor rain detector from batch/clip-level to per-frame (O(n_fft) memory) for embedded CM7 deployment.  
-**Status:** Core streaming path complete and validated. Most pending check-ins from the May session are now committed (see below). All FD/TD decision thresholds (`td_gate_threshold`, `td_kurtosis_upper_threshold`, `new_rain_primary_flux_min`, `new_rain_mode1/2/3_flux_min`, `new_rain_min_support_count`, `clip_rain_min_frames`) were reconciled on 2026-08-05 to match the parameter set Santhosh chose and deployed in `edge` repo's NoiseCL (`config_list.h` on `origin/sp/noise_cancel_model`) — see session log for the full value table and the intermediate wrong values (3.5, then 3.7) this went through before landing on the confirmed-deployed set. **`golden_regression/scripts/generate_baseline.py` still needs the same update** (tracked separately, not yet done) before re-running validation against this threshold set. PR #5 (`fix/noise-psd-mode-snr-summary`, `730ace8`) merged into `origin/main` on 2026-08-31 after the real-clip smoke test passed, but was then reverted on `main` (`0b8dea0`) — the same branch/commits were re-opened as **PR #6** for team review (still open as of 2026-09-08). `origin/main` currently sits at that revert commit, `0b8dea0`. See the 2026-08-31/2026-09 session log entries and `noise_psd_by_mode_wiring.md` for the full round-by-round review history (12 rounds as of PR #6).
+**Status:** Core streaming path complete and validated. Most pending check-ins from the May session are now committed (see below). All FD/TD decision thresholds (`td_gate_threshold`, `td_kurtosis_upper_threshold`, `new_rain_primary_flux_min`, `new_rain_mode1/2/3_flux_min`, `new_rain_min_support_count`, `clip_rain_min_frames`) were reconciled on 2026-08-05 to match the parameter set Santhosh chose and deployed in `edge` repo's NoiseCL (`config_list.h` on `origin/sp/noise_cancel_model`) — see session log for the full value table and the intermediate wrong values (3.5, then 3.7) this went through before landing on the confirmed-deployed set. **`golden_regression/scripts/generate_baseline.py` still needs the same update** (tracked separately, not yet done) before re-running validation against this threshold set. PR #5 (`fix/noise-psd-mode-snr-summary`, `730ace8`) merged into `origin/main` on 2026-08-31 after the real-clip smoke test passed, but was then reverted on `main` (`0b8dea0`) — the same branch/commits were re-opened as **PR #6** for team review (still open as of 2026-09-08). `origin/main` currently sits at that revert commit, `0b8dea0`. See the 2026-08-31 and 2026-09-09 session log entries and `noise_psd_by_mode_wiring.md` for the full round-by-round review history (12 rounds as of PR #6).
 
 ---
 
@@ -37,6 +37,30 @@ K ≈ 67 bins (400–3500 Hz, n_fft=256, fs=11162). **Reduction: 670×.**
 | `feature_dump_peak_and_envelope_wiring.md` | Writeup: `feature_dump_include_peak_summary`/`feature_dump_include_td_envelope` were dead flags — the data only ever reached `det_debug` (expensive, `keep_state_debug`-gated), never the lean `feature_dump`. Both fixes applied (`rain_frame_classifier.py` `fd_dense` block, ~line 1142-1159); peak-summary verified against real data, td-envelope not yet smoke-tested. |
 
 ---
+
+## Session log — 2026-09-09
+
+**PR #6 Copilot review pass.** Addressed all three open review comments from GitHub Copilot's
+PR #6 review (posted 2026-09-08): fixed an off-by-one in `_stream_frames()`'s test helper
+(`test_band_energy_summary.py`) that silently skipped the last valid streaming frame in every
+streaming-summary test (`n_frames = len(audio)//HOP - 2` -> `- 1`, since `N_FFT == 2*HOP`); fixed
+this file's own stale Status line (see above); and added a processor-level regression test
+(`test_process_band_energy_summary_uses_unclamped_noise_psd`) driving real audio through
+`SpectralNoiseProcessor.process()` end-to-end, since every existing `band_energy_summary` test
+called `_detect_rain_over_time()` directly and so never covered which noise-PSD variant
+(clamped vs. unclamped) `process()` actually wires in — verified as a real regression guard by
+temporarily reverting the wiring and confirming the new test fails. All three replied to on the
+PR #6 thread; commits `ac5b96c`/`22538f0`.
+
+A follow-up high-effort `/code-review` of the full PR surfaced two pre-existing issues not
+introduced by this session (not yet fixed, flagged for team discussion): `band_energy_summary`'s
+all-or-nothing gate drops `total_energy_sum`/`coverage_fraction` too when `noise_psd` is
+unavailable, even though those two fields are raw-power-only per the code's own comments —
+possibly intentional, since an existing test (`test_batch_missing_noise_psd_emits_error_not_fake_summary`)
+already asserts this behavior; and `normalize_bands()`'s `ValueError` is soft-caught into an error
+string for `clip_spectral_occupancy_bands` but propagates uncaught for `band_energy_summary_bands`/
+`RainFrameClassifierState.__init__` — the same invalid-bands mistake crashes in one path and
+degrades gracefully in the other.
 
 ## Session log — 2026-08-31
 
