@@ -106,7 +106,9 @@ def _stream_frames(state, audio):
     each completing hop.
     """
     state.seed_audio(audio[:HOP])
-    n_frames = len(audio) // HOP - 2
+    # N_FFT == 2*HOP, so the last valid frame is t = len(audio)//HOP - 2
+    # (buffer x[t*HOP : t*HOP+N_FFT] must fit in audio) -> n_frames = that + 1.
+    n_frames = len(audio) // HOP - 1
     results = []
     for t in range(n_frames):
         c_start = (t + 1) * HOP
