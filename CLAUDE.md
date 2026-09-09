@@ -53,14 +53,20 @@ temporarily reverting the wiring and confirming the new test fails. All three re
 PR #6 thread; commits `ac5b96c`/`22538f0`.
 
 A follow-up high-effort `/code-review` of the full PR surfaced two pre-existing issues not
-introduced by this session (not yet fixed, flagged for team discussion): `band_energy_summary`'s
-all-or-nothing gate drops `total_energy_sum`/`coverage_fraction` too when `noise_psd` is
-unavailable, even though those two fields are raw-power-only per the code's own comments —
-possibly intentional, since an existing test (`test_batch_missing_noise_psd_emits_error_not_fake_summary`)
-already asserts this behavior; and `normalize_bands()`'s `ValueError` is soft-caught into an error
-string for `clip_spectral_occupancy_bands` but propagates uncaught for `band_energy_summary_bands`/
-`RainFrameClassifierState.__init__` — the same invalid-bands mistake crashes in one path and
-degrades gracefully in the other.
+introduced by this session. **Fixed:** `normalize_bands()`'s `ValueError` was soft-caught into a
+`clip_spectral_occupancy_error` string for `clip_spectral_occupancy_bands` but propagated uncaught
+for `band_energy_summary_bands`/`RainFrameClassifierState.__init__` — the same invalid-bands
+mistake crashed in one path and degraded gracefully in the other. `band_energy_summary_bands`
+raising loudly is the deliberate, tested behavior (see
+`test_invalid_bands_raise_identically_in_batch_and_streaming_even_when_disabled` and the
+2026-08-25 entry below), so `clip_spectral_occupancy_bands` was brought in line with it instead —
+bands are now resolved/validated before `compute_clip_spectral_occupancy_stats()`'s try block, so
+a bad bands list raises immediately while genuine runtime failures (e.g. shape mismatches) are
+still caught softly. Commit `0087fb9`. **Left as-is, flagged for team discussion:**
+`band_energy_summary`'s all-or-nothing gate drops `total_energy_sum`/`coverage_fraction` too when
+`noise_psd` is unavailable, even though those two fields are raw-power-only per the code's own
+comments — possibly intentional, since an existing test
+(`test_batch_missing_noise_psd_emits_error_not_fake_summary`) already asserts this behavior.
 
 ## Session log — 2026-08-31
 
