@@ -14,6 +14,7 @@ from audio_processing_tools.edge.rain_frame_classifier import (
     RainFrameClassifierMixin,
     RainFrameClassifierState,
 )
+from audio_processing_tools.edge.rain_signal_processor import SpectralNoiseProcessor
 
 from .conftest import SAMPLE_RATE
 
@@ -458,3 +459,79 @@ def test_batch_and_streaming_band_masks_agree_on_coverage(detector_params):
         assert batch_summary[f"{name}_coverage_fraction"] == pytest.approx(
             stream_summary[f"{name}_coverage_fraction"]
         ), name
+
+
+# ---------------------------------------------------------------------------
+# Processor-level wiring (SpectralNoiseProcessor.process())
+# ---------------------------------------------------------------------------
+
+
+def test_process_band_energy_summary_uses_unclamped_noise_psd(detector_params):
+    """band_energy_summary must reflect the real (unclamped) lagged noise PSD.
+
+    Every other test above calls _detect_rain_over_time() directly with an
+    explicit noise_psd, so none of them exercise the code in
+    rain_signal_processor.py's process() that decides *which* PSD (the
+    second-clamped detector_noise_psd_lag vs. the real
+    detector_noise_psd_lag_unclamped) reaches the diagnostic — regression test
+    for the process()-wiring bug fixed in 730ace8.
+
+    A loud-then-abruptly-quiet clip creates the transient the second clamp
+    exists for: detector_noise_psd_lag[:, t] is detector_noise_psd[:, t-1]
+    (shifted by one frame), so once the signal drops, the lagged noise
+    estimate from the still-loud previous frame exceeds the new, near-silent
+    current frame's power and gets clamped down — while the true (unclamped)
+    lagged estimate does not. We independently reconstruct both variants from
+    the raw per-frame estimate the processor exposes in `debug`, confirm this
+    clip actually produces a meaningful divergence between them, then check
+    which one the diagnostic used.
+    """
+    rng = np.random.default_rng(7)
+    n = 2 * SAMPLE_RATE
+    audio = np.empty(n, dtype=np.float64)
+    audio[: n // 2] = rng.normal(0.0, 0.5, n // 2)
+    audio[n // 2 :] = rng.normal(0.0, 1e-5, n - n // 2)
+    audio = audio.astype(np.float32)
+
+    params = dict(detector_params)
+    params["band_energy_summary_enable"] = True
+    proc_params = {
+        "sample_rate": SAMPLE_RATE,
+        "operating_band": (400.0, 3500.0),
+        "n_fft": 256,
+        "hop": 128,
+        "eps": 1e-9,
+        "q": 0.30,
+        "detector": params,
+        "classifier_only_mode": True,
+        "return_detector_debug": True,
+        "return_debug": True,
+    }
+
+    processor = SpectralNoiseProcessor()
+    processor.setup(proc_params)
+    result = processor.process(audio, sr=SAMPLE_RATE)
+
+    debug = result["debug"]
+    raw = np.asarray(debug["detector_noise_psd"])
+    clamped_lag = np.asarray(debug["detector_noise_psd_lag"])
+    band_mask = np.asarray(debug["band_mask"])
+
+    # Mirrors rain_signal_processor.py's own shift-by-one (lines ~805-808).
+    unclamped_lag = raw.copy()
+    if unclamped_lag.shape[1] > 1:
+        unclamped_lag = np.roll(unclamped_lag, shift=1, axis=1)
+        unclamped_lag[:, 0] = raw[:, 0]
+
+    unclamped_total = float(unclamped_lag[band_mask].sum())
+    clamped_total = float(clamped_lag[band_mask].sum())
+    # The transient must actually make the two clamp variants disagree,
+    # or this test would pass regardless of which one process() wires up.
+    assert unclamped_total > clamped_total * 1.05
+
+    det_debug = result["det_debug"]
+    assert det_debug.get("band_energy_summary_error") is None
+    summary = det_debug["band_energy_summary"]
+    emitted_total = sum(v for k, v in summary.items() if k.endswith("_noise_energy_sum"))
+    assert emitted_total == pytest.approx(unclamped_total, rel=1e-5)
+    assert emitted_total != pytest.approx(clamped_total, rel=1e-5)
