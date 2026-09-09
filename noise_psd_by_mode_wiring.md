@@ -579,3 +579,38 @@ to `pytest.approx` equality on the real values.
 Test count 38 → 39, all passing; no new ruff findings. Landed as `13e0f58`. PR #6's description
 left untouched (still the trimmed Scope/Summary/Test-plan form) — this round's detail lives here
 instead, per the same policy established in the eleventh round.
+
+## Thirteenth round: team review (QCaudron) — a second batch/streaming divergence, on clamp/lag
+
+Separate from the eleventh round's acknowledged rain-exclusion divergence above (which is about
+*which frames* count toward the noise baseline), `QCaudron` identified a second, independent way
+batch and streaming disagree on `band_energy_summary`'s `noise_energy_sum`: they use different
+*clamp/lag conventions* for the noise value itself, even when both are tracking the same frames.
+
+**Acknowledged, not fixed (R&D/offline scope): batch and streaming apply the eleventh-round
+unclamp fix inconsistently, because streaming's accumulator never went through the code path that
+fix touched.** The eleventh round fixed `rain_signal_processor.py`'s *batch* wiring so
+`noise_energy_sum` reads `detector_noise_psd_lag_unclamped` — the lagged estimate
+(`detector_noise_psd[:, t-1]`) with no `min(N, maxr_det * P[t])` re-clamp against the current
+frame. Streaming's accumulator was never part of that fix and still feeds the diagnostic straight
+from `CausalNoiseTracker.update()`'s return value (`rain_frame_classifier.py:2234`,
+`N_band_t = self._noise_tracker.update(P_band_t, is_rain=bool(is_rain))`, accumulated into
+`frame_band_noise_energy` at line 2260) — same-frame, and already internally clamped to
+`min(N, maxr_det * P[t])` inside the tracker itself. So after a loud pulse is immediately followed
+by a quiet frame: batch's `noise_energy_sum` can keep the pulse-elevated `N[t-1]` (now above the
+new, smaller `P[t]`), while streaming's floors that same noise value down to `P[t]` for that frame
+— reintroducing, on the streaming side only, the exact fake-"signal above noise" failure mode the
+eleventh round's unclamp fix was written to eliminate on the batch side. No test builds this
+transient across both paths (the existing batch/streaming parity tests only compare
+`coverage_fraction`, not `*_noise_energy_sum` values), so it isn't currently caught.
+
+Decision: left as-is. `band_energy_summary` is R&D/offline instrumentation only (not approved for
+CM7 in its current form — see PR #6's Scope section), and the two options to close this
+gap — accumulating a pre-clamp/lagged estimate in the streaming path instead of `N_band_t`, or
+re-clamping batch's diagnostic to match streaming — each change an existing diagnostic's
+semantics for one path, which wasn't judged worth doing solely to make the two paths agree on a
+number neither is contractually specified to match. Documenting this here instead, next to the
+rain-exclusion note, so a future reader doesn't assume batch and streaming `*_noise_energy_sum`
+share a clamp/lag convention: they track the same frames (mostly — see the rain-exclusion note
+above for the other axis of divergence) but can report different noise magnitudes for the same
+transient.
