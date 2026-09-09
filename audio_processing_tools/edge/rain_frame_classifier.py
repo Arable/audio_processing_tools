@@ -1188,12 +1188,19 @@ class RainFrameClassifierMixin:
         clip_spectral_occupancy: Dict[str, Any] = {}
         if clip_spectral_occupancy_enable:
             if raw_power is not None:
+                # Resolve/validate bands outside the try below: an invalid
+                # custom bands list (unsorted/overlapping/reversed/empty/
+                # duplicate-named) must raise loudly here, exactly like
+                # band_energy_summary_bands does, rather than being swallowed
+                # into a soft clip_spectral_occupancy_error alongside genuine
+                # runtime failures (e.g. shape mismatches) from the call below.
+                clip_occupancy_bands = normalize_bands(self._dget("clip_spectral_occupancy_bands", None))
                 try:
                     clip_spectral_occupancy = compute_clip_spectral_occupancy_stats(
                         raw_power=raw_power,
                         freqs=freqs,
                         frame_class=frame_class,
-                        bands=self._dget("clip_spectral_occupancy_bands", None),
+                        bands=clip_occupancy_bands,
                         dtype=clip_spectral_occupancy_dtype,
                         eps=eps,
                     )

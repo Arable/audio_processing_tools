@@ -535,3 +535,35 @@ def test_process_band_energy_summary_uses_unclamped_noise_psd(detector_params):
     emitted_total = sum(v for k, v in summary.items() if k.endswith("_noise_energy_sum"))
     assert emitted_total == pytest.approx(unclamped_total, rel=1e-5)
     assert emitted_total != pytest.approx(clamped_total, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# clip_spectral_occupancy_bands validation parity with band_energy_summary_bands
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_clip_spectral_occupancy_bands_raises_like_band_energy_summary_bands(detector_params):
+    """An invalid clip_spectral_occupancy_bands override must fail loudly too.
+
+    Before this fix, compute_clip_spectral_occupancy_stats()'s bare
+    `except Exception` demoted normalize_bands()'s ValueError (unsorted,
+    overlapping, reversed, empty, or duplicate-named bands) to a soft
+    clip_spectral_occupancy_error string -- inconsistent with
+    band_energy_summary_bands, which raises identically in both batch and
+    streaming (test_invalid_bands_raise_identically_in_batch_and_streaming_
+    even_when_disabled above). A genuine runtime failure unrelated to bands
+    validation should still be caught softly, so this only asserts on the
+    bands-validation case.
+    """
+    freqs = _freqs()
+    raw_power, _ = _synthetic_clip(freqs, T=20)
+    params = dict(detector_params)
+    params["clip_spectral_occupancy_enable"] = True
+    params["clip_spectral_occupancy_bands"] = [("high", 1000.0, 3500.0), ("low", 400.0, 1000.0)]
+    detector = _BatchDetector(params)
+    with pytest.raises(ValueError, match="sorted ascending"):
+        detector._detect_rain_over_time(
+            10.0 * np.log10(raw_power + 1e-9),
+            freqs,
+            raw_power=raw_power,
+        )
