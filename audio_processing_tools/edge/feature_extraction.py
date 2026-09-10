@@ -86,6 +86,106 @@ def default_spectral_occupancy_bands() -> tuple[tuple[str, float, float], ...]:
     )
 
 
+def normalize_bands(
+    bands: tuple[tuple[str, float, float], ...] | None,
+) -> tuple[tuple[str, float, float], ...]:
+    """
+    Normalize a band-definition sequence to (str, float, float) triples.
+    None defaults to default_spectral_occupancy_bands().
+
+    Requires bands to already be sorted ascending by lo and raises ValueError
+    if not, rather than silently re-sorting: band_freq_mask's
+    half-open-except-last convention assumes "last in iteration order" means
+    "covers the top of the spectrum", so an out-of-order list would otherwise
+    silently drop the true top-edge bin and double-count a boundary bin.
+    compute_clip_spectral_occupancy_stats() is an existing, externally-consumed
+    function whose callers may rely on positional order between a
+    caller-supplied bands list and its output arrays (band_names,
+    rain_log_power_mean, etc.) — silently reordering those callers' input would
+    be a worse surprise than a clear, immediate error. Any already-sorted list
+    (the overwhelmingly common case, since these are naturally ascending
+    frequency ranges) is entirely unaffected.
+
+    Also requires each band to be non-reversed (lo < hi) and the sequence to
+    be non-overlapping (hi of band i <= lo of band i+1): sorted-by-lo alone
+    permits overlapping ranges, which band_freq_mask's non-overlapping-sequence
+    assumption doesn't guard against on its own — an overlap would silently
+    double-count every bin in the shared region into both bands.
+
+    Also requires unique band names: callers key their output dicts by name
+    (e.g. band_energy_summary's ``{name}_total_energy_sum``), so a duplicate
+    name would silently overwrite an earlier band's entries rather than error.
+
+    Also requires at least one band: an empty sequence has no natural "last
+    band" to receive the closed-interval Nyquist-adjacent bin, and callers
+    that build one static mask matrix per band (e.g.
+    RainFrameClassifierState's streaming accumulator) would get a
+    zero-row matrix that can't be matrix-multiplied against a per-frame
+    power vector — reject it here rather than let it fail downstream with an
+    unrelated shape-mismatch error.
+    """
+    if bands is None:
+        bands = default_spectral_occupancy_bands()
+    normalized = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
+    if not normalized:
+        raise ValueError("bands must not be empty")
+    los = [lo for _, lo, _ in normalized]
+    if los != sorted(los):
+        raise ValueError(
+            "bands must be sorted ascending by lo (band_freq_mask's "
+            "half-open-except-last convention requires the last band in "
+            f"iteration order to cover the top of the spectrum); got los={los!r}"
+        )
+    for name, lo, hi in normalized:
+        if not lo < hi:
+            raise ValueError(f"band {name!r} has reversed/zero-width bounds: lo={lo!r}, hi={hi!r}")
+    for (name_a, _, hi_a), (name_b, lo_b, _) in zip(normalized, normalized[1:], strict=False):
+        if hi_a > lo_b:
+            raise ValueError(
+                f"bands must not overlap: {name_a!r} ends at {hi_a!r}, "
+                f"{name_b!r} starts at {lo_b!r}"
+            )
+    names = [name for name, _, _ in normalized]
+    if len(set(names)) != len(names):
+        dupes = sorted({name for name in names if names.count(name) > 1})
+        raise ValueError(
+            f"band names must be unique (callers key output dicts like "
+            f"'{{name}}_total_energy_sum' by name, so a duplicate would silently "
+            f"overwrite an earlier band's entry): duplicated name(s) {dupes!r}"
+        )
+    return normalized
+
+
+def band_coverage_fraction(full_mask: np.ndarray, covered_mask: np.ndarray) -> float:
+    """
+    Fraction of full_mask's bins also present in covered_mask (covered_mask
+    must be a subset of full_mask, e.g. full_mask & operating_band_mask).
+    0.0 if full_mask selects no bins at all (a band with no bins on the freq
+    grid), not a division error.
+    """
+    total_bins = int(np.sum(full_mask))
+    if total_bins == 0:
+        return 0.0
+    covered_bins = int(np.sum(covered_mask))
+    return float(covered_bins) / float(total_bins)
+
+
+def band_freq_mask(freqs: np.ndarray, lo: float, hi: float, *, is_last_band: bool) -> np.ndarray:
+    """
+    Frequency-bin mask for one band in a contiguous, non-overlapping band
+    sequence: half-open [lo, hi) for every band except the last, which is
+    closed [lo, hi] so the final Nyquist-adjacent bin is still included.
+
+    A bin sitting exactly on a shared boundary (freqs[k] == hi of band i ==
+    lo of band i+1) must be counted in exactly one of the two adjacent bands,
+    not both — this is what enforces that. For a standalone single band (not
+    part of a sequence), pass is_last_band=True.
+    """
+    if is_last_band:
+        return (freqs >= lo) & (freqs <= hi)
+    return (freqs >= lo) & (freqs < hi)
+
+
 def compute_clip_spectral_occupancy_stats(
     *,
     raw_power: np.ndarray,
@@ -116,18 +216,13 @@ def compute_clip_spectral_occupancy_stats(
             f"raw_power.shape[1] ({raw_power.shape[1]}) must match frame_class.size ({frame_class.size})"
         )
 
-    if bands is None:
-        bands = default_spectral_occupancy_bands()
-    bands = tuple((str(name), float(lo), float(hi)) for name, lo, hi in bands)
+    bands = normalize_bands(bands)
     n_bands = len(bands)
     n_frames = raw_power.shape[1]
 
     band_power = np.zeros((n_bands, n_frames), dtype=np.float64)
     for i, (_, lo, hi) in enumerate(bands):
-        if i == n_bands - 1:
-            mask = (freqs >= lo) & (freqs <= hi)
-        else:
-            mask = (freqs >= lo) & (freqs < hi)
+        mask = band_freq_mask(freqs, lo, hi, is_last_band=(i == n_bands - 1))
         if np.any(mask):
             band_power[i, :] = np.sum(raw_power[mask, :], axis=0)
 
