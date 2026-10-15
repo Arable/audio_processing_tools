@@ -32,8 +32,11 @@ class DsdProcessingEmualtor:
 
         self.verbose = verbose
 
-        # Frequency resolution
-        self.dF = self.fs / self.frame_length
+        # Frequency resolution. Integer division on purpose: firmware's
+        # disdrometer_legacy.h defines DF as (SAMPLING_FREQ/FFT_SAMPLE_LENGTH)
+        # in integer C arithmetic (11162/512 = 21, not 21.80), and every band
+        # index below (rain band, PFT, lower/upper windows) is derived from it.
+        self.dF = self.fs // self.frame_length
 
         # output
         self.loudness_bins = 32
@@ -136,7 +139,8 @@ class DsdProcessingEmualtor:
         spectrum = np.abs(fft(frame))
 
         # calculate peak energy and peak enegry index
-        pft_spectrum = spectrum[self.pft_low_idx:self.pft_high_idx]
+        # inclusive of pft_high_idx, like firmware's PFT loop (i <= PFT_HIGH_INDEX)
+        pft_spectrum = spectrum[self.pft_low_idx:self.pft_high_idx + 1]
         peak_energy_index = np.argmax(pft_spectrum) + self.pft_low_idx
         peak_energy = spectrum[peak_energy_index]
         if peak_energy != 0:

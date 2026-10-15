@@ -1,5 +1,7 @@
 import numpy as np
 
+from audio_processing_tools.edge.band_noise_estimator import legacy_band_bins
+
 RAIN_ENERGY_THRESHOLD = 0.6
 RAIN_LOG_FACTOR = 0.6
 RAIN_LOG_BASE = 1.13
@@ -37,9 +39,9 @@ def estimate_rain_from_audio(
 ):
     audio_data = np.asarray(audio_data, dtype=np.float64).reshape(-1)
 
-    dF = fs / frame_length
-    rain_low_idx = int(rain_low_freq // dF) + 1
-    rain_high_idx = int(rain_high_freq // dF)
+    # Integer-DF band edges, matching firmware's FFT_LOW_INDEX/FFT_HIGH_INDEX
+    # (bins 20..33 inclusive for fs=11162, frame_length=512).
+    rain_low_idx, rain_high_idx = legacy_band_bins(rain_low_freq, rain_high_freq, fs, frame_length)
 
     n_frames = len(audio_data) // frame_length
     dsd_hist = np.zeros(DSD_BINS, dtype=np.float64)
