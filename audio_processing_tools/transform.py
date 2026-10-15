@@ -22,7 +22,7 @@ from tqdm import tqdm
 from audio_processing_tools.db_tools import get_db_data, upsert_df
 from audio_processing_tools.fetch import get_raw_audio_data, get_device_raw_audio_data
 from audio_processing_tools.parse import parse_mark_audio_file, parse_s3_audio_key, pcm_to_float
-from audio_processing_tools.edge.device_dsd_processing_emulator import DsdProcessingEmualtor
+from audio_processing_tools.host_analysis.device_dsd_processing_emulator import DsdProcessingEmualtor
 # from audio_processing_tools.edge.dsp_rain_detection import analyse_raw_audio_wrapper
 
 
