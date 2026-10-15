@@ -5,7 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 from tqdm import tqdm
 
-from audio_processing_tools.edge.device_dsd_processing_emulator import DsdProcessingEmualtor
+from audio_processing_tools.host_analysis.device_dsd_processing_emulator import DsdProcessingEmualtor
 from audio_processing_tools.parse import parse_mark_audio_file
 from audio_processing_tools.fetch import get_device_raw_audio_data
 from audio_processing_tools.transform import emulator_output_to_df
