@@ -93,7 +93,7 @@ audio_processing_tools/
 ├── visualize_audio.py              # Audio/spectrogram plotting
 ├── visualize_noise_output.py       # Noise-processor output plotting
 ├── frame_classifier_feature_analysis.py  # Frame-classifier feature analysis
-├── edge/                           # Edge device processing (see edge/README.md)
+├── edge/                           # Edge device processing (porting reference: edge/README.md)
 │   ├── dsp_rain_detection.py      # Legacy clip-level rain detection DSP algorithm
 │   ├── rain_signal_processor.py   # Frame-level detector + suppressor pipeline
 │   ├── rain_frame_classifier.py   # Batch + streaming rain frame classifier
@@ -111,9 +111,15 @@ audio_processing_tools/
     └── noise.py                    # Noise estimation post-processing
 ```
 
-See `edge/README.md` for the detector/suppressor architecture and
-`rain_algorithm_technical_assessment.md` for a detailed technical
-assessment of the rain detection algorithm.
+## Rain algorithm documentation
+
+| Doc | Covers |
+|---|---|
+| [docs/rain_detection_ncl.md](docs/rain_detection_ncl.md) | CM7 NCL rain detection (pre-release): algorithm, thresholds and release status, firmware alignment, parity, Python-only spectral suppressor |
+| [docs/rain_detection_wrm.md](docs/rain_detection_wrm.md) | WRM legacy rain detection (deployed) and legacy DSD quantification: technical assessment |
+| [docs/rain_measurement.md](docs/rain_measurement.md) | CM4 rain measurement: band energy → DSD → mm, firmware bin edges, band noise estimation and suppression |
+| [audio_processing_tools/edge/README.md](audio_processing_tools/edge/README.md) | Firmware-porting reference: conventions, precision, state, Python↔C names, parity harnesses |
+| [docs/history/](docs/history/) | Development notes kept for reference |
 
 ## Documentation
 

@@ -1,5 +1,7 @@
 # Feature-Dump Wiring: Peak Summary + TD Envelope
 
+> **Historical record.** Development notes kept for reference; may be out of date. Current documentation: [rain_detection_ncl.md](../rain_detection_ncl.md), [rain_measurement.md](../rain_measurement.md), [edge/README.md](../../audio_processing_tools/edge/README.md).
+
 **File:** `edge/rain_frame_classifier.py`
 **Branch:** `main` (both fixes applied, committed as `f501362`; peak-summary verified against real data, td-envelope not yet smoke-tested)
 

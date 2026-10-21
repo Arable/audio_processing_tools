@@ -1,5 +1,7 @@
 # Two bugs around `noise_psd` / per-mode-band noise estimation
 
+> **Historical record.** Development notes kept for reference; may be out of date. Current documentation: [rain_detection_ncl.md](../rain_detection_ncl.md), [rain_measurement.md](../rain_measurement.md), [edge/README.md](../../audio_processing_tools/edge/README.md).
+
 **Files:** `edge/rain_signal_processor.py`, `edge/rain_frame_classifier.py`
 **Status:** both bugs fixed and committed here (2026-08-24), following a code review. Originally
 found and reverted (drafted, verified in isolation, then backed out) during a

@@ -1,11 +1,14 @@
 # Frame-Level Streaming Refactor: Noise Estimation + Rain Detection
 
+> **Historical record.** Development notes kept for reference; may be out of date. Current documentation: [rain_detection_ncl.md](../rain_detection_ncl.md), [rain_measurement.md](../rain_measurement.md), [edge/README.md](../../audio_processing_tools/edge/README.md).
+
 **Files:** `edge/noise_tracker.py`, `edge/rain_frame_classifier.py`, `edge/feature_extraction.py`, `edge/rain_signal_processor.py`
 **Branch:** `feature/frame_level_rain_processing`
 
 ## Scope of this doc
 
-`edge/README.md` already documents the detector/suppressor *algorithm* —
+`edge/README.md` already documents the detector/suppressor *algorithm* [now in
+`docs/rain_detection_ncl.md`; `edge/README.md` is the firmware-porting reference] —
 lagged noise PSD, noise-normalized detection, adaptive oversubtraction, etc.
 That explanation still holds. This doc covers what's **new**: the refactor
 from batch/clip-level processing (full spectrogram in memory, O(F×T)) to a

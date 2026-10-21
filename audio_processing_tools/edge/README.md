@@ -1,526 +1,143 @@
-📄 Noise Suppressor & Rain Detector
-
-Overview
-This system enables accurate rain detection and measurement in environments where acoustic signals are heavily contaminated by wind and slowly varying background noise.
-This module implements a real-time rain detection and spectral noise suppression pipeline for acoustic disdrometer signals (Fs ≈ 11.16 kHz).
-
-It is designed for noisy outdoor environments, particularly where signals are affected by wind and slowly varying background noise.
-
-The system is intended to be robust to:
-	•	Wind-induced noise
-	•	Slowly varying environmental and structural noise
-
-Note:
-	This design has not been exhaustively validated across all possible deployment conditions. Performance may vary in environments with strong mechanical or highly structured vibrations.
-
-⸻
-
-🧱 Architecture
-
-Input Audio
-   │
-   ▼
-[Pre-filter]
-   │
-   ▼
-[STFT → Power Spectrum]
-   │
-   ├── Detector Path
-   │     ├── FD features (mode flux)
-   │     ├── TD features (crest, kurtosis)
-   │     ├── Noise-normalized spectrum (optional)
-   │     └── Frame classification
-   │
-   └── Suppressor Path
-         ├── Noise PSD estimation (causal)
-         ├── Adaptive gain computation
-         ├── Spectral suppression
-         └── ISTFT (optional)
-   │
-   ▼
-[Clip Aggregation]
-   │
-   ▼
-Outputs (metrics + state)
-
-
-The system consists of two tightly coupled components:
-
-1. Detector Path
-   - Extracts FD + TD features
-   - Classifies frames as rain or noise
-
-2. Suppressor Path
-   - Estimates noise PSD
-   - Applies adaptive spectral suppression
-
-The detector and suppressor are interdependent:
-- The suppressor provides a time-lagged noise estimate used to normalize detector inputs
-- Detector and suppressor operate on the same frame-level spectral representation
-
-⸻
-
-🎯 Design Goals
-
-Robust Detection
-	•	Detect impulsive rain signatures
-	•	Reject wind / mechanical noise
-
-Noise-Robust Measurement
-	•	Suppress non-rain energy
-	•	Preserve rain spectral structure
-
-Edge Deployment
-	•	Causal / low latency
-	•	Float32 support
-	•	Configurable + modular
-
-⸻
-🧠 Core Design Principles
-
-1. Frame-Level Causal Processing
-
-The pipeline operates in a frame-causal manner (with small optional latency depending on STFT configuration):
-	•	Frame decisions depend only on:
-	•	Current frame t
-	•	Past frames ≤ t
-	•	No future information is used in:
-	•	Noise PSD estimation
-	•	Gain computation
-	•	Frame classification
-
-This ensures:
-	•	✅ Real-time deployability (CM4 / CM7)
-	•	✅ Stable behavior in streaming conditions
-	•	✅ No look-ahead bias
-
-⚠️ Note:
-	•	STFT with center=True introduces symmetric latency
-	•	Setting center=False enables strictly causal execution for firmware deployment
-
-⸻
-
-2. Time-Lagged Noise Estimate (Key Innovation)
-
-A critical design feature is the use of lagged noise PSD:
-
-N_lag(t) = N(t-1)
-
-This is used in one place unconditionally, and optionally in a second:
-
-A. Detector input normalization (always on by default)
-
-log(P(t)) - log(N_lag(t))
-
-`detector_use_noise_norm` defaults to True, and the lag here is
-unconditional (implemented via np.roll on the noise-PSD array) —
-independent of any other config flag.
-
-B. Gain computation (opt-in, off by default)
-
-G(t) uses N_lag(t) instead of N(t) only when `use_lagged_noise_psd=True`.
-
-This flag defaults to **False** — out of the box, gain computation uses
-the *same-frame* N(t), not a lagged estimate. Only the detector-side
-normalization (A) is lagged unconditionally. Enable
-`use_lagged_noise_psd` explicitly if you also want the suppression gain
-itself to use N(t-1).
-
-⸻
-
-🎯 Why Lagged PSD Matters (for detector normalization)
-
-Problem (without lag)
-
-If current frame PSD is used:
-	•	Rain energy leaks into noise estimate
-	•	Suppression becomes self-referential
-	•	Detector sees distorted spectrum
-
-⸻
-
-Solution (with lag)
-
-Using N(t-1) ensures:
-	•	✅ No leakage of current frame signal into noise estimate
-	•	✅ Stable normalization (true “above-noise” signal)
-	•	✅ Cleaner separation between:
-	•	rain transients
-	•	slowly varying noise floor
-
-💡 This effectively converts the system into a causal, frame-level SNR estimator
-
-⸻
-
-🌧️ Handling Noisy Conditions (Key Strength)
-
-This design is explicitly optimized for non-stationary, real-world noise.
-
-⸻
-
-1. Noise-Normalized Detection
-
-Instead of absolute energy:
-
-Detection ∝ P(t) / N(t-1)
-
-➡ Rain is detected as energy above noise baseline, not raw amplitude.
-
-Effect:
-	•	Wind bursts → suppressed
-	•	Mechanical noise → reduced when it behaves like slowly varying background energy
-	•	Rain impulses → preserved
-
-⸻
-
-2. Stable Noise PSD Estimation
-
-Noise PSD is estimated using a causal low-quantile style tracker on the spectral power, without relying on detector frame decisions in the current configuration.
-
-Effect:
-	•	Avoids feedback from detector errors into the PSD estimate
-	•	Provides a stable background-noise estimate for normalization and suppression
-
-⸻
-
-3. Adaptive Suppression via Confidence
-
-oversub ∝ noise_conf
-
-	•	Rain-like frames → low suppression
-	•	Noise-like frames → strong suppression
-
-Effect:
-	•	Preserves rain structure
-	•	Aggressively removes noise
-
-⸻
-
-4. SNR-Based Protection Layer
-
-Optional gating:
-
-High SNR → reduce suppression
-
-Effect:
-	•	Strong rain impulses are protected
-	•	Prevents over-suppression
-
-⸻
-
-5. Asymmetric PSD Tracking
-
-ema_up  (fast)
-ema_down (slow)
-
-Effect:
-	•	Quickly adapts to increasing noise
-	•	Slowly decays → avoids instability
-
-⸻
-
-📌 Combined Effect
-
-These mechanisms together create:
-
-A system that detects relative energy changes (rain)
-while tracking slow background noise (wind/mechanical)
-
-⸻
-
-⚠️ Known Failure Modes (Important for Deployment)
-
-- Rapidly changing noise:
-  - Noise PSD may lag, causing temporary under- or over-suppression
-
-- Very low rain intensity:
-  - May fall below noise floor and be missed
-
-- Strong impulsive mechanical noise:
-  - Can resemble rain in TD features
-
-- Frame misclassification: Incorrect rain/noise labels can affect clip-level decisions and suppression behavior
-
-⸻
-
-🆚 Why This Works Better in Noisy Environments
-
-| Challenge             | Typical System               | This Design                              |
-|----------------------|------------------------------|------------------------------------------|
-| Wind bursts          | Misclassified as rain        | Normalized out                           |
-| Mechanical vibration | Strong false positives       | Filtered by TD + normalization           |
-| Non-stationary noise | PSD drift or slow adaptation | Quantile tracking + lagged normalization |
-| Rain + noise overlap | Suppressed                   | Preserved via confidence + SNR           |
-
-
-⸻
-
-✅ Suggested One-Line Summary (for slides / exec)
-
-“Rain is detected as energy above a continuously learned noise baseline, enabling robust performance in highly noisy environments.”
-
-⸻
-
-
-🔊 Processing Pipeline
-
-1. Pre-filter
-
-pre_filter_mode = "highpass" | "bandpass" | "none"
-
-	•	High-pass → removes structural noise
-	•	Band-pass → restricts to operating band (400–3500 Hz)
-
-⸻
-
-
-2. STFT
-
-n_fft = 256
-hop = 128
-window = "hann"
-
-Outputs:
-	•	S → complex spectrum
-	•	P = |S|² → power
-
-⸻
-
-3. Rain Detection
-
-Implemented via RainFrameClassifierMixin.
-
-Input Modes
-	•	Absolute spectrum (dB)
-	•	Noise-normalized spectrum:
-
-log(P) - log(N_lag)
-
-➡ Acts like instantaneous SNR
-
-⸻
-
-3.1 Features
-
-Frequency-domain
-	•	Mode bands (e.g. 450–650 Hz, etc.)
-	•	Mode flux score (primary feature)
-	•	Optional peak features
-
-Time-domain
-	•	Crest factor (strong)
-	•	Kurtosis (very strong)
-	•	Time flux (observed to be less discriminative in current datasets)	
-
-⸻
-
-3.2 Classification
-
-Outputs:
-
-frame_class ∈ {RAIN, NOISE}
-rain_conf ∈ [0,1]
-noise_conf = 1 - rain_conf
-
-
-⸻
-
-🌊 Noise PSD Estimation
-
-Method: Causal Quantile Tracking
-
-Tracks low quantile of power spectrum:
-
-if P > tracker:
-    increase slowly
-else:
-    decrease faster
-
-Key Parameters
-
-q = 0.25
-win_sec = 0.5
-ema_up / ema_down
-
-Properties
-	•	Causal
-	•	Handles non-stationary noise
-	•	Independent of detector decisions in current configuration
-
-⸻
-
-🔉 Gain Computation
-
-Adaptive Oversubtraction
-
-noise_conf only starts ramping suppression above a fixed threshold (0.7);
-below it, oversubtraction stays at `base`:
-
-eff_noise = clip((noise_conf - 0.7) / (1 - 0.7), 0, 1)
-oversub   = base + eff_noise * (max - base)
-
-Typical:
-	•	base = 1.0
-	•	max = 3.0
-
-⸻
-
-Gain Modes
-
-sqrt subtraction (default)
-
-G = 1 - α * sqrt(N / P)
-
-Wiener
-
-G = max(P - αN, 0) / P
-
-
-⸻
-
-Stabilization
-	•	Frequency smoothing → reduces musical noise
-	•	Temporal smoothing → disabled for rain frames
-
-⸻
-
-SNR Gating (Optional)
-
-Reduces suppression when SNR is high:
-
-if SNR high → reduce suppression
-
-
-⸻
-
-🔁 Suppression
-
-S_hat = G * S
-
-Optional:
-
-y = ISTFT(S_hat)
-
-
-⸻
-
-📊 Clip-Level Aggregation
-
-Clip-level aggregation is used to improve robustness by requiring consistent evidence of rain across multiple frames, rather than relying on isolated detections.
-
-Rain Decision
-
-clip_is_rain = rain_frame_count >= clip_rain_min_frames
-
-This ensures that short-duration noise bursts or isolated misclassifications do not trigger rain detection at the clip level.
-
-⸻
-
-Confidence
-
-median_conf = median(rain_conf on rain frames)
-abundance_conf = rain_frame_count / (2 * min_frames)
-
-clip_rain_conf = max(median_conf, abundance_conf)
-
-
-⸻
-
-📦 Outputs
-
-Metrics
-
-{
-  "clip_is_rain": bool,
-  "clip_rain_conf": float,
-  "rain_frame_count": int,
-  "clip_rain_fraction": float,
-  "mean_noise_floor_db": float,
-}
-
-State
-
-{
-  "frame_class": [...],
-  "rain_conf": [...],
-  "noise_conf": [...],
-  "features": {...},
-  "debug": {...},
-}
-
-
-⸻
-
-⚙️ Configuration
-
-{
-  "suppressor": {...},
-  "detector": {...}
-}
-
-Precedence:
-
-flat params > nested params > defaults
-
-
-⸻
-
-🧪 Modes
-
-Mode	Description
-Full	Detection + suppression
-classifier_only_mode	Feature extraction only
-suppressor_bypass	Detector only (keeps detector normalization active, skips final PSD/gain/ISTFT)
-
-
-⸻
-
-✅ Strengths
-	•	Noise-normalized detection (core differentiator)
-	•	Strong TD features (crest, kurtosis)
-	•	Confidence-driven suppression
-	•	Modular design (detector vs suppressor)
-	•	Edge-friendly implementation
-
-⸻
-
-⚠️ Limitations
-	•	FD features are highly correlated
-	•	Threshold-based decision logic
-	•	PSD tracking may lag under rapidly changing noise conditions
-	•	Potential overfitting on small datasets
-
-Note: this document describes the batch/offline detector+suppressor
-(`SpectralNoiseProcessor`). A per-frame streaming implementation
-(`RainFrameClassifierState`, standalone `CausalNoiseTracker`) also exists
-for embedded deployment — see `frame_level_rain_streaming.md`. One
-behavioral difference not covered above: the streaming path's causal
-detector normalization uses the *same-frame* N(t) from `CausalNoiseTracker.update()`,
-whereas this batch path's detector normalization (section A above) uses an
-unconditionally lagged N(t-1) via `np.roll`.
-
-⸻
-
-🔧 Improvement Opportunities
-
-Detector
-	•	Replace thresholds with learned model
-	•	Feature decorrelation
-
-Suppressor
-	•	Multi-timescale PSD tracking
-	•	Band-wise adaptive suppression
-
-System
-	•	Secondary microphone (noise reference)
-	•	Event-level detection
-	•	Distance-aware modeling
-
-⸻
-
-📌 Summary
-
-This pipeline provides a robust baseline for rain detection in wind-affected and slowly varying noisy environments, combining:
-	•	Spectral + temporal features
-	•	Adaptive noise modeling
-	•	Confidence-aware suppression
+# `edge/`: firmware-porting reference
+
+This folder holds the Python reference implementations of the on-device rain algorithms. This README
+covers the **low-level details that matter when porting to, or checking against, firmware**: frame
+alignment, filter state, precision, Python↔C names, and the parity harnesses.
+
+What the algorithms do, and their status, is in the top-level docs:
+
+| Topic | Doc | Python | Firmware |
+|---|---|---|---|
+| NCL rain detection (CM7, pre-release) | [docs/rain_detection_ncl.md](../../docs/rain_detection_ncl.md) | `rain_signal_processor.py`, `rain_frame_classifier.py`, `noise_tracker.py`, `feature_extraction.py` | `edge` `NoiseCL/Src/dsp_noise_detection.c` |
+| WRM rain detection (deployed) | [docs/rain_detection_wrm.md](../../docs/rain_detection_wrm.md) | `dsp_rain_detection.py` | `edge` `RainCL/Src/dsp_rain_detection.c` |
+| Rain measurement (CM4): legacy DSD + band noise suppression | [docs/rain_measurement.md](../../docs/rain_measurement.md) | `rain_estimator.py`, `band_noise_estimator.py`, `band_noise_processor.py`, `../host_analysis/device_dsd_processing_emulator.py` | pluvira (production) `CM4/Src/disdrometer_legacy.c`, `disdrometer.c`, `band_noise_dsd.c`, `rain_models.c`, `fft_helper.c` |
+
+---
+
+## 1. Frame and filter conventions
+
+**NCL (CM7)**
+- 11,162 Hz; `n_fft = 256` (`NOISE_CL_FFT_SIZE`), `hop = 128` (`NOISE_CL_HOP_SIZE`); periodic Hann.
+- STFT with `center=False`: frame `t` covers `x[t*hop : t*hop + n_fft]`, no symmetric padding.
+  `center=True` would shift batch frames against the streaming/firmware frame boundaries. Frames per
+  10 s clip: `(Fs*10 − n_fft) / hop + 1` in integer arithmetic = 869 (`NOISE_CL_MAX_FRAMES`).
+- The STFT is taken on the **unfiltered** signal in both Python (`librosa.stft(x, …)`, not `x_proc`) and
+  firmware (`finSignal`, "unfiltered — used for FFT/spectral path"). The 350 Hz high-pass
+  (`NOISE_CL_HP_SOS_COEF_DEF`, 4th-order Butterworth, 2 biquads) feeds only the TD gate.
+- TD filtering must be **causal** to match firmware: set `td_feature_timing_mode="causal_frame"` (Python
+  default is `"offline"`, which uses non-causal `sosfiltfilt`). Firmware resets the HP state per clip and
+  pre-filters the first `HOP_SIZE` samples so frame 0 sees a full filtered window; the PC build runs one
+  causal pass over the clip (`sosfilt` equivalent).
+- Streaming (`RainFrameClassifierState.process_audio_frame`): prime with `seed_audio(x[0:hop])`, then
+  feed one hop per call so the rolling buffer holds exactly `x[t*hop : t*hop + n_fft]` before each FFT.
+
+**CM4**
+- Legacy DSD: 512-sample frames, no overlap, no window, unscaled FFT magnitude
+  (`arm_rfft_fast_f32` + `arm_cmplx_mag_f32` == `np.abs(np.fft.rfft(frame))`, non-negative frequencies only).
+- Bin edges use firmware's **integer** spacing `DF = 11162 / 512 = 21`, not 21.80 Hz. See
+  [rain_measurement.md §1.1](../../docs/rain_measurement.md); Python on `main` is one bin low until
+  audio_processing_tools PR #7 merges.
+- Band noise: 512-sample frames split into four 128-sample subframes; HPF (350 Hz) and BPF (400–700 Hz)
+  are 4th-order Butterworth SOS whose state **carries across frames**, so the batch adapter requires
+  `hop == frame_len`.
+
+## 2. Precision
+
+Firmware is float32 throughout. `SpectralNoiseProcessor` defaults to `process_dtype="float32"`;
+`BandNoiseEstimatorConfig.dtype` defaults to float64. Compute and store in float32 when checking
+parity; treat float64 as a declared exception. The remaining NCL C-vs-Python mismatch (2 of 2000 clip
+decisions) is attributed to float32 (C) vs float64 (Python) per-mode band baselines.
+
+## 3. State and memory
+
+| Component | State carried between frames |
+|---|---|
+| `CausalNoiseTracker` | three arrays of K (operating-band bins): `_tracker`, `_tracker_scale`, `_prev_N` |
+| `RainFrameClassifierState` | two previous spectrum columns (flux is `t` vs `t−2`), one low-quantile tracker per mode + one combined, an `n_fft`-sample rolling audio buffer (raw + filtered), and for `process_audio_frame` one `CausalNoiseTracker`: about 5.4 KB in total, independent of clip length (batch path: ~3.6 MB spectrogram) |
+| Firmware NCL band state (`noise_cl_band_state_t`) | per mode band: `bin_lo/bin_hi`, `tracker`, `scale`, `prev_N`; plus `eta`, `band_eta` |
+| `BandNoiseEstimator` / `band_noise_dsd.c` | HPF + BPF filter states, ring buffer of `W = 30` subframe energies with ages (TTL), previous-frame FFT band powers and dB levels, hold counter, effective q |
+
+## 4. Python ↔ C names
+
+**NCL** (`NoiseProcessorConfig` / detector params → `noise_cl_config_t`, `noisecldsp_config.h`):
+
+| Python | C |
+|---|---|
+| `td_gate_threshold` | `td_gate_thr` |
+| `td_kurtosis_upper_threshold` | `td_kurtosis_upper_thr` (0 disables) |
+| `new_rain_primary_flux_min` | `primary_flux_min` |
+| `new_rain_mode{1,2,3}_flux_min` | `mode{1,2,3}_flux_min` |
+| `new_rain_min_support_count` | `NOISE_CL_MIN_SUPPORT_COUNT` |
+| `clip_rain_min_frames` | `clip_rain_min_frames` |
+| `q`, `win_sec` (noise PSD) | `NOISE_CL_QUANT_Q`, `NOISE_CL_QUANT_WIN_SEC` |
+| `mode_flux_norm_q` (20) | `NOISE_CL_BAND_QUANT_Q` (0.20) |
+| `mode_flux_norm_win_sec` (0.5) | `NOISE_CL_QUANT_WIN_SEC` (0.5; used with rounding for `band_eta`) |
+| `ema_up`, `ema_down` | `NOISE_CL_EMA_UP`, `NOISE_CL_EMA_DOWN` |
+| `mode_bands` | `NOISE_CL_MODE_BANDS_DEF` |
+| `detector_use_noise_norm` | `use_noise_psd_norm` |
+| `pre_filter_mode="highpass"` for TD features (causal with `td_feature_timing_mode="causal_frame"`) | `use_td_prefilter` |
+| `mode_flux_norm_enable` | `use_flux_norm` |
+
+Thresholds are read from `noise_cl_config()` in `dsp_noise_detection.c`, **not** from `config_list.h`
+(`noise_cl_init()` ignores the latter). Release status: [rain_detection_ncl.md §3](../../docs/rain_detection_ncl.md).
+
+**CM4 band noise:** full table in [rain_measurement.md §2.6](../../docs/rain_measurement.md)
+(`BandNoiseEstimatorConfig` ↔ `BAND_NOISE_*` / `BAND_RAIN_*` in `band_noise_dsd.h`).
+
+**Legacy DSD** (`disdrometer_legacy.h`): `RAIN_ENERGY_THRESHOLD` (0.6), `RAIN_LOG_FACTOR` (0.6),
+`RAIN_LOG_BASE` (1.13), `FFT_LOW/HIGH_INDEX`, `PFT_LOW/HIGH_INDEX`, `LOWER/UPPER_WINDOW_*`.
+In Python, `rain_estimator.py` defines `RAIN_ENERGY_THRESHOLD`, `RAIN_LOG_FACTOR`, `RAIN_LOG_BASE` and
+`DSD_BINS` as module constants and computes the rain-band indices inside `estimate_rain_from_audio()`;
+`DsdProcessingEmualtor` holds the indices as attributes (`rain_low_idx`/`rain_high_idx`,
+`pft_low_idx`/`pft_high_idx`, `lwin_start_idx`/`lwin_end_idx`, `hwin_start_idx`/`hwin_end_idx`).
+
+## 5. Numerical details that had to match (NCL bitmatch)
+
+From `edge` `NoiseCL/TargetPC/Test/Util/bitmatch_summary.md` (stages 1–2, simplified configurations,
+2000/2000) and `production_summary.md` (production configuration):
+
+1. **Periodic** Hann (`2/N`), as librosa/scipy `fftbins=True`.
+2. Band bin range `ceil(lo/res)`..`floor(hi/res)`, matching Python's `freqs >= lo & freqs <= hi`.
+3. Crest factor `peak / sqrt(mean(x²) + eps)`, epsilon inside the square root.
+4. Unbiased Pearson kurtosis, `scipy.stats.kurtosis(fisher=False, bias=False)`.
+5. Baseline read **before** update (emit-before-ingest), as in `causal_stochastic_low_quantile_baseline`.
+6. Scale EMA alpha `1 − eta`, not a fixed 0.95.
+7. **Per-bin PSD tracker only:** window `W = floor(win_sec·Fs/hop)` = 43, `eta = 2/44`, not ceil
+   (matches `CausalNoiseTracker`'s `int()`). Don't reuse this for the band baseline (item 11).
+8. Inner clamp `N ≤ P` after each per-bin update, and outer clamp `N_lag ≤ P` before the log difference.
+
+Production configuration (`use_noise_psd_norm=1`, `use_td_prefilter=1`, `use_flux_norm=1`):
+
+9. Flux normalisation reads the **raw** band tracker (`tracker[i]`), not the EMA-smoothed `prev_N[i]`,
+   and reads it before updating (emit-before-ingest).
+10. TD pre-filter must be causal on both sides: Python `td_feature_timing_mode="causal_frame"`
+    (`sosfilt`), not `"offline"` (`sosfiltfilt`).
+11. **Band baseline** has its own step size, `band_eta`, from `W = round(win_sec·Fs/hop)` = 44
+    (`eta = 2/45`), matching `causal_stochastic_low_quantile_baseline`'s `int(round(...))`.
+
+## 6. Parity harnesses
+
+| Algorithm | Harness | Notes |
+|---|---|---|
+| NCL | `edge` `NoiseCL/TargetPC/Test/Util/run_batch.py` → `call_c_fun.compare_algo()` | C library vs Python `SpectralNoiseProcessor`; PASS = rain frames within ±2. Release 1 (current NCL pre-release firmware): 1998/2000 clip decisions agree. Write-ups `bitmatch_summary.md`, `production_summary.md` |
+| WRM | `edge` `RainCL/TargetPC/Test/Util/` (`call_c_fun.py`, `dsp_rain_detection.py`, `test_rain_classifier.py`) | 100/100 on set_100 (rain_anomaly_analysis `frame_level_processing_changes.md` §9) |
+| CM4 band noise | pluvira `Utilities/band_noise_pylib/` | builds `band_noise_dsd.c` as a host library callable from Python |
+| Python-only regression | `tests/edge/rain_detection/` here; golden regression in rain_anomaly_analysis `tests/rain_detection/golden_regression/` | deterministic synthetic tests; field-data baselines |
+
+## 7. Known non-parity and open items
+
+- **Python defaults vs firmware:** `td_feature_timing_mode` defaults to `"offline"` (firmware is causal);
+  `tests/edge/rain_detection/conftest.py` uses `q = 0.30` (firmware 0.25); NCL thresholds are release 1,
+  as in `edge` `master`/2.2.203.14. NCL build 2.2.204.14 (release 2) is reportedly on four devices; see
+  [rain_detection_ncl.md §3](../../docs/rain_detection_ncl.md).
+- **Streaming `process_audio_frame()`** differs from the batch path (which matches firmware) on 5.6 % of
+  set_1000 clip decisions. Most of that comes from the 1-frame TD lag and pre-filter warm-up: ungated
+  streaming already differs on 5.4 %, and its rain-gated noise learning (firmware doesn't gate) adds
+  0.8 %. Use the batch path for firmware comparisons.
+- **Streaming vs replay, by design:** filter warm-up after `reset()`, TD features one frame later, no
+  per-clip flux winsorisation, and same-frame N(t) instead of N(t−1) for normalisation.
+- **CM4:** Python legacy DSD and window bins differ from firmware until PR #7 (rain band 19..32 vs
+  20..33, PFT high 67 vs 70, windows 13/45 vs 14/47); `smooth_N_E` exists only in
+  Python; `BandNoiseEstimatorConfig` defaults to float64.
+- **Spectral suppressor path** (`SpectralNoiseProcessor` gain/ISTFT) is Python-only, used to test and
+  show the effect of spectral noise suppression; nothing to port.
