@@ -116,8 +116,10 @@ The rain bands summed for trigger 1 are the five CM7 mode bands (450–650, 800�
 2350–2550, 3150–3350 Hz), combined into one value: this is a rain/no-rain gate, not a per-band noise
 estimate. Two legacy triggers (`use_dE_over_Ehpf`, `use_D_trigger`) exist but are off.
 
-The whole-frame flag `fft_rain_frame` acts only through this learning mask; it isn't used elsewhere in
-the measurement, so changes in the rain-frame fraction are not by themselves a change in measured rain.
+The whole-frame flag `fft_rain_frame` acts through this learning mask and, only when the optional
+`smooth_N_E` is on, also picks the wet or dry attack rate of the `N_E` smoothing
+(`band_noise_estimator.py`, `is_raining`). `smooth_N_E` is off by default and in firmware (`N_E = N_E_raw`),
+so there a change in the rain-frame fraction is not by itself a change in measured rain.
 
 ### 2.2 Noise learning
 

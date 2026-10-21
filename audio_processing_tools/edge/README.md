@@ -20,7 +20,7 @@ What the algorithms do, and their status, is in the top-level docs:
 - 11,162 Hz; `n_fft = 256` (`NOISE_CL_FFT_SIZE`), `hop = 128` (`NOISE_CL_HOP_SIZE`); periodic Hann.
 - STFT with `center=False`: frame `t` covers `x[t*hop : t*hop + n_fft]`, no symmetric padding.
   `center=True` would shift batch frames against the streaming/firmware frame boundaries. Frames per
-  10 s clip: `(Fs*10 − n_fft) / hop + 1` (`NOISE_CL_MAX_FRAMES`).
+  10 s clip: `(Fs*10 − n_fft) / hop + 1` in integer arithmetic = 869 (`NOISE_CL_MAX_FRAMES`).
 - The STFT is taken on the **unfiltered** signal in both Python (`librosa.stft(x, …)`, not `x_proc`) and
   firmware (`finSignal`, "unfiltered — used for FFT/spectral path"). The 350 Hz high-pass
   (`NOISE_CL_HP_SOS_COEF_DEF`, 4th-order Butterworth, 2 biquads) feeds only the TD gate.
@@ -33,7 +33,7 @@ What the algorithms do, and their status, is in the top-level docs:
 
 **CM4**
 - Legacy DSD: 512-sample frames, no overlap, no window, unscaled FFT magnitude
-  (`arm_rfft_fast_f32` + `arm_cmplx_mag_f32` == `np.abs(np.fft.fft(frame))`).
+  (`arm_rfft_fast_f32` + `arm_cmplx_mag_f32` == `np.abs(np.fft.rfft(frame))`, non-negative frequencies only).
 - Bin edges use firmware's **integer** spacing `DF = 11162 / 512 = 21`, not 21.80 Hz. See
   [rain_measurement.md §1.1](../../docs/rain_measurement.md); Python on `main` is one bin low until
   audio_processing_tools PR #7 merges.
