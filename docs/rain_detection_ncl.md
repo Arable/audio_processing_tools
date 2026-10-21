@@ -8,8 +8,10 @@ constants in `NoiseCL/Inc/noisecldsp_config.h`.
 
 NCL is the per-minute "is it raining" gate that runs on the 10 s clip CM7 records each minute. It is
 meant to replace the deployed WRM detector ([rain_detection_wrm.md](rain_detection_wrm.md)) and is
-still at pre-release. Its decision gates CM4's rain measurement ([rain_measurement.md](rain_measurement.md)):
-if NCL says no rain for a minute, CM4's measurement for that minute isn't reported.
+an NCL pre-release. The detector that currently gates rain reporting is WRM: CM4 firmware reads the
+WRM (RainCL) rain status (`get_rain_status_from_raincl()`, pluvira `disdrometer.c`); NCL's output is
+stored alongside, and how rain gating is applied downstream has not been verified here. The intended
+design is that NCL's per-minute decision gates CM4's measurement ([rain_measurement.md](rain_measurement.md)).
 
 Low-level conventions for porting (frame alignment, filter state, float32, Python↔C names) are in
 [`audio_processing_tools/edge/README.md`](../audio_processing_tools/edge/README.md).
@@ -95,7 +97,7 @@ detector input = log P(t) − log N_lag(t),   N_lag(t) = N(t−1)
    mode band.
 2. **Per-mode baseline:** each mode's flux is normalised against its own causal low-quantile baseline
    (`mode_flux_norm_q = 20` percentile, `mode_flux_norm_win_sec = 0.5`; firmware
-   `NOISE_CL_BAND_QUANT_Q = 0.20`). The score is an excess-over-baseline ratio,
+   `NOISE_CL_BAND_QUANT_Q = 0.20`, `NOISE_CL_QUANT_WIN_SEC = 0.5`). The score is an excess-over-baseline ratio,
    `max(flux − baseline, 0) / (baseline + floor)`, not a z-score.
 3. Thresholds are applied in `log1p` space.
 
@@ -123,6 +125,9 @@ is_rain = primary_ok AND (support_hits ≥ new_rain_min_support_count)
 
 `primary_ok` requires the primary mode's score to clear `new_rain_primary_flux_min`; `support_hits`
 counts how many of the 3 support modes clear their own thresholds (`new_rain_mode{1,2,3}_flux_min`).
+Requiring all 3 support modes on top of the primary guards against narrowband interference that
+resembles a single mode. The per-mode adaptive baselines are a substantial change from WRM's fixed
+SNR thresholds ([rain_detection_wrm.md](rain_detection_wrm.md)).
 `rain_conf` is **binary** (0.0/1.0) so it stays aligned with the hard frame count used at clip level.
 A small threshold miscalibration therefore flips a frame rather than shading a confidence, which is
 worth keeping in mind when tuning against noisy labels.
@@ -132,7 +137,7 @@ worth keeping in mind when tuning against noisy labels.
 ```
 clip_is_rain   = rain_frame_count ≥ clip_rain_min_frames
 median_conf    = median(rain_conf on rain frames)
-abundance_conf = rain_frame_count / (2 × clip_rain_min_frames)
+abundance_conf = clip(rain_frame_count / (2 × clip_rain_min_frames), 0, 1)
 clip_rain_conf = max(median_conf, abundance_conf)
 ```
 
@@ -162,12 +167,19 @@ params > defaults. **Modes:** full (detection + suppression); `classifier_only_m
 | `td_kurtosis_upper_threshold` / `td_kurtosis_upper_thr` | 12.0 | 12.0 |
 | noise PSD `q` / `NOISE_CL_QUANT_Q` | 0.25 | 0.25 |
 
-- **Devices run release 1.** Release 2 is the recommendation in rain_anomaly_analysis
+- **Release status (as of 2026-10-21; fleet firmware versions not checked).** Release 2 is the
+  recommendation in rain_anomaly_analysis
   [`learnings/ncl_fw_threshold_recommendation.md`](https://github.com/Arable/rain_anomaly_analysis/blob/main/learnings/ncl_fw_threshold_recommendation.md).
-  It is in `edge`'s `NoiseCL/Inc/config_list.h` on `master` (since `ce97000`), but `noise_cl_config()`
-  in `dsp_noise_detection.c` hardcodes the release 1 values (4 / 3.4 / 2.45) and is what the model
-  reads. The fix is `edge` PR #30 (`sp/param_ch`), open as of 2026-10-21.
-- **Python defaults are release 1**: `rain_frame_classifier.py` (`td_gate_threshold` 3.4,
+  The thresholds the model uses are hardcoded in `noise_cl_config()` (`dsp_noise_detection.c`);
+  `config_list.h` is not read by the model.
+  - `edge` `master` and `Release-2.2.203.14` (`22e0250`, PR #21) hardcode **release 1** (4 / 3.4 / 2.45).
+    PR #21 changed only `config_list.h` (`ce97000` on `sp/noise_cancel_model`).
+  - NCL build **2.2.204.14** (`Release-2.2.204.14` = `8e2e2ec`, the same commit as open `edge` PR #30,
+    `sp/param_ch`) hardcodes **release 2**. It was reportedly rolled out to four devices as of 2026-10-12:
+    D003974, D003733 and two HW3.5 EVT units, B050010 and B050008 (unpushed `edge` commit `7c159e3`).
+  - So most NCL pre-release devices probably still run release 1. NCL is a pre-release on all of them;
+    WRM is the deployed detector.
+- **Python defaults are release 1** (the current NCL pre-release firmware on most devices): `rain_frame_classifier.py` (`td_gate_threshold` 3.4,
   `new_rain_mode3_flux_min` 2.45), `rain_signal_processor.py` (`clip_rain_min_frames` 4), and
   `tests/edge/rain_detection/conftest.py`. Move them together with the golden baselines in
   rain_anomaly_analysis, not on their own. Note that `conftest.py` uses `q = 0.30`, not firmware's 0.25.
@@ -177,16 +189,17 @@ params > defaults. **Modes:** full (detection + suppression); `classifier_only_m
 **Which Python path matches firmware:** the **batch** path (`SpectralNoiseProcessor` /
 `RainDetectorProcessor`) with `td_feature_timing_mode="causal_frame"` and `q = 0.25`. The Python default
 for `td_feature_timing_mode` is `"offline"` (TD features from non-causal `sosfiltfilt`); set
-`"causal_frame"` to match firmware's causal filtering. Firmware's noise tracker isn't rain-gated, so the
-streaming `process_audio_frame()` path, which gates learning, is **not** the faithful one.
+`"causal_frame"` to match firmware's causal filtering. The streaming `process_audio_frame()` path is
+**not** the faithful one: it gates noise learning on rain (firmware doesn't), lags TD features by a
+frame, and has pre-filter warm-up.
 
 | Comparison | Result | Source |
 |---|---|---|
-| C library vs Python batch, NCL, deployed release 1, 1000 rain + 1000 no-rain clips | clip decision agrees on 1998/2000; 1992/2000 within ±2 rain frames | `edge` `NoiseCL/TargetPC/Test/Util/` (`run_batch.py`, `production_summary.md`) |
+| C library vs Python batch, NCL release 1 (current NCL pre-release firmware), 1000 rain + 1000 no-rain clips | clip decision agrees on 1998/2000; 1992/2000 within ±2 rain frames | `edge` `NoiseCL/TargetPC/Test/Util/` (`run_batch.py`, `production_summary.md`) |
 | C vs Python, NCL and WRM, set_100 | 100/100 clip decisions each | rain_anomaly_analysis `tests/rain_detection/golden_regression/frame_level_processing_changes.md` §9 |
 | Python `replay_clip()` vs batch `_detect_rain_over_time()` | 1.0000 frame-class agreement, flux MAE 0.000000 | [history/frame_level_rain_streaming.md](history/frame_level_rain_streaming.md) |
 | Python `process_frame()` vs no-winsor replay | 0.9552 frame agreement; all disagreements from the 1-frame TD lag | same |
-| Python batch vs streaming `process_audio_frame()` (rain-gated), set_1000 | 0.994 frame agreement, but 56 clips (5.6 %) change decision | `frame_level_processing_changes.md` §8 |
+| Python batch vs streaming `process_audio_frame()`, set_1000 | rain-gated: 0.994 frame agreement, 56 clips (5.6 %) change decision; ungated: 54 clips (5.4 %). Gating alone flips 0.8 %; most of the gap is the 1-frame TD lag and pre-filter warm-up | `frame_level_processing_changes.md` §8 |
 
 The last two rows are Python-vs-Python comparisons, not firmware ones. The remaining C-vs-Python
 residual is attributed to float32 (C) vs float64 (Python) band baselines.
@@ -251,6 +264,10 @@ slowly; strong TD features (crest factor, kurtosis); a modular detector/suppress
 over-suppression); very light rain below the noise floor; strong impulsive mechanical noise that looks
 like rain in the TD features (the anomalous-noise false positives studied in rain_anomaly_analysis);
 frame misclassification propagating to the clip decision.
+
+**Validation caveat:** the design has not been exhaustively validated across deployment conditions;
+performance may differ where there is strong mechanical or highly structured vibration. Among the TD
+features, time flux has been less discriminative in the datasets so far than crest factor and kurtosis.
 
 **Limitations:** the FD features are highly correlated; decisions are threshold-based; PSD tracking can
 lag fast noise changes; thresholds risk overfitting small tuning sets.

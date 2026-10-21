@@ -4,13 +4,16 @@
 `audio_processing_tools/host_analysis/device_dsd_processing_emulator.py` (`DsdProcessingEmualtor`),
 `audio_processing_tools/edge/band_noise_estimator.py` (`BandNoiseEstimator`, `NoiseFrameDetector`),
 `audio_processing_tools/edge/band_noise_processor.py` (`BandNoiseEstimatorProcessor`).
-**Firmware** (pluvira / mark3-firmware-trunk, `CM4/`): `disdrometer_legacy.c/.h`, `disdrometer.c`,
-`band_noise_dsd.c/.h`, `fft_helper.c`.
+**Firmware** (production CM4 source: pluvira, `CM4/`): `disdrometer_legacy.c/.h`, `disdrometer.c`,
+`band_noise_dsd.c/.h`, `rain_models.c`, `fft_helper.c`. (mark3-firmware-trunk `master` has the legacy
+files but not `band_noise_dsd.c`, which is only on its `band-noise-nc-fixes` branch.)
 
 CM4 measures how much it rains. It runs continuously on 512-sample frames, unlike CM7, which records a
-10 s clip once a minute. CM7's NCL detection decides whether each minute's CM4 measurement is reported:
+10 s clip once a minute. A per-minute detection decides whether each minute's CM4 measurement counts:
 a missed detection drops a correct measurement, and a false detection lets through one that shouldn't be
-reported. See [rain_detection_ncl.md](rain_detection_ncl.md).
+reported. In current firmware CM4 reads the WRM (RainCL) rain status (`get_rain_status_from_raincl()`);
+NCL is a pre-release whose output is stored alongside, and the downstream gating has not been verified
+here. See [rain_detection_ncl.md](rain_detection_ncl.md).
 
 Porting conventions (filter state, float32, Python↔C names): [`audio_processing_tools/edge/README.md`](../audio_processing_tools/edge/README.md).
 
@@ -54,10 +57,18 @@ PFT_LOW_INDEX  = 100/DF + 1 = 5,    PFT_HIGH_INDEX = 1500/DF − 1 = 70
 lower window   = 300/DF = 14 .. 32,  upper window = 1000/DF = 47 .. 65
 ```
 
-`rain_estimator.py` and the DSD emulator on `main` use the true spacing, `fs / 512 = 21.80 Hz`, which
-gives rain band bins **19..32**: one bin lower than the device. audio_processing_tools PR #7
-(`vo/fix-dsd-band-bins`, open) moves both to firmware's integer DF. Until it merges, Python legacy DSD
-results are shifted by one bin against firmware.
+`rain_estimator.py` and the DSD emulator on `main` use the true spacing, `fs / 512 = 21.80 Hz`. That
+shifts more than the rain band:
+
+| | Firmware | Python on `main` |
+|---|---|---|
+| Rain band | 20..33 | 19..32 |
+| PFT | 5..70 | 5..67 |
+| Lower FFT window | 14..32 | 13..31 |
+| Upper FFT window | 47..65 | 45..63 |
+
+audio_processing_tools PR #7 (`vo/fix-dsd-band-bins`, open) moves all of these to firmware's integer
+DF. Until it merges, Python legacy DSD and window outputs don't line up with the device's.
 
 ## 2. Band noise estimation and suppression
 
@@ -69,11 +80,20 @@ This is a different, narrower module from CM7's spectral noise processor
 ([rain_detection_ncl.md](rain_detection_ncl.md)), which works across all resonance modes in
 400–3500 Hz for frame classification.
 
-**Status.**
-- *Firmware:* CM4 runs `band_noise_dsd_process_frame()` on every frame (`disdrometer.c`,
-  `disdrometer_process_sample`) and accumulates a second, **noise-cancelled** DSD histogram from
-  `M_clean_fft` (`accumulate_nc_histogram`), next to the raw one. Rain is computed from both
-  (`nc_rain_rate_via_bins`, and `nc_rain_rate_direct` from accumulated `M_clean_fft` without binning).
+**Status** (from reading pluvira `master` source, not observed at runtime).
+- *Firmware:* in `disdrometer_process_sample()` CM4 runs `band_noise_dsd_process_frame()` and accumulates
+  a second, **noise-cancelled** DSD histogram from `M_clean_fft` (`accumulate_nc_histogram`), next to the
+  raw one. It seems not to run on every frame: it is skipped while the audio write pointer is inside the
+  scratch area it borrows at the end of the raw-audio buffer (`audio_raw_writep >= BAND_NOISE_SCRATCH_ADDR`),
+  until the CM7 model run clears that buffer. Skipped frames add nothing to the noise-cancelled histogram,
+  so the noise-cancelled rates may cover less time than the raw one. The estimator is reset at each
+  no-rain poll and at the start of each rain-accumulation window (`band_noise_dsd_reset()`).
+- *What is reported:* the raw `energy_histogram` is uploaded as the DSD (`add_dsd_sensor_data`). Three
+  rain rates go into the rain-classification sensor record (`store_rain_classification_sensor_data`,
+  `rain_models.c`): `rain_regression` (raw), `noise_classifier.rain_regression` (noise-cancelled, via
+  bins) and `noise_classifier.nc_rain_rate_direct` (noise-cancelled, accumulated `M_clean_fft` without
+  binning). The noise-cancelled histogram itself apparently isn't uploaded. Cloud precipitation is
+  presumably computed from the raw DSD (not checked).
 - *Python:* `BandNoiseEstimator` is standalone. `RainDetectorProcessor` and `estimate_rain_from_audio()`
   don't use it; it is the reference implementation used for parity and offline evaluation.
 
@@ -88,7 +108,9 @@ non-rain energy feeds the noise estimate. Either of two triggers marks rain:
    **and** exceeds the concurrent rise in broadband (high-pass) loudness by ≥ `excess_rise_db` (3 dB).
    A narrowband jump relative to broadband energy separates an impact (which excites the resonance)
    from wind (which raises everything together). A `k_subframes` hold (2) extends the mask over decay
-   tails.
+   tails. Working on 128-sample subframes (~11.5 ms) is fine enough to catch individual impacts. The
+   assumption can break down for strong gusts that happen to excite the fundamental mode
+   preferentially.
 
 The rain bands summed for trigger 1 are the five CM7 mode bands (450–650, 800–1050, 1500–1800,
 2350–2550, 3150–3350 Hz), combined into one value: this is a rain/no-rain gate, not a per-band noise
@@ -129,10 +151,16 @@ in rain (`ne_attack_alpha_wet` 0.02), faster rise otherwise (`ne_attack_alpha_dr
 ### 2.4 Two FFT-band metrics
 
 `M_band_fft` / `E_band_fft` use `legacy_band_bins()`, floor-based bin edges that reproduce
-`disdrometer_legacy.h`'s integer macros, rather than the round-based `hz_to_bin()` used elsewhere in the
-file. That makes the unsuppressed FFT magnitude sum directly comparable with firmware's legacy
-`drop_energy_level`, so suppression can be checked side by side. It is not meant to match
-`band_noise_dsd.c`'s own diagnostics, which use an RMS-style binning.
+`disdrometer_legacy.h`'s integer macros, rather than the round-based `hz_to_bin()` used for the rain and
+primary bands. Firmware does the same (`legacy_low_bin` / `legacy_high_bin` in `band_noise_dsd.c`). This
+lines the unsuppressed FFT magnitude sum up with the legacy `drop_energy_level` band, so suppression can
+be compared side by side.
+
+The bins match but the input doesn't: `M_band_fft` is computed from the 350 Hz high-passed frame (Python
+`band_noise_estimator.py`, firmware `band_noise_dsd.c` `run_rain_detector(x_hpf, …)`), while
+`drop_energy_level` uses the raw frame. The 4th-order 350 Hz HPF attenuates about 1.3 dB (power) at
+400 Hz and less above it, so `M_band_fft` (and therefore `M_clean_fft`) reads slightly low against the
+raw path at the bottom of the band.
 
 ### 2.5 Telemetry and the batch adapter
 
@@ -143,8 +171,8 @@ file. That makes the unsuppressed FFT magnitude sum directly comparable with fir
   array and a params dict (nested `det.*` overrides allowed), frames at `hop == frame_len` (required:
   IIR state carries across frames), and returns `(results_dict, state_dict)`. `state_dict` has per-frame
   arrays of the `BandNoiseFrameOut` fields (`M_band`, `E_band`, `N_E`, `subE`, `G_mag`, `M_clean`,
-  `M_clean_fft`, …); the energy stats appear once, as a cumulative snapshot under
-  `state["energy_stats"]`.
+  `M_clean_fft`, …), and `results_dict` has summary medians; the energy stats appear once, as a
+  cumulative snapshot under `state["energy_stats"]`.
 
 ### 2.6 Configuration (Python default = firmware value)
 
@@ -187,7 +215,8 @@ recordings carry their own native noise, and there is no clean-rain reference.
   0.52 s. The 0.5 s wind ramp alone accounts for about 0.43 s and 0.31 s, so the estimator adds about
   0.3 s and 0.2 s.
 - **Possible over-suppression in heavy rain.** Against noise floors taken from the quietest impact-free
-  blocks of each clip, CM4 at q = 0.30 estimates more noise in almost every clip. In classes 10–12 its
+  blocks of each clip, CM4's mean noise estimate at q = 0.30 is higher than the 10th-percentile floor in
+195/195 clips, the 20th in 193/195 and the 30th in 149/195. In classes 10–12 its
   rain-output reduction (median 12.8 %) is close to the 30th-percentile floor's (12.3 %) but far above
   the 10th-percentile floor's (4.1 %). This is consistent with some rain leaking into the noise
   estimate, but doesn't establish it.
@@ -205,7 +234,9 @@ Sources (rain_anomaly_analysis; files from open PRs appear at these links once m
 
 - The estimator is single-band by design (`band_hz`). There is no per-mode-band CM4 noise estimate; a
   per-band version would need `BandNoiseEstimator` itself to be generalised.
-- Which rain value the device reports (raw, noise-cancelled via bins, or noise-cancelled direct) is
-  decided outside these modules; check `disdrometer.c` and the reporting path before comparing field
-  data against either.
+- How the three reported rain rates (section 2, Status) are used downstream, and whether cloud
+  precipitation uses only the raw DSD, hasn't been checked. Check the reporting path before comparing
+  field data against either.
+- The band-noise skip while the scratch area is in use (section 2, Status) is from reading the source;
+  how often it happens on devices hasn't been measured.
 - HW3.5 microphones and gain differ from HW3.0; none of the results above have been repeated on HW3.5.

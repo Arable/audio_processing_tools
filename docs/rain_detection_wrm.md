@@ -32,7 +32,7 @@
 
 ## 1. Executive Summary
 
-The Arable Mark rain measurement system is an **acoustic disdrometer**: it uses a microphone inside a resonance chamber to detect and quantify rainfall from the sound of drops impacting the dome. The system operates on 10 seconds of audio every minute, sampled at 11,162 Hz.
+The Arable Mark rain measurement system is an **acoustic disdrometer**: it uses a microphone inside a resonance chamber to detect and quantify rainfall from the sound of drops impacting the dome. Audio is sampled at 11,162 Hz. Rain detection runs on a 10-second clip recorded every minute; the DSD measurement (CM4) runs continuously on 512-sample frames.
 
 There are two distinct algorithms:
 
@@ -241,8 +241,9 @@ For each audio frame (512 samples, no overlap, no window function by default):
    *Bin edges (status note, October 2026):* firmware computes the bin spacing with integer
    division, `DF = SAMPLING_FREQ / FFT_SAMPLE_LENGTH = 11162 / 512 = 21`
    (`disdrometer_legacy.h`), so the band is bins 20..33. The Python emulator on `main` uses the
-   true spacing 21.80 Hz and gets bins 19..32. audio_processing_tools PR #7 aligns Python with
-   firmware. See [rain_measurement.md](rain_measurement.md).
+   true spacing 21.80 Hz and gets bins 19..32; its peak-frequency and FFT-window bins are shifted
+   too (PFT high 67 vs 70, windows 13/45 vs 14/47). audio_processing_tools PR #7 aligns all of them
+   with firmware. See [rain_measurement.md](rain_measurement.md).
 
    **Why this band:** This is where raindrop impacts produce the strongest response (the dome's fundamental resonance). The energy in this band is a proxy for the total impact energy.
 

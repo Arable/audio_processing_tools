@@ -10,7 +10,7 @@ What the algorithms do, and their status, is in the top-level docs:
 |---|---|---|---|
 | NCL rain detection (CM7, pre-release) | [docs/rain_detection_ncl.md](../../docs/rain_detection_ncl.md) | `rain_signal_processor.py`, `rain_frame_classifier.py`, `noise_tracker.py`, `feature_extraction.py` | `edge` `NoiseCL/Src/dsp_noise_detection.c` |
 | WRM rain detection (deployed) | [docs/rain_detection_wrm.md](../../docs/rain_detection_wrm.md) | `dsp_rain_detection.py` | `edge` `RainCL/Src/dsp_rain_detection.c` |
-| Rain measurement (CM4): legacy DSD + band noise suppression | [docs/rain_measurement.md](../../docs/rain_measurement.md) | `rain_estimator.py`, `band_noise_estimator.py`, `band_noise_processor.py`, `../host_analysis/device_dsd_processing_emulator.py` | pluvira / mark3-firmware-trunk `CM4/Src/disdrometer_legacy.c`, `disdrometer.c`, `band_noise_dsd.c`, `fft_helper.c` |
+| Rain measurement (CM4): legacy DSD + band noise suppression | [docs/rain_measurement.md](../../docs/rain_measurement.md) | `rain_estimator.py`, `band_noise_estimator.py`, `band_noise_processor.py`, `../host_analysis/device_dsd_processing_emulator.py` | pluvira (production) `CM4/Src/disdrometer_legacy.c`, `disdrometer.c`, `band_noise_dsd.c`, `rain_models.c`, `fft_helper.c` |
 
 ---
 
@@ -70,7 +70,8 @@ decisions) is attributed to float32 (C) vs float64 (Python) per-mode band baseli
 | `new_rain_min_support_count` | `NOISE_CL_MIN_SUPPORT_COUNT` |
 | `clip_rain_min_frames` | `clip_rain_min_frames` |
 | `q`, `win_sec` (noise PSD) | `NOISE_CL_QUANT_Q`, `NOISE_CL_QUANT_WIN_SEC` |
-| `mode_flux_norm_q` (20), `mode_flux_norm_win_sec` | `NOISE_CL_BAND_QUANT_Q` (0.20) |
+| `mode_flux_norm_q` (20) | `NOISE_CL_BAND_QUANT_Q` (0.20) |
+| `mode_flux_norm_win_sec` (0.5) | `NOISE_CL_QUANT_WIN_SEC` (0.5; used with rounding for `band_eta`) |
 | `ema_up`, `ema_down` | `NOISE_CL_EMA_UP`, `NOISE_CL_EMA_DOWN` |
 | `mode_bands` | `NOISE_CL_MODE_BANDS_DEF` |
 | `detector_use_noise_norm` | `use_noise_psd_norm` |
@@ -83,14 +84,17 @@ Thresholds are read from `noise_cl_config()` in `dsp_noise_detection.c`, **not**
 **CM4 band noise:** full table in [rain_measurement.md §2.6](../../docs/rain_measurement.md)
 (`BandNoiseEstimatorConfig` ↔ `BAND_NOISE_*` / `BAND_RAIN_*` in `band_noise_dsd.h`).
 
-**Legacy DSD:** `RAIN_ENERGY_THRESHOLD` (0.6), `RAIN_LOG_FACTOR` (0.6), `RAIN_LOG_BASE` (1.13),
-`FFT_LOW/HIGH_INDEX`, `PFT_LOW/HIGH_INDEX`, `LOWER/UPPER_WINDOW_*` in `disdrometer_legacy.h`, mirrored
-as module constants in `rain_estimator.py` and attributes of `DsdProcessingEmualtor`.
+**Legacy DSD** (`disdrometer_legacy.h`): `RAIN_ENERGY_THRESHOLD` (0.6), `RAIN_LOG_FACTOR` (0.6),
+`RAIN_LOG_BASE` (1.13), `FFT_LOW/HIGH_INDEX`, `PFT_LOW/HIGH_INDEX`, `LOWER/UPPER_WINDOW_*`.
+In Python, `rain_estimator.py` defines `RAIN_ENERGY_THRESHOLD`, `RAIN_LOG_FACTOR`, `RAIN_LOG_BASE` and
+`DSD_BINS` as module constants and computes the rain-band indices inside `estimate_rain_from_audio()`;
+`DsdProcessingEmualtor` holds the indices as attributes (`rain_low_idx`/`rain_high_idx`,
+`pft_low_idx`/`pft_high_idx`, `lwin_start_idx`/`lwin_end_idx`, `hwin_start_idx`/`hwin_end_idx`).
 
 ## 5. Numerical details that had to match (NCL bitmatch)
 
-From `edge` `NoiseCL/TargetPC/Test/Util/bitmatch_summary.md`, the C changes needed to reach 2000/2000
-on the simplified configurations:
+From `edge` `NoiseCL/TargetPC/Test/Util/bitmatch_summary.md` (stages 1–2, simplified configurations,
+2000/2000) and `production_summary.md` (production configuration):
 
 1. **Periodic** Hann (`2/N`), as librosa/scipy `fftbins=True`.
 2. Band bin range `ceil(lo/res)`..`floor(hi/res)`, matching Python's `freqs >= lo & freqs <= hi`.
@@ -98,14 +102,24 @@ on the simplified configurations:
 4. Unbiased Pearson kurtosis, `scipy.stats.kurtosis(fisher=False, bias=False)`.
 5. Baseline read **before** update (emit-before-ingest), as in `causal_stochastic_low_quantile_baseline`.
 6. Scale EMA alpha `1 − eta`, not a fixed 0.95.
-7. Tracker window `W = floor(win_sec·Fs/hop)` (43, `eta = 2/44`), not ceil.
+7. **Per-bin PSD tracker only:** window `W = floor(win_sec·Fs/hop)` = 43, `eta = 2/44`, not ceil
+   (matches `CausalNoiseTracker`'s `int()`). Don't reuse this for the band baseline (item 11).
 8. Inner clamp `N ≤ P` after each per-bin update, and outer clamp `N_lag ≤ P` before the log difference.
+
+Production configuration (`use_noise_psd_norm=1`, `use_td_prefilter=1`, `use_flux_norm=1`):
+
+9. Flux normalisation reads the **raw** band tracker (`tracker[i]`), not the EMA-smoothed `prev_N[i]`,
+   and reads it before updating (emit-before-ingest).
+10. TD pre-filter must be causal on both sides: Python `td_feature_timing_mode="causal_frame"`
+    (`sosfilt`), not `"offline"` (`sosfiltfilt`).
+11. **Band baseline** has its own step size, `band_eta`, from `W = round(win_sec·Fs/hop)` = 44
+    (`eta = 2/45`), matching `causal_stochastic_low_quantile_baseline`'s `int(round(...))`.
 
 ## 6. Parity harnesses
 
 | Algorithm | Harness | Notes |
 |---|---|---|
-| NCL | `edge` `NoiseCL/TargetPC/Test/Util/run_batch.py` → `call_c_fun.compare_algo()` | C library vs Python `SpectralNoiseProcessor`; PASS = rain frames within ±2. Deployed release 1: 1998/2000 clip decisions agree. Write-ups `bitmatch_summary.md`, `production_summary.md` |
+| NCL | `edge` `NoiseCL/TargetPC/Test/Util/run_batch.py` → `call_c_fun.compare_algo()` | C library vs Python `SpectralNoiseProcessor`; PASS = rain frames within ±2. Release 1 (current NCL pre-release firmware): 1998/2000 clip decisions agree. Write-ups `bitmatch_summary.md`, `production_summary.md` |
 | WRM | `edge` `RainCL/TargetPC/Test/Util/` (`call_c_fun.py`, `dsp_rain_detection.py`, `test_rain_classifier.py`) | 100/100 on set_100 (rain_anomaly_analysis `frame_level_processing_changes.md` §9) |
 | CM4 band noise | pluvira `Utilities/band_noise_pylib/` | builds `band_noise_dsd.c` as a host library callable from Python |
 | Python-only regression | `tests/edge/rain_detection/` here; golden regression in rain_anomaly_analysis `tests/rain_detection/golden_regression/` | deterministic synthetic tests; field-data baselines |
@@ -113,13 +127,17 @@ on the simplified configurations:
 ## 7. Known non-parity and open items
 
 - **Python defaults vs firmware:** `td_feature_timing_mode` defaults to `"offline"` (firmware is causal);
-  `tests/edge/rain_detection/conftest.py` uses `q = 0.30` (firmware 0.25); NCL thresholds are release 1
-  in both, as on the device today.
-- **Streaming `process_audio_frame()`** gates noise learning on `is_rain`; firmware doesn't. 5.6 % of
-  set_1000 clips change decision against the batch path, so use the batch path for firmware comparisons.
+  `tests/edge/rain_detection/conftest.py` uses `q = 0.30` (firmware 0.25); NCL thresholds are release 1,
+  as in `edge` `master`/2.2.203.14. NCL build 2.2.204.14 (release 2) is reportedly on four devices; see
+  [rain_detection_ncl.md §3](../../docs/rain_detection_ncl.md).
+- **Streaming `process_audio_frame()`** differs from the batch path (which matches firmware) on 5.6 % of
+  set_1000 clip decisions. Most of that comes from the 1-frame TD lag and pre-filter warm-up: ungated
+  streaming already differs on 5.4 %, and its rain-gated noise learning (firmware doesn't gate) adds
+  0.8 %. Use the batch path for firmware comparisons.
 - **Streaming vs replay, by design:** filter warm-up after `reset()`, TD features one frame later, no
   per-clip flux winsorisation, and same-frame N(t) instead of N(t−1) for normalisation.
-- **CM4:** Python legacy DSD bins 19..32 vs firmware 20..33 until PR #7; `smooth_N_E` exists only in
+- **CM4:** Python legacy DSD and window bins differ from firmware until PR #7 (rain band 19..32 vs
+  20..33, PFT high 67 vs 70, windows 13/45 vs 14/47); `smooth_N_E` exists only in
   Python; `BandNoiseEstimatorConfig` defaults to float64.
 - **Spectral suppressor path** (`SpectralNoiseProcessor` gain/ISTFT) is Python-only, used to test and
   show the effect of spectral noise suppression; nothing to port.

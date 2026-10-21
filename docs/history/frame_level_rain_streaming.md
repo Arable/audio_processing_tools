@@ -7,7 +7,8 @@
 
 ## Scope of this doc
 
-`edge/README.md` already documents the detector/suppressor *algorithm* —
+`edge/README.md` already documents the detector/suppressor *algorithm* [now in
+`docs/rain_detection_ncl.md`; `edge/README.md` is the firmware-porting reference] —
 lagged noise PSD, noise-normalized detection, adaptive oversubtraction, etc.
 That explanation still holds. This doc covers what's **new**: the refactor
 from batch/clip-level processing (full spectrogram in memory, O(F×T)) to a

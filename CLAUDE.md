@@ -6,7 +6,7 @@
 **Active branch:** `main` (`feature/frame_level_rain_processing` merged as PR #4)  
 **Golden regression repo:** `/Users/vikrantoak/source1/rain_anomaly_analysis/tests/rain_detection/golden_regression` (moved from `data-science-scratch/golden_regression`)  
 **Goal:** Refactor rain detector from batch/clip-level to per-frame (O(n_fft) memory) for embedded CM7 deployment.  
-**Status:** Core streaming path complete and validated. On 2026-08-05 the FD/TD decision thresholds were reconciled to NCL release 1 (`trial_params3`/`manual-v3`), the set then in `edge` NoiseCL's `config_list.h` on `origin/sp/noise_cancel_model`. The full value table is in the 2026-08-05 session log. **NCL release 2** (`td_gate_threshold` 3.4→**3.7**, `new_rain_mode3_flux_min` 2.45→**3.5**, `clip_rain_min_frames` 4→**2**, everything else unchanged; the recommendation in `rain_anomaly_analysis/learnings/ncl_fw_threshold_recommendation.md`) is approved and in `edge`'s `config_list.h` since `ce97000` (2026-10-01), but **devices still run release 1**: `noise_cl_config()` in `NoiseCL/Src/dsp_noise_detection.c` hardcodes the release 1 values and is what the model reads (`noise_cl_init()` ignores `config_list.h`). The fix is `edge` PR #30 (`sp/param_ch`), open as of 2026-10-21. This repo's code defaults (`rain_frame_classifier.py` Mixin/`State.__init__`/`from_mixin()`, `rain_signal_processor.py` `clip_rain_min_frames`) and `tests/edge/rain_detection/conftest.py` are on release 1, matching the devices today. Updating them is a separate code PR, paired with regenerating the golden baselines in `rain_anomaly_analysis`. PR #6 (`fix/noise-psd-mode-snr-summary`, `band_energy_summary`) merged into `origin/main` as `92de827`. See the 2026-08-31 and 2026-09-09 session log entries and `docs/history/noise_psd_by_mode_wiring.md` for its review history.
+**Status:** Core streaming path complete and validated. On 2026-08-05 the FD/TD decision thresholds were reconciled to NCL release 1 (`trial_params3`/`manual-v3`), the set then in `edge` NoiseCL's `config_list.h` on `origin/sp/noise_cancel_model`. The full value table is in the 2026-08-05 session log. **NCL release 2** (`td_gate_threshold` 3.4→**3.7**, `new_rain_mode3_flux_min` 2.45→**3.5**, `clip_rain_min_frames` 4→**2**, everything else unchanged; the recommendation in `rain_anomaly_analysis/learnings/ncl_fw_threshold_recommendation.md`) is approved. The model reads the thresholds hardcoded in `noise_cl_config()` (`NoiseCL/Src/dsp_noise_detection.c`), not `config_list.h`. `edge` `master` and `Release-2.2.203.14` (`22e0250`, PR #21; its `config_list.h` change was `ce97000` on `sp/noise_cancel_model`) hardcode release 1. NCL build 2.2.204.14 (`Release-2.2.204.14` = `8e2e2ec`, same commit as open `edge` PR #30 `sp/param_ch`) hardcodes release 2 and was reportedly rolled out to D003974, D003733, B050010 and B050008 (HW3.5 EVT) as of 2026-10-12 (unpushed `edge` commit `7c159e3`). Most NCL pre-release devices probably still run release 1; fleet versions not checked. This repo's code defaults (`rain_frame_classifier.py` Mixin/`State.__init__`/`from_mixin()`, `rain_signal_processor.py` `clip_rain_min_frames`) and `tests/edge/rain_detection/conftest.py` are on release 1. Updating them is a separate code PR, paired with regenerating the golden baselines in `rain_anomaly_analysis`. PR #6 (`fix/noise-psd-mode-snr-summary`, `band_energy_summary`) merged into `origin/main` as `92de827`. See the 2026-08-31 and 2026-09-09 session log entries and `docs/history/noise_psd_by_mode_wiring.md` for its review history.
 
 ---
 
@@ -26,18 +26,18 @@ K ≈ 67 bins (400–3500 Hz, n_fft=256, fs=11162). **Reduction: 670×.**
 
 | File | Role |
 |------|------|
-| `audio_processing_tools/edge/rain_signal_processor.py` | Top-level processor. STFT `center=False` line 754, ISTFT `center=False` line 1141. Comparison flags: `run_frame_level_comparison`, `run_streaming_comparison`, `run_nowinsor_replay` in `NoiseProcessorConfig`. |
+| `audio_processing_tools/edge/rain_signal_processor.py` | Top-level processor. STFT `center=False` ~line 754, ISTFT `center=False` ~line 1155. Comparison flags: `run_frame_level_comparison`, `run_streaming_comparison`, `run_nowinsor_replay` in `NoiseProcessorConfig`. |
 | `audio_processing_tools/edge/rain_frame_classifier.py` | `RainFrameClassifierMixin` (batch path) + `RainFrameClassifierState` (streaming path). `process_audio_frame()` is the main per-frame entry point. |
 | `audio_processing_tools/edge/feature_extraction.py` | `extract_td_features_inline`, `extract_raw_spectral_shape_features_inline`. RS function requires `raw_power` (F,T) + `freqs` (F,) — `x` parameter removed. |
 | `audio_processing_tools/edge/noise_tracker.py` | `CausalNoiseTracker` — standalone stateful noise PSD tracker. Has `_seeded` flag (auto-seeds from first frame). |
 | `rain_anomaly_analysis/tests/rain_detection/golden_regression/scripts/generate_baseline.py` | Canonical validation script — replaces notebook. Runs processing + frame-level, streaming, and regression checks. |
 | `audio_processing_tools/edge/rain_estimator.py` | `estimate_rain_from_audio()` — per-clip DSD-based rain-rate estimate (drop-size histogram → regression model → `precip_mm`). Wired into `RainDetectorProcessor.run()` behind `estimate_clip_rain` flag (2026-08-05). |
-| `docs/rain_measurement.md` | CM4 rain measurement: legacy DSD path (firmware bin edges) + band noise estimation/suppression (`band_noise_estimator.py`/`band_noise_processor.py`, folded in from the old `band_noise_suppression.md`), Python↔firmware config table, evaluated behaviour. In Python the estimator is standalone (not wired into `RainDetectorProcessor` or `rain_estimator.py`); firmware CM4 runs it and accumulates a noise-cancelled DSD. |
+| `docs/rain_measurement.md` | CM4 rain measurement: legacy DSD path (firmware bin edges) + band noise estimation/suppression (`band_noise_estimator.py`/`band_noise_processor.py`, folded in from the old `band_noise_suppression.md`), Python↔firmware config table, evaluated behaviour. In Python the estimator is standalone (not wired into `RainDetectorProcessor` or `rain_estimator.py`); pluvira CM4 runs it (skipped while its scratch area in the raw-audio buffer is in use) and accumulates a noise-cancelled DSD alongside the raw one. |
 | `docs/rain_detection_ncl.md` | CM7 NCL rain detection: algorithm, release 1/2 thresholds, which Python path matches firmware, parity, streaming implementation, Python-only spectral suppressor path. |
 | `docs/rain_detection_wrm.md` | WRM legacy detector (`dsp_rain_detection.py`) + legacy DSD quantification: technical assessment (was `rain_algorithm_technical_assessment.md`). |
 | `audio_processing_tools/edge/README.md` | Firmware-porting reference: frame/filter conventions, precision, state, Python↔C names, bitmatch details, parity harnesses. |
 | `docs/history/frame_level_rain_streaming.md` | Historical: what was new in the streaming refactor across `noise_tracker.py`/`rain_frame_classifier.py`/`feature_extraction.py`/`rain_signal_processor.py`. Current summary in `docs/rain_detection_ncl.md` §5. |
-| `docs/history/feature_dump_peak_and_envelope_wiring.md` | Historical writeup: `feature_dump_include_peak_summary`/`feature_dump_include_td_envelope` were dead flags — the data only ever reached `det_debug` (expensive, `keep_state_debug`-gated), never the lean `feature_dump`. Both fixes applied (`rain_frame_classifier.py` `fd_dense` block, ~line 1142-1159); peak-summary verified against real data, td-envelope not yet smoke-tested. |
+| `docs/history/feature_dump_peak_and_envelope_wiring.md` | Historical writeup: `feature_dump_include_peak_summary`/`feature_dump_include_td_envelope` were dead flags — the data only ever reached `det_debug` (expensive, `keep_state_debug`-gated), never the lean `feature_dump`. Both fixes applied (`rain_frame_classifier.py` `fd_dense` block, ~line 1252-1269); peak-summary verified against real data, td-envelope not yet smoke-tested. |
 
 ---
 
@@ -51,8 +51,9 @@ C-vs-Python parity harness still checks release 1. Only the docs were updated (t
 `tests/edge/rain_detection/README.md`, and `rain_anomaly_analysis`'s CLAUDE.md/README/learnings). The Python
 defaults are still release 1. The 2026-08-05 entry's "3.7 was a stale-checkout mistake" was correct at the
 time; 3.7 is now the approved release-2 value, for an unrelated reason (release-2 retune). *Correction
-(2026-10-21):* release 2 is not yet live on devices. `noise_cl_config()` hardcodes release 1 and is what
-the model reads; it changes with `edge` PR #30.
+(2026-10-21):* `master`'s `noise_cl_config()` still hardcodes release 1, and that is what the model reads.
+Release 2 is hardcoded only in NCL build 2.2.204.14 (`8e2e2ec`, = `edge` PR #30), reportedly on four
+devices as of 2026-10-12.
 
 ## Session log — 2026-09-09
 
@@ -189,7 +190,7 @@ completed and PR merged on 2026-08-31 — see that session log entry above.
 - `replay_clip()`: RS power from per-frame `np.fft.rfft` loop (center=False) — no more `spsig.stft`.
 
 ### `center=False` STFT
-STFT line 754 and ISTFT line 1141 both `center=False`. Frame t covers `x[t*hop : t*hop+n_fft]`. Invalidated all prior baselines (regenerated, see below).
+STFT line 754 and ISTFT line 1141 (now ~1155) both `center=False`. Frame t covers `x[t*hop : t*hop+n_fft]`. Invalidated all prior baselines (regenerated, see below).
 
 ---
 
