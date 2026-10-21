@@ -1,5 +1,7 @@
 # Frame-Level Streaming Refactor: Noise Estimation + Rain Detection
 
+> **Historical record.** Development notes kept for reference; may be out of date. Current documentation: [rain_detection_ncl.md](../rain_detection_ncl.md), [rain_measurement.md](../rain_measurement.md), [edge/README.md](../../audio_processing_tools/edge/README.md).
+
 **Files:** `edge/noise_tracker.py`, `edge/rain_frame_classifier.py`, `edge/feature_extraction.py`, `edge/rain_signal_processor.py`
 **Branch:** `feature/frame_level_rain_processing`
 
