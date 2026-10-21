@@ -1,7 +1,16 @@
-# Technical Assessment: Arable Mark Rain Detection and Quantification Algorithm
+# WRM Rain Detection and Legacy DSD Quantification: Technical Assessment
 
 **Prepared for the Arable Data Science Team**
-**March 2026**
+**March 2026** (status notes updated October 2026)
+
+> **Scope.** This document describes the **WRM** rain detector, the deployed legacy
+> detector (`audio_processing_tools/edge/dsp_rain_detection.py`; firmware
+> `edge/RainCL/Src/dsp_rain_detection.c`), and the legacy DSD quantification
+> (`audio_processing_tools/host_analysis/device_dsd_processing_emulator.py`; firmware
+> `disdrometer_legacy.c`). The NCL (CM7) detector that is intended to replace WRM is
+> documented in [rain_detection_ncl.md](rain_detection_ncl.md). Rain measurement (CM4),
+> including the band noise estimator and suppressor, is in
+> [rain_measurement.md](rain_measurement.md).
 
 ---
 
@@ -11,7 +20,7 @@
 2. [System Overview and Physical Principles](#2-system-overview-and-physical-principles)
 3. [Algorithm Walkthrough: Rain Detection](#3-algorithm-walkthrough-rain-detection)
 4. [Algorithm Walkthrough: Rain Quantification (DSD)](#4-algorithm-walkthrough-rain-quantification-dsd)
-5. [The Noise Suppression System (In Development)](#5-the-noise-suppression-system-in-development)
+5. [Noise Suppression (moved)](#5-noise-suppression-moved)
 6. [Literature Context and State of the Art](#6-literature-context-and-state-of-the-art)
 7. [Assumptions and Their Validity](#7-assumptions-and-their-validity)
 8. [Strengths](#8-strengths)
@@ -229,6 +238,12 @@ For each audio frame (512 samples, no overlap, no window function by default):
 1. **FFT** of the frame → magnitude spectrum.
 2. **Sum magnitude in [400, 700] Hz** — this is the fundamental resonance band. The sum of FFT magnitudes across bins in this range gives `drop_energy_level`.
 
+   *Bin edges (status note, October 2026):* firmware computes the bin spacing with integer
+   division, `DF = SAMPLING_FREQ / FFT_SAMPLE_LENGTH = 11162 / 512 = 21`
+   (`disdrometer_legacy.h`), so the band is bins 20..33. The Python emulator on `main` uses the
+   true spacing 21.80 Hz and gets bins 19..32. audio_processing_tools PR #7 aligns Python with
+   firmware. See [rain_measurement.md](rain_measurement.md).
+
    **Why this band:** This is where raindrop impacts produce the strongest response (the dome's fundamental resonance). The energy in this band is a proxy for the total impact energy.
 
 3. **Energy binning**: If `drop_energy_level > 0.6` (the energy threshold):
@@ -269,54 +284,15 @@ The DSD histogram from the edge is transmitted to the cloud, where it's converte
 
 ---
 
-## 5. The Noise Suppression System (In Development)
+## 5. Noise Suppression (moved)
 
-A noise suppression pipeline spans three modules. This system is designed to estimate and compensate for background noise, primarily wind, before or alongside rain detection. As of the `feature/frame_level_rain_processing` branch, the detector/suppressor path below has been refactored to a per-frame streaming implementation (`RainFrameClassifierState`, `CausalNoiseTracker`) validated against this batch path at 1.0000 frame-class agreement — see `frame_level_rain_streaming.md` and `CLAUDE.md` for that refactor; the mechanism described below is unchanged by it.
+This section originally described the noise-suppression work as "in development". That work
+is now documented with the algorithms it belongs to:
 
-### 5.1 Spectral Noise Processor (`rain_signal_processor.py`, class `SpectralNoiseProcessor`)
-
-This implements a **spectral subtraction** approach (Boll, 1979) with adaptive confidence weighting:
-
-1. **Pre-filtering**: High-pass at 350 Hz (or bandpass to the operating band).
-2. **STFT**: 256-sample FFT, 128-sample hop.
-3. **Rain frame classification** (via `RainFrameClassifierMixin`): Each frame is classified as RAIN, NOISE, or UNCERTAIN using spectral flux in configured "mode bands" (resonance harmonics).
-4. **Noise PSD estimation**: Tracks the noise power spectral density using:
-   - A ring buffer of noise-only frames (frames not classified as rain)
-   - Quantile-based estimation (default q=0.25, i.e., 25th percentile of recent noise frames)
-   - Asymmetric EMA smoothing: fast-attack (ema_up=0.6) when noise increases, slow-release (ema_down=0.95) when it decreases
-5. **Gain computation**: Spectral subtraction with confidence-weighted oversubtraction:
-   - `G = 1 - α × sqrt(N/P)` (sqrt subtraction) or Wiener-like `G = max(P - αN, 0) / (P + ε)`
-   - Oversubtraction factor α varies from 1.0 (rain-likely) to 3.0 (noise-likely)
-   - Temporal smoothing is reduced on rain-like frames to preserve transient character
-6. **ISTFT**: Reconstruct the denoised waveform.
-
-**Assessment:** This is a well-structured noise suppression system consistent with established approaches. The adaptive oversubtraction based on frame classification is a good idea — suppress more aggressively when you're confident it's noise, preserve signal when it might be rain. The main risk is the chicken-and-egg problem: you need to classify rain vs. noise before you suppress noise, but your classification may be unreliable in high-noise conditions. The warmup logic (learning from all frames until the buffer is half-filled) is a practical solution to cold-start issues.
-
-### 5.2 Band Noise Estimator (`band_noise_estimator.py`)
-
-This is a complementary, more targeted noise estimator focused on the [400, 700] Hz fundamental band:
-
-1. **Per-subframe processing**: 512-sample frames are divided into 128-sample subframes (4 per frame).
-2. **Bandpass filtering** to [400, 700] Hz for the target metric, plus high-pass for overall energy.
-3. **Rain detection** at two levels:
-   - **FFT-level**: Compares total rain-band energy and primary-band energy frame-to-frame (6 dB and 3 dB jump thresholds, respectively).
-   - **Subframe-level**: Detects sudden band energy rises (≥6 dB) that exceed overall loudness rises (by ≥3 dB). This is clever: it detects narrowband energy jumps *relative to broadband energy*, which is a good discriminator for rain (narrowband resonance response) vs. wind (broadband energy increase).
-4. **Noise estimation**: Non-rain subframe energies are pushed into a ring buffer; noise is estimated as the 30th percentile via quantile estimation with EMA smoothing.
-5. **Wiener-like gain**: `G = sqrt(max(E_band - β×N_E, 0) / (E_band + ε))`, with gain floor of 0.10.
-
-**Assessment:** The subframe-level processing at 128 samples (~11.5 ms) provides fine temporal resolution, appropriate for catching individual raindrop transients. The "excess rise" trigger (band rise minus overall rise ≥ 3 dB) is a thoughtful feature that captures the physics: a rain drop excites the resonance band specifically, while wind raises all frequencies. However, this assumption breaks down for strong gusts that happen to excite the fundamental mode preferentially.
-
-### 5.3 Rain Frame Classifier (`rain_frame_classifier.py`)
-
-The classifier used within the noise processor is distinct from the detection algorithm's approach. It uses:
-
-1. **Spectral flux per mode band**: Positive differences (half-wave rectified) between the current frame and the frame two STFT hops back (t vs. t‑2, not t vs. t‑1), computed separately per configured resonance mode and combined with mode weights into a total flux.
-2. **Causal low-quantile baseline normalization**: Each mode's flux is normalized against its own causal low-quantile baseline tracker (`CausalLowQuantileTracker`) — the score is `max(flux - baseline, 0) / (baseline + floor)`, an excess-over-baseline ratio, not a z-score (no median/MAD statistics are used).
-3. **Time-domain gate**: A separate TD gate (`td_crest_factor > td_gate_threshold`, optionally AND'd with `td_kurtosis <= td_kurtosis_upper_threshold`) multiplies the normalized flux scores before they're compared to thresholds — zeroing them out on frames that don't look impulsive in the time domain.
-4. **Hard threshold vote, not a soft confidence**: `is_rain = primary_ok AND (support_hits >= min_support_count)`, where `primary_ok` requires the primary mode's log1p-transformed flux to clear its own threshold, and `support_hits` counts how many of the 3 support modes independently clear their own thresholds (default: at least 3 of 3). `rain_conf` is returned as a binary 0.0/1.0, not a continuous confidence — deliberately, so it stays aligned with the hard frame-count decision used for clip-level aggregation.
-5. Spectral peak structure (position, prominence, bandwidth relative to mode bands) is computed and exported as a diagnostic/feature-dump signal for offline tuning, but does not gate the runtime `is_rain` decision. There is no hold-expansion or decay-tail-protection mechanism in the current code.
-
-**Assessment:** This classifier is more sophisticated than the detection algorithm's novelty-based approach. The causal low-quantile normalization adapts each mode's baseline independently, which is a substantial improvement over the fixed-threshold SNR in the detection algorithm. The multi-mode support-count requirement (≥3 of 3 support modes, on top of the primary) is a good safeguard against narrowband interference resembling a single mode. Because the final decision is a hard vote rather than a blended confidence, small threshold miscalibrations produce a hard flip in frame class rather than a graded confidence — worth keeping in mind when tuning thresholds against noisy validation labels.
+- the spectral noise processor and the NCL rain frame classifier (`rain_signal_processor.py`,
+  `rain_frame_classifier.py`, `noise_tracker.py`): [rain_detection_ncl.md](rain_detection_ncl.md);
+- the band noise estimator and suppressor used for rain measurement (`band_noise_estimator.py`):
+  [rain_measurement.md](rain_measurement.md).
 
 ---
 
@@ -400,7 +376,7 @@ The requirement that the fundamental must be active before harmonics are conside
 Almost every decision point uses hard-coded thresholds: novelty thresholds per harmonic, kurtosis/crest/energy thresholds, rain peak count thresholds, the FP/FN override thresholds. These are presumably tuned on specific test data and may not generalize across the device fleet, seasons, or geographic regions. There is no mechanism for per-device calibration or adaptation.
 
 **W4: Wind noise directly corrupts the DSD.**
-The DSD emulator uses raw energy in [400, 700] Hz without any noise compensation. Wind energy in this band is counted as drop energy, inflating the DSD and causing overprediction. This is the primary known failure mode and is the motivation for the noise suppression work. Until noise suppression is integrated into the DSD pipeline, wind will cause systematic positive bias in rain estimates.
+The DSD emulator uses raw energy in [400, 700] Hz without any noise compensation. Wind energy in this band is counted as drop energy, inflating the DSD and causing overprediction. This is the primary known failure mode and is the motivation for the noise suppression work. Until noise suppression is integrated into the DSD pipeline, wind will cause systematic positive bias in rain estimates. *(Status note, October 2026: CM4 firmware now also accumulates a noise-cancelled DSD histogram from the band noise suppressor's `M_clean_fft`, alongside the raw one; see [rain_measurement.md](rain_measurement.md).)*
 
 **W5: No broadband analysis.**
 The algorithm focuses almost exclusively on the resonance bands (fundamental + harmonics). It does not use energy *between* harmonics or *outside* the resonance bands as a diagnostic. This is a missed opportunity: wind should produce relatively more inter-harmonic energy (smooth broadband spectrum) while rain should produce relatively less (energy concentrated at harmonics). A "harmonic-to-noise ratio" or "spectral flatness within the operating band" could be a powerful discriminator.
