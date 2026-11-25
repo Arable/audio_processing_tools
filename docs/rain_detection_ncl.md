@@ -79,8 +79,12 @@ else:           decrease faster      (step ∝ 1 − q)
 The detector compares the current frame against the **previous frame's** noise estimate:
 
 ```
-detector input = log P(t) − log N_lag(t),   N_lag(t) = N(t−1)
+detector input = log P(t) − log N_lag(t),   N_lag(t) = min(N(t−1), noise_psd_max_ratio × P(t))
 ```
+
+The outer clamp is applied to the lagged estimate before the log difference (at the default ratio of
+1.0 the denominator is `min(N(t−1), P(t))`), so with a ratio ≤ 1 the normalised value is never negative when power dips
+below the previous frame's noise floor.
 
 - The lag is unconditional on the detector side (`np.roll` on the noise-PSD array;
   `detector_use_noise_norm` defaults to True). Firmware uses the same lagged estimate (`psd_N_lag`).

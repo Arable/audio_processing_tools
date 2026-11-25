@@ -57,13 +57,13 @@ PFT_LOW_INDEX  = 100/DF + 1 = 5,    PFT_HIGH_INDEX = 1500/DF − 1 = 70
 lower window   = 300/DF = 14 .. 32,  upper window = 1000/DF = 47 .. 65
 ```
 
-`rain_estimator.py` and the DSD emulator on `main` use the true spacing, `fs / 512 = 21.80 Hz`. That
+`rain_estimator.py` and the DSD emulator on `main` (as of `92de827`) use the true spacing, `fs / 512 = 21.80 Hz`. That
 shifts more than the rain band:
 
 | | Firmware | Python on `main` |
 |---|---|---|
 | Rain band | 20..33 | 19..32 |
-| PFT | 5..70 | 5..67 |
+| PFT | 5..70 | 5..66 (`pft_high_idx` = 67, but the slice excludes it) |
 | Lower FFT window | 14..32 | 13..31 |
 | Upper FFT window | 47..65 | 45..63 |
 
