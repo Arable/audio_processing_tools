@@ -31,7 +31,8 @@ def _emulator() -> DsdProcessingEmualtor:
 
 def test_emulator_indices_match_firmware_macros():
     emu = _emulator()
-    assert emu.dF == 21
+    assert emu.dF_fw == 21
+    assert emu.dF == pytest.approx(FS / N)
     assert (emu.rain_low_idx, emu.rain_high_idx) == (20, 33)
     assert (emu.pft_low_idx, emu.pft_high_idx) == (5, 70)
     assert (emu.lwin_start_idx, emu.lwin_end_idx) == (14, 32)
@@ -56,3 +57,19 @@ def test_rain_estimator_band_edges(k, counted):
     out = estimate_rain_from_audio(_tone_at_bin(k), fs=FS, frame_length=N)
     assert out["n_frames"] == 1
     assert (out["rain_energy_frame_count"] == 1) is counted
+
+
+def test_emulator_reports_true_hz():
+    text = str(_emulator())
+    assert "21.80 Hz" in text
+    assert "hwin = 1000 1417 Hz" in text  # bin 65 * 21.80, not 65 * 21
+
+
+def test_fs_below_frame_length_does_not_crash():
+    # Integer DF would be 8000 // 8192 = 0; fall back to fractional spacing.
+    fs, n = 8000, 8192
+    emu = DsdProcessingEmualtor(fs=fs, frame_length=n, hop_length=n, bwindow=False)
+    assert emu.dF_fw == pytest.approx(fs / n)
+    assert (emu.rain_low_idx, emu.rain_high_idx) == (410, 716)
+    out = estimate_rain_from_audio(np.zeros(2 * n), fs=fs, frame_length=n)
+    assert out["n_frames"] == 2

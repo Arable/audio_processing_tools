@@ -9,6 +9,8 @@ from scipy.fftpack import fft
 from matplotlib import pyplot as plt
 import librosa
 
+from audio_processing_tools.edge.band_noise_estimator import firmware_df
+
 HEADER_SIZE = 40
 DEFAULT_BYTES_PER_SAMPLE = 2
 ENABLE_PLOT_DATA = False
@@ -32,11 +34,12 @@ class DsdProcessingEmualtor:
 
         self.verbose = verbose
 
-        # Frequency resolution. Integer division on purpose: firmware's
-        # disdrometer_legacy.h defines DF as (SAMPLING_FREQ/FFT_SAMPLE_LENGTH)
-        # in integer C arithmetic (11162/512 = 21, not 21.80), and every band
-        # index below (rain band, PFT, lower/upper windows) is derived from it.
-        self.dF = self.fs // self.frame_length
+        # True bin spacing in Hz (21.80 for 11162/512), for Hz reporting only.
+        self.dF = self.fs / self.frame_length
+        # Firmware's integer DF (disdrometer_legacy.h: SAMPLING_FREQ/FFT_SAMPLE_LENGTH
+        # in C integer arithmetic, 11162/512 = 21). Every band index below (rain
+        # band, PFT, lower/upper windows) is derived from it.
+        self.dF_fw = firmware_df(self.fs, self.frame_length)
 
         # output
         self.loudness_bins = 32
@@ -50,8 +53,8 @@ class DsdProcessingEmualtor:
         self.rain_energy_threshold = 0.6
         self.rain_low_freq = 400
         self.rain_high_freq = 700
-        self.rain_low_idx = int(self.rain_low_freq // self.dF) + 1
-        self.rain_high_idx = int(self.rain_high_freq // self.dF)
+        self.rain_low_idx = int(self.rain_low_freq // self.dF_fw) + 1
+        self.rain_high_idx = int(self.rain_high_freq // self.dF_fw)
 
         self.rain_log_base = 1.13
         self.rain_log_factor = 0.6
@@ -59,19 +62,19 @@ class DsdProcessingEmualtor:
         # pft parameters
         self.pft_low_freq = 100
         self.pft_high_freq = 1500
-        self.pft_low_idx = int(self.pft_low_freq // self.dF) + 1
-        self.pft_high_idx = int(self.pft_high_freq // self.dF) - 1
+        self.pft_low_idx = int(self.pft_low_freq // self.dF_fw) + 1
+        self.pft_high_idx = int(self.pft_high_freq // self.dF_fw) - 1
 
         # fft parameters
         self.lwin_start = 300
         self.hwin_start = 1000
-        self.lwin_start_idx = int(self.lwin_start // self.dF)
+        self.lwin_start_idx = int(self.lwin_start // self.dF_fw)
         self.lwin_end_idx = (
-            int(self.lwin_start // self.dF) + int(self.fft_bins // 2) - 1
+            int(self.lwin_start // self.dF_fw) + int(self.fft_bins // 2) - 1
         )
-        self.hwin_start_idx = int(self.hwin_start // self.dF)
+        self.hwin_start_idx = int(self.hwin_start // self.dF_fw)
         self.hwin_end_idx = (
-            int(self.hwin_start // self.dF) + int(self.fft_bins // 2) - 1
+            int(self.hwin_start // self.dF_fw) + int(self.fft_bins // 2) - 1
         )
         # raw file header size
         self.hdr_size = HEADER_SIZE
@@ -92,12 +95,12 @@ class DsdProcessingEmualtor:
         ret = f"###### start of the config block #########\n"
         ret += f"Sampling frequency = {self.fs} \n"
         ret += f"FFT length = {self.frame_length}\n"
-        ret += f"frequency resultion = {self.dF} Hz\n"
+        ret += f"frequency resolution = {self.dF:.2f} Hz (firmware index DF = {self.dF_fw})\n"
         ret += f"Rain Enegry Threshold = {self.rain_energy_threshold}\n"
         ret += f"Windowing Enabled = {self.apply_window}\n"
         ret += f"Rain Detection Band = {self.rain_low_freq} {self.rain_high_freq} Hz  indices = {self.rain_low_idx} {self.rain_high_idx} \n"
-        ret += f"lwin = {self.lwin_start} {self.lwin_end_idx * self.dF} Hz  lwin indices = {self.lwin_start_idx} {self.lwin_end_idx} \n"
-        ret += f"hwin = {self.hwin_start} {self.hwin_end_idx*self.dF} Hz  hwin indices = {self.hwin_start_idx} {self.hwin_end_idx} \n"
+        ret += f"lwin = {self.lwin_start} {self.lwin_end_idx * self.dF:.0f} Hz  lwin indices = {self.lwin_start_idx} {self.lwin_end_idx} \n"
+        ret += f"hwin = {self.hwin_start} {self.hwin_end_idx * self.dF:.0f} Hz  hwin indices = {self.hwin_start_idx} {self.hwin_end_idx} \n"
         ret += f"pft frequencies = {self.pft_low_freq} {self.pft_high_freq} Hz  pft indices =  {self.pft_low_idx} {self.pft_high_idx} \n"
         ret += f"###### end of the config block #########\n"
         return ret
