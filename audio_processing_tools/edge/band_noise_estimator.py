@@ -44,12 +44,16 @@ def firmware_df(fs: float, n_fft: int) -> float:
     """
     disdrometer_legacy.h's DF = SAMPLING_FREQ / FFT_SAMPLE_LENGTH, in integer
     C arithmetic (11162 // 512 = 21, not 21.80). Band-index math only; use
-    fs / n_fft for Hz. When fs < n_fft the integer DF would be 0 (firmware never
-    runs that configuration), so fall back to the true fractional spacing
-    instead of dividing by zero.
+    fs / n_fft for Hz. fs must be at least n_fft: below that the integer DF is
+    0, a configuration the firmware never runs, so it is rejected.
     """
     df = int(fs) // int(n_fft)
-    return df if df >= 1 else float(fs) / float(n_fft)
+    if df < 1:
+        raise ValueError(
+            f"fs ({fs}) must be >= n_fft ({n_fft}): the firmware's integer bin spacing "
+            "fs // n_fft would be 0 (firmware runs fs = 11162, n_fft = 512)"
+        )
+    return df
 
 
 def legacy_band_bins(lo_hz: float, hi_hz: float, fs: float, n_fft: int) -> Tuple[int, int]:

@@ -65,11 +65,11 @@ def test_emulator_reports_true_hz():
     assert "hwin = 1000 1417 Hz" in text  # bin 65 * 21.80, not 65 * 21
 
 
-def test_fs_below_frame_length_does_not_crash():
-    # Integer DF would be 8000 // 8192 = 0; fall back to fractional spacing.
+def test_fs_below_frame_length_is_rejected():
+    # Integer DF would be 8000 // 8192 = 0, a configuration the firmware never runs: a clear error, not a
+    # ZeroDivisionError or a silently different bin spacing.
     fs, n = 8000, 8192
-    emu = DsdProcessingEmualtor(fs=fs, frame_length=n, hop_length=n, bwindow=False)
-    assert emu.dF_fw == pytest.approx(fs / n)
-    assert (emu.rain_low_idx, emu.rain_high_idx) == (410, 716)
-    out = estimate_rain_from_audio(np.zeros(2 * n), fs=fs, frame_length=n)
-    assert out["n_frames"] == 2
+    with pytest.raises(ValueError, match="must be >= n_fft"):
+        DsdProcessingEmualtor(fs=fs, frame_length=n, hop_length=n, bwindow=False)
+    with pytest.raises(ValueError, match="must be >= n_fft"):
+        estimate_rain_from_audio(np.zeros(2 * n), fs=fs, frame_length=n)
