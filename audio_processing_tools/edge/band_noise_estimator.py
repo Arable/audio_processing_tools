@@ -40,22 +40,38 @@ def hz_to_bin(f_hz: float, fs: float, n_fft: int) -> int:
     return int(np.clip(np.round(f_hz * n_fft / fs), 0, n_fft // 2))
 
 
+def firmware_df(fs: float, n_fft: int) -> float:
+    """
+    disdrometer_legacy.h's DF = SAMPLING_FREQ / FFT_SAMPLE_LENGTH, in integer
+    C arithmetic (11162 // 512 = 21, not 21.80). Band-index math only; use
+    fs / n_fft for Hz. fs must be at least n_fft: below that the integer DF is
+    0, a configuration the firmware never runs, so it is rejected.
+    """
+    df = int(fs) // int(n_fft)
+    if df < 1:
+        raise ValueError(
+            f"fs ({fs}) must be >= n_fft ({n_fft}): the firmware's integer bin spacing "
+            "fs // n_fft would be 0 (firmware runs fs = 11162, n_fft = 512)"
+        )
+    return df
+
+
 def legacy_band_bins(lo_hz: float, hi_hz: float, fs: float, n_fft: int) -> Tuple[int, int]:
     """
     Band edges matching disdrometer_legacy.h's FFT_LOW_INDEX/FFT_HIGH_INDEX
     macros exactly (integer-division DF, not hz_to_bin's round-to-nearest):
-        DF = fs // n_fft
+        DF = fs // n_fft            (see firmware_df)
         low_bin  = (lo_hz // DF) + 1
         high_bin = hi_hz // DF
-    Used only for M_band_fft/E_band_fft's band_hz edges, so the unsuppressed
-    FFT-domain reference is comparable to the legacy (non-suppressed)
-    drop_energy_level path for a valid with/without-noise-suppression
-    side-by-side. Not used for the rain-band/primary-band bins in
-    NoiseFrameDetector, which have no legacy counterpart to match.
+    Used for M_band_fft/E_band_fft's band_hz edges (so the unsuppressed
+    FFT-domain reference is comparable to the legacy drop_energy_level path)
+    and for the rain band in rain_estimator.estimate_rain_from_audio. Not used
+    for the rain-band/primary-band bins in NoiseFrameDetector, which have no
+    legacy counterpart to match.
     """
-    df = int(fs) // int(n_fft)
-    low_bin = (int(lo_hz) // df) + 1
-    high_bin = int(hi_hz) // df
+    df = firmware_df(fs, n_fft)
+    low_bin = int(int(lo_hz) // df) + 1
+    high_bin = int(int(hi_hz) // df)
     return low_bin, high_bin
 
 
